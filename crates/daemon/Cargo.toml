@@ -1,0 +1,24 @@
+[package]
+name = "frostbited"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "frostbited"
+path = "src/main.rs"
+
+[dependencies]
+frostbite-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "sync", "time", "signal", "io-util"] }
+nix = { version = "0.29", features = ["signal", "fs", "user"] }
+procfs = "0.17"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

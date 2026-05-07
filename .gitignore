@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Tauri / node
+/crates/gui/ui/node_modules
+/crates/gui/ui/dist
+/crates/gui/target
+/crates/gui/gen
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store

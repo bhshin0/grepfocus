@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Frostbite</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Frostbite</h1>
+      <nav>
+        <button data-tab="status" class="active">Status</button>
+        <button data-tab="new">New block</button>
+        <button data-tab="list">Block list</button>
+      </nav>
+    </header>
+    <main>
+      <section id="status" class="tab active">
+        <h2>Status</h2>
+        <div id="status-content">Loading…</div>
+      </section>
+
+      <section id="new" class="tab">
+        <h2>New block</h2>
+        <form id="new-block-form">
+          <label>Name <input name="name" required /></label>
+          <label>Domains (one per line)
+            <textarea name="domains" rows="4" placeholder="reddit.com&#10;twitter.com"></textarea>
+          </label>
+          <label>App exe paths or basenames (one per line)
+            <textarea name="apps" rows="4" placeholder="/usr/bin/steam&#10;discord"></textarea>
+          </label>
+          <button type="submit">Save block</button>
+          <p id="new-block-msg" class="msg"></p>
+        </form>
+      </section>
+
+      <section id="list" class="tab">
+        <h2>Saved blocks</h2>
+        <ul id="block-list"></ul>
+        <p id="list-msg" class="msg"></p>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
