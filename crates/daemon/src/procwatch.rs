@@ -1,4 +1,4 @@
-//! Periodic /proc scan that SIGKILLs processes matching the active block.
+//! Periodic /proc scan that SIGKILLs processes matching any active block.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -19,12 +19,15 @@ pub async fn run(daemon: Arc<Daemon>) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
-        let matchers = {
+        let matchers: Vec<AppMatcher> = {
             let st = daemon.state.lock().await;
-            match &st.active {
-                Some(a) => a.block.apps.clone(),
-                None => continue,
+            if st.active.is_empty() {
+                continue;
             }
+            st.active
+                .iter()
+                .flat_map(|a| a.block.apps.iter().cloned())
+                .collect()
         };
         if matchers.is_empty() {
             continue;

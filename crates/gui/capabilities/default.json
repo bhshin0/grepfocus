@@ -2,8 +2,20 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default permissions for the Frostbite app window",
-  "windows": ["*"],
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://localhost:*"]
+  },
   "permissions": [
-    "core:default"
+    "core:default",
+    "allow-list-blocks",
+    "allow-add-block",
+    "allow-delete-block",
+    "allow-start-block",
+    "allow-get-status",
+    "allow-list-schedules",
+    "allow-add-schedule",
+    "allow-update-schedule",
+    "allow-delete-schedule"
   ]
 }

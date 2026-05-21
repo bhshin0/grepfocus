@@ -19,6 +19,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "
 nix = { version = "0.29", features = ["signal", "fs", "user"] }
 procfs = "0.17"
 rand = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -13,6 +13,7 @@
         <button data-tab="status" class="active">Status</button>
         <button data-tab="new">New block</button>
         <button data-tab="list">Block list</button>
+        <button data-tab="schedules">Schedules</button>
       </nav>
     </header>
     <main>
@@ -40,6 +41,44 @@
         <h2>Saved blocks</h2>
         <ul id="block-list"></ul>
         <p id="list-msg" class="msg"></p>
+      </section>
+
+      <section id="schedules" class="tab">
+        <h2>Recurring schedules</h2>
+        <p class="hint">Schedules auto-start the chosen block on selected weekdays during a daily time window. They cannot span midnight; split into two if needed.</p>
+        <ul id="schedule-list"></ul>
+
+        <details id="schedule-form-details">
+          <summary>+ New schedule</summary>
+          <form id="schedule-form">
+            <input type="hidden" name="id" value="" />
+            <label>Name <input name="name" required placeholder="Weekday focus" /></label>
+            <label>Block
+              <select name="block_id" required></select>
+            </label>
+            <label>Days
+              <div class="days" id="days-picker">
+                <label><input type="checkbox" name="day" value="1"> Mon</label>
+                <label><input type="checkbox" name="day" value="2"> Tue</label>
+                <label><input type="checkbox" name="day" value="3"> Wed</label>
+                <label><input type="checkbox" name="day" value="4"> Thu</label>
+                <label><input type="checkbox" name="day" value="5"> Fri</label>
+                <label><input type="checkbox" name="day" value="6"> Sat</label>
+                <label><input type="checkbox" name="day" value="0"> Sun</label>
+              </div>
+            </label>
+            <label>Start (local time)
+              <input type="time" name="start_time" required value="09:00" />
+            </label>
+            <label>Duration (hours)
+              <input type="number" name="duration_hours" min="0.25" max="24" step="0.25" required value="8" />
+            </label>
+            <label><input type="checkbox" name="enabled" checked> Enabled</label>
+            <button type="submit">Save schedule</button>
+            <button type="button" id="schedule-cancel" class="ghost">Cancel</button>
+            <p id="schedule-msg" class="msg"></p>
+          </form>
+        </details>
       </section>
     </main>
     <script type="module" src="/src/main.ts"></script>

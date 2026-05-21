@@ -121,3 +121,75 @@ button[type="submit"], .start-btn {
   padding: 18px;
   text-align: center;
 }
+
+.hint {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 4px 0 12px;
+}
+
+.note {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 14px;
+}
+
+.origin {
+  font-size: 13px;
+  opacity: 0.85;
+  font-weight: normal;
+}
+
+.meta-line {
+  font-size: 13px;
+  opacity: 0.9;
+}
+
+button.ghost {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.block-card.disabled { opacity: 0.6; }
+.block-card .toggle-btn {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.days {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+.days label {
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+  color: var(--fg);
+  font-size: 13px;
+}
+
+details summary {
+  cursor: pointer;
+  padding: 8px 0;
+  color: var(--accent);
+  font-size: 14px;
+}
+details[open] summary { margin-bottom: 10px; }
+
+#schedule-list { list-style: none; padding: 0; display: grid; gap: 10px; margin-bottom: 16px; }
+form label > input[type="checkbox"] { width: auto; margin-right: 6px; }

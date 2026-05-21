@@ -10,6 +10,7 @@ use anyhow::Context;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
+mod enforce;
 mod hosts;
 mod ipc;
 mod paths;
@@ -17,11 +18,11 @@ mod procwatch;
 mod scheduler;
 mod state;
 
-use frostbite_core::State;
+use frostbite_core::{now_unix, State};
 
 /// Runtime context shared across all daemon tasks.
 pub struct Daemon {
-    /// Persisted state — blocks list and the currently active block, if any.
+    /// Persisted state — blocks, active blocks, schedules.
     pub state: Mutex<State>,
     /// HMAC key loaded from /etc/frostbite/secret at startup.
     pub key: Vec<u8>,
@@ -43,39 +44,57 @@ async fn main() -> anyhow::Result<()> {
     paths::ensure_dirs().context("creating runtime/state directories")?;
     let key = state::load_or_create_secret().context("loading HMAC secret")?;
 
-    let initial = state::load(&key).unwrap_or_else(|err| {
-        error!(?err, "state file invalid or missing — starting fresh and clearing any leftover hosts block");
-        if let Err(e) = hosts::clear_block() {
-            error!(?e, "failed to clear leftover hosts block");
+    let mut initial = match state::load(&key) {
+        Ok(s) => s,
+        Err(err) => {
+            let missing = err.chain().any(|e| {
+                e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            });
+            if missing {
+                info!("no state file yet — first run, starting fresh");
+            } else {
+                error!(?err, "state file corrupted — starting fresh and clearing any leftover hosts block");
+                if let Err(e) = hosts::clear_block() {
+                    error!(?e, "failed to clear leftover hosts block");
+                }
+            }
+            State::default()
         }
-        State::default()
-    });
+    };
+
+    // Drop any active blocks that have already expired between shutdown and
+    // startup. (They will simply never be re-applied.)
+    let now = now_unix();
+    let before = initial.active.len();
+    initial.active.retain(|a| a.ends_at_unix > now);
+    let dropped = before - initial.active.len();
+    if dropped > 0 {
+        info!(dropped, "discarded expired active blocks on startup");
+    }
+    if dropped > 0 {
+        if let Err(e) = state::save(&initial, &key) {
+            error!(?e, "failed to save state after dropping expired actives");
+        }
+    }
 
     info!(
         block_count = initial.blocks.len(),
-        active = initial.active.is_some(),
+        active_count = initial.active.len(),
+        schedule_count = initial.schedules.len(),
         "daemon starting"
     );
+
+    // Re-apply the union of all still-active blocks before accepting clients.
+    let startup_domains = enforce::union_domains(&initial.active);
+    if let Err(e) = enforce::apply(&startup_domains) {
+        error!(?e, "failed to re-apply hosts enforcement on startup");
+    }
 
     let daemon = Arc::new(Daemon {
         state: Mutex::new(initial),
         key,
     });
-
-    // If we're starting up with an active block, re-apply its enforcement.
-    {
-        let st = daemon.state.lock().await;
-        if let Some(active) = &st.active {
-            if active.ends_at_unix > frostbite_core::now_unix() {
-                info!("re-applying active block on startup");
-                let domains: Vec<String> = active.block.domains.clone();
-                drop(st);
-                if let Err(e) = hosts::apply_block(&domains) {
-                    error!(?e, "failed to re-apply hosts block");
-                }
-            }
-        }
-    }
 
     let ipc_handle = tokio::spawn(ipc::serve(daemon.clone()));
     let watch_handle = tokio::spawn(procwatch::run(daemon.clone()));

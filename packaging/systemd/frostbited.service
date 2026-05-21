@@ -3,14 +3,14 @@ Description=Frostbite blocker daemon
 Documentation=https://github.com/scada/frostbite
 After=network-pre.target
 DefaultDependencies=no
+# Stronger restart resilience: keep restarting even if it crashes a lot.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/frostbited
 Restart=always
 RestartSec=1
-# Stronger restart resilience: keep restarting even if it crashes a lot.
-StartLimitIntervalSec=0
 
 # The daemon must edit /etc/hosts and /var/lib/frostbite, so we cannot use
 # ProtectSystem=strict. We still apply the hardening that's compatible with

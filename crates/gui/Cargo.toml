@@ -17,5 +17,7 @@ frostbite-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util"] }
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["devtools"] }
 tauri-plugin-shell = "2"
+tauri-plugin-localhost = "2"
+portpicker = "0.1"
