@@ -13,6 +13,7 @@ use tracing::{error, info};
 mod enforce;
 mod hosts;
 mod ipc;
+mod nftables;
 mod paths;
 mod procwatch;
 mod scheduler;
