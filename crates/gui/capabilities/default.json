@@ -8,6 +8,7 @@
   },
   "permissions": [
     "core:default",
+    "notification:default",
     "allow-list-blocks",
     "allow-add-block",
     "allow-delete-block",
@@ -16,6 +17,9 @@
     "allow-list-schedules",
     "allow-add-schedule",
     "allow-update-schedule",
-    "allow-delete-schedule"
+    "allow-delete-schedule",
+    "allow-set-password",
+    "allow-unlock",
+    "allow-take-break"
   ]
 }

@@ -14,10 +14,15 @@ use tracing::warn;
 
 use crate::{hosts, nftables};
 
-/// Deduplicated, sorted union of all domains across the active blocks.
-pub fn union_domains(active: &[ActiveBlock]) -> Vec<String> {
+/// Deduplicated, sorted union of all domains across the active blocks that are
+/// currently being enforced. Blocks on a break (`break_until_unix > now`) are
+/// skipped so their domains resolve again until the break ends.
+pub fn union_domains(active: &[ActiveBlock], now: u64) -> Vec<String> {
     let mut set: BTreeSet<String> = BTreeSet::new();
     for a in active {
+        if a.break_until_unix.is_some_and(|t| t > now) {
+            continue;
+        }
         for d in &a.block.domains {
             let d = d.trim();
             if !d.is_empty() {

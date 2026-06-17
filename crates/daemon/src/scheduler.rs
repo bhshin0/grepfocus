@@ -96,6 +96,7 @@ async fn tick(daemon: &Arc<Daemon>) {
                 started_at_unix: now_unix,
                 ends_at_unix,
                 originator: Originator::Schedule { schedule_id: s.id },
+                break_until_unix: None,
             });
             info!(
                 schedule_id = s.id,
@@ -105,11 +106,29 @@ async fn tick(daemon: &Arc<Daemon>) {
             changed = true;
         }
 
-        if changed {
+        // 4. Resume any block whose break has ended (enforcement returns).
+        for a in st.active.iter_mut() {
+            if a.break_until_unix.is_some_and(|t| t <= now_unix) {
+                a.break_until_unix = None;
+                info!(block_id = a.block.id, "break ended");
+                changed = true;
+            }
+        }
+
+        // Prune break-allowance ledger entries from previous days (resets the
+        // daily allowance). This needs a save but not a re-apply on its own.
+        let today = local_day();
+        let before = st.allowance.len();
+        st.allowance.retain(|l| l.day == today);
+        let ledger_pruned = st.allowance.len() != before;
+
+        if changed || ledger_pruned {
             if let Err(e) = state::save(&st, &daemon.key) {
                 error!(?e, "scheduler save failed");
             }
-            Some(enforce::union_domains(&st.active))
+        }
+        if changed {
+            Some(enforce::union_domains(&st.active, now_unix))
         } else {
             None
         }
@@ -120,6 +139,13 @@ async fn tick(daemon: &Arc<Daemon>) {
             error!(?e, "scheduler enforce::apply failed");
         }
     }
+}
+
+/// Days since the Common-Era epoch in local time. The absolute value is
+/// irrelevant — it only needs to change at local midnight so the break
+/// allowance resets daily.
+pub fn local_day() -> i64 {
+    Local::now().date_naive().num_days_from_ce() as i64
 }
 
 /// True if `t` falls inside today's scheduled window.

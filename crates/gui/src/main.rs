@@ -3,8 +3,13 @@
 
 mod client;
 
-use frostbite_core::{ActiveBlock, Block, Request, Response, Schedule};
-use tauri::{WebviewUrl, WebviewWindowBuilder};
+use std::collections::HashMap;
+use std::time::Duration;
+
+use frostbite_core::{ActiveBlock, AllowanceLedger, Block, Request, Response, Schedule};
+use tauri::menu::MenuBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
 #[tauri::command]
 async fn list_blocks() -> Result<Vec<Block>, String> {
@@ -46,12 +51,54 @@ async fn start_block(id: u64, duration_secs: u64) -> Result<(), String> {
 struct StatusOut {
     active: Vec<ActiveBlock>,
     now_unix: u64,
+    password_set: bool,
+    unlocked: bool,
+    allowance_used: Vec<AllowanceLedger>,
 }
 
 #[tauri::command]
 async fn get_status() -> Result<StatusOut, String> {
     match client::call(Request::GetStatus {}).await? {
-        Response::Status { active, now_unix } => Ok(StatusOut { active, now_unix }),
+        Response::Status {
+            active,
+            now_unix,
+            password_set,
+            unlocked,
+            allowance_used,
+        } => Ok(StatusOut {
+            active,
+            now_unix,
+            password_set,
+            unlocked,
+            allowance_used,
+        }),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+#[tauri::command]
+async fn set_password(old: Option<String>, new: Option<String>) -> Result<(), String> {
+    match client::call(Request::SetPassword { old, new }).await? {
+        Response::Ok {} => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+#[tauri::command]
+async fn unlock(password: String) -> Result<(), String> {
+    match client::call(Request::Unlock { password }).await? {
+        Response::Ok {} => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+#[tauri::command]
+async fn take_break(block_id: u64, secs: u64) -> Result<(), String> {
+    match client::call(Request::TakeBreak { block_id, secs }).await? {
+        Response::Ok {} => Ok(()),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),
     }
@@ -93,6 +140,60 @@ async fn delete_schedule(id: u64) -> Result<(), String> {
     }
 }
 
+/// Fire a desktop notification. Best-effort — failures are ignored so a
+/// missing notification daemon never disrupts the app.
+fn notify(app: &AppHandle, title: &str, body: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app.notification().builder().title(title).body(body).show();
+}
+
+/// Background task: poll the daemon every 5s, keep the tray tooltip in sync,
+/// and fire a notification whenever a block starts or ends. Runs for the life
+/// of the process (the window hides to tray rather than closing), so
+/// notifications keep flowing even with no window open.
+fn spawn_status_watcher(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        // id -> block name. `None` until the first successful poll so we
+        // establish a baseline without notifying for already-active blocks.
+        let mut prev: Option<HashMap<u64, String>> = None;
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            ticker.tick().await;
+            let active = match client::call(Request::GetStatus {}).await {
+                Ok(Response::Status { active, .. }) => active,
+                _ => continue, // daemon down / transient error — try again next tick
+            };
+            let cur: HashMap<u64, String> = active
+                .iter()
+                .map(|a| (a.block.id, a.block.name.clone()))
+                .collect();
+
+            if let Some(tray) = app.tray_by_id("frostbite-tray") {
+                let tip = if cur.is_empty() {
+                    "Frostbite — no active blocks".to_string()
+                } else {
+                    format!("Frostbite — {} active", cur.len())
+                };
+                let _ = tray.set_tooltip(Some(&tip));
+            }
+
+            if let Some(prev_map) = &prev {
+                for (id, name) in &cur {
+                    if !prev_map.contains_key(id) {
+                        notify(&app, "Block started", name);
+                    }
+                }
+                for (id, name) in prev_map {
+                    if !cur.contains_key(id) {
+                        notify(&app, "Block ended", name);
+                    }
+                }
+            }
+            prev = Some(cur);
+        }
+    });
+}
+
 fn main() {
     // wry's custom URI scheme handler is unreliable on this webkit2gtk-4.1
     // build (2.52). Serve embedded assets via a real localhost HTTP server
@@ -102,6 +203,15 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_localhost::Builder::new(port).build())
+        .plugin(tauri_plugin_notification::init())
+        .on_window_event(|window, event| {
+            // Closing the window hides it to the tray instead of quitting, so
+            // the status watcher (and thus notifications) keeps running.
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(move |app| {
             let url = format!("http://localhost:{port}/index.html").parse().unwrap();
             let _win = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
@@ -109,6 +219,48 @@ fn main() {
                 .inner_size(900.0, 640.0)
                 .min_inner_size(600.0, 480.0)
                 .build()?;
+
+            let menu = MenuBuilder::new(app)
+                .text("show", "Show Frostbite")
+                .separator()
+                .text("quit", "Quit")
+                .build()?;
+
+            TrayIconBuilder::with_id("frostbite-tray")
+                .icon(app.default_window_icon().expect("bundled icon").clone())
+                .tooltip("Frostbite — no active blocks")
+                .menu(&menu)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(w) = app.get_webview_window("main") {
+                            if w.is_visible().unwrap_or(false) {
+                                let _ = w.hide();
+                            } else {
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                            }
+                        }
+                    }
+                })
+                .build(app)?;
+
+            spawn_status_watcher(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -121,6 +273,9 @@ fn main() {
             add_schedule,
             update_schedule,
             delete_schedule,
+            set_password,
+            unlock,
+            take_break,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use frostbite_core::AppMatcher;
+use frostbite_core::{now_unix, AppMatcher};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use procfs::process::all_processes;
@@ -24,8 +24,11 @@ pub async fn run(daemon: Arc<Daemon>) {
             if st.active.is_empty() {
                 continue;
             }
+            let now = now_unix();
             st.active
                 .iter()
+                // Skip blocks currently on a break — their apps run freely.
+                .filter(|a| !a.break_until_unix.is_some_and(|t| t > now))
                 .flat_map(|a| a.block.apps.iter().cloned())
                 .collect()
         };

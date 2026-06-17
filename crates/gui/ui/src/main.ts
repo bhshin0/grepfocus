@@ -10,6 +10,13 @@ interface Block {
   name: string;
   domains: string[];
   apps: AppMatcher[];
+  allowance_secs_per_day: number;
+}
+
+interface AllowanceLedger {
+  block_id: number;
+  day: number;
+  used_secs: number;
 }
 
 type Originator = { kind: "manual" } | { kind: "schedule"; schedule_id: number };
@@ -19,11 +26,15 @@ interface ActiveBlock {
   started_at_unix: number;
   ends_at_unix: number;
   originator: Originator;
+  break_until_unix: number | null;
 }
 
 interface Status {
   active: ActiveBlock[];
   now_unix: number;
+  password_set: boolean;
+  unlocked: boolean;
+  allowance_used: AllowanceLedger[];
 }
 
 interface Schedule {
@@ -49,6 +60,7 @@ tabs.forEach((btn) => {
     if (target === "list") refreshList();
     if (target === "status") refreshStatus();
     if (target === "schedules") refreshSchedules();
+    if (target === "settings") refreshSettings();
   });
 });
 
@@ -79,12 +91,14 @@ newForm.addEventListener("submit", async (ev) => {
       .map((s) => s.trim())
       .filter(Boolean),
     apps: parseAppLines(String(fd.get("apps") ?? "")),
+    allowance_secs_per_day: Math.max(0, Math.floor(Number(fd.get("allowance_minutes") ?? 0))) * 60,
   };
   if (!block.name) {
     newMsg.classList.add("error");
     newMsg.textContent = "name is required";
     return;
   }
+  if (!(await ensureUnlocked())) return;
   try {
     const id = await invoke<number>("add_block", { block });
     newMsg.textContent = `saved (id ${id})`;
@@ -135,8 +149,10 @@ function renderBlockCard(b: Block): HTMLLIElement {
     if (a.kind === "basename") return a.name;
     return `cmdline:${a.contains}`;
   });
+  const allowanceNote =
+    b.allowance_secs_per_day > 0 ? ` · break allowance ${Math.floor(b.allowance_secs_per_day / 60)} min/day` : "";
   li.querySelector(".meta")!.textContent =
-    `${b.domains.length} domain(s), ${b.apps.length} app(s) — ${[...b.domains, ...apps].join(", ") || "(empty)"}`;
+    `${b.domains.length} domain(s), ${b.apps.length} app(s)${allowanceNote} — ${[...b.domains, ...apps].join(", ") || "(empty)"}`;
   const dur = li.querySelector<HTMLInputElement>(".duration")!;
   li.querySelector<HTMLButtonElement>(".start-btn")!.addEventListener("click", async () => {
     const minutes = Math.max(1, parseInt(dur.value, 10) || 30);
@@ -152,6 +168,7 @@ function renderBlockCard(b: Block): HTMLLIElement {
   });
   li.querySelector<HTMLButtonElement>(".delete-btn")!.addEventListener("click", async () => {
     listMsg.classList.remove("error");
+    if (!(await ensureUnlocked())) return;
     try {
       await invoke("delete_block", { id: b.id });
       refreshList();
@@ -178,7 +195,7 @@ async function refreshStatus() {
       stopCountdownTimer();
       return;
     }
-    renderActive(s.active);
+    renderActive(s);
     if (countdownTimer == null) {
       countdownTimer = window.setInterval(tickCountdowns, 1000);
     }
@@ -207,9 +224,13 @@ function fmtRemaining(secs: number): string {
   return [h, m, r].map((n) => String(n).padStart(2, "0")).join(":");
 }
 
-function renderActive(active: ActiveBlock[]) {
+function renderActive(s: Status) {
   statusEl.innerHTML = "";
-  for (const a of active) {
+  const usedByBlock = new Map<number, number>();
+  for (const l of s.allowance_used) usedByBlock.set(l.block_id, l.used_secs);
+  const nowSec = s.now_unix;
+
+  for (const a of s.active) {
     const div = document.createElement("div");
     div.className = "active-banner";
     div.dataset.endsAt = String(a.ends_at_unix);
@@ -223,6 +244,52 @@ function renderActive(active: ActiveBlock[]) {
       <div class="meta-line">${a.block.domains.length} domain(s), ${a.block.apps.length} app(s)</div>
     `;
     div.querySelector<HTMLSpanElement>(".name")!.textContent = a.block.name;
+
+    const allowance = a.block.allowance_secs_per_day;
+    if (allowance > 0) {
+      const onBreak = a.break_until_unix != null && a.break_until_unix > nowSec;
+      if (onBreak) {
+        const ob = document.createElement("div");
+        ob.className = "on-break";
+        ob.dataset.breakUntil = String(a.break_until_unix);
+        ob.textContent = "On break — resumes in --:--:--";
+        div.appendChild(ob);
+      } else {
+        const used = usedByBlock.get(a.block.id) ?? 0;
+        const remainingMin = Math.floor((allowance - used) / 60);
+        const row = document.createElement("div");
+        row.className = "break-row";
+        const defMin = Math.min(5, Math.max(1, remainingMin));
+        row.innerHTML = `
+          <input type="number" class="break-min" min="1" value="${defMin}" /> min
+          <button class="break-btn">Take a break</button>
+          <span class="break-left"></span>
+        `;
+        const btn = row.querySelector<HTMLButtonElement>(".break-btn")!;
+        const input = row.querySelector<HTMLInputElement>(".break-min")!;
+        const left = row.querySelector<HTMLSpanElement>(".break-left")!;
+        if (remainingMin <= 0) {
+          btn.disabled = true;
+          input.disabled = true;
+          left.textContent = "no allowance left today";
+        } else {
+          left.textContent = `${remainingMin} min left today`;
+        }
+        btn.addEventListener("click", async () => {
+          const minutes = Math.max(1, parseInt(input.value, 10) || 1);
+          btn.disabled = true;
+          try {
+            await invoke("take_break", { blockId: a.block.id, secs: minutes * 60 });
+            refreshStatus();
+          } catch (e) {
+            left.textContent = String(e);
+            btn.disabled = false;
+          }
+        });
+        div.appendChild(row);
+      }
+    }
+
     statusEl.appendChild(div);
   }
   const note = document.createElement("p");
@@ -243,6 +310,19 @@ function tickCountdowns() {
     if (remaining > 0) allDone = false;
     div.querySelector(".countdown")!.textContent = fmtRemaining(remaining);
   });
+
+  // Break countdowns: when one elapses, refresh so the controls return.
+  statusEl.querySelectorAll<HTMLDivElement>(".on-break").forEach((ob) => {
+    const until = Number(ob.dataset.breakUntil);
+    const rem = until - nowSec;
+    if (rem > 0) {
+      ob.textContent = `On break — resumes in ${fmtRemaining(rem)}`;
+    } else {
+      ob.textContent = "Break ending…";
+      setTimeout(refreshStatus, 500);
+    }
+  });
+
   if (allDone) setTimeout(refreshStatus, 500);
 }
 
@@ -318,6 +398,7 @@ function renderScheduleCard(s: Schedule, blockName: string): HTMLLIElement {
   const toggle = li.querySelector<HTMLButtonElement>(".toggle-btn")!;
   toggle.textContent = s.enabled ? "Disable" : "Enable";
   toggle.addEventListener("click", async () => {
+    if (!(await ensureUnlocked())) return;
     try {
       await invoke("update_schedule", { schedule: { ...s, enabled: !s.enabled } });
       refreshSchedules();
@@ -330,6 +411,7 @@ function renderScheduleCard(s: Schedule, blockName: string): HTMLLIElement {
     loadIntoForm(s);
   });
   li.querySelector<HTMLButtonElement>(".delete-btn")!.addEventListener("click", async () => {
+    if (!(await ensureUnlocked())) return;
     try {
       await invoke("delete_schedule", { id: s.id });
       refreshSchedules();
@@ -395,6 +477,7 @@ schedForm.addEventListener("submit", async (ev) => {
     duration_minutes,
     enabled,
   };
+  if (!(await ensureUnlocked())) return;
   try {
     if (id === 0) {
       await invoke("add_schedule", { schedule });
@@ -406,6 +489,148 @@ schedForm.addEventListener("submit", async (ev) => {
   } catch (e) {
     schedMsg.classList.add("error");
     schedMsg.textContent = String(e);
+  }
+});
+
+// ─── Settings: password lock ────────────────────────────────────────────────
+
+const lockStateEl = document.querySelector<HTMLDivElement>("#lock-state")!;
+const pwForm = document.querySelector<HTMLFormElement>("#password-form")!;
+const pwMsg = document.querySelector<HTMLParagraphElement>("#password-msg")!;
+const oldPwLabel = document.querySelector<HTMLLabelElement>("#old-pw-label")!;
+const pwSubmit = document.querySelector<HTMLButtonElement>("#password-submit")!;
+const pwClear = document.querySelector<HTMLButtonElement>("#password-clear")!;
+
+const unlockDialog = document.querySelector<HTMLDialogElement>("#unlock-dialog")!;
+const unlockForm = document.querySelector<HTMLFormElement>("#unlock-form")!;
+const unlockMsg = document.querySelector<HTMLParagraphElement>("#unlock-msg")!;
+const unlockCancel = document.querySelector<HTMLButtonElement>("#unlock-cancel")!;
+
+let unlockResolver: ((ok: boolean) => void) | null = null;
+
+/// Resolve once the user unlocks (true) or cancels (false).
+function promptUnlock(): Promise<boolean> {
+  return new Promise((resolve) => {
+    unlockResolver = resolve;
+    (unlockForm.querySelector('input[name="password"]') as HTMLInputElement).value = "";
+    unlockMsg.classList.remove("error");
+    unlockMsg.textContent = "";
+    unlockDialog.showModal();
+  });
+}
+
+function finishUnlock(ok: boolean) {
+  if (unlockDialog.open) unlockDialog.close();
+  const r = unlockResolver;
+  unlockResolver = null;
+  r?.(ok);
+}
+
+unlockForm.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const pw = (unlockForm.querySelector('input[name="password"]') as HTMLInputElement).value;
+  unlockMsg.classList.remove("error");
+  try {
+    await invoke("unlock", { password: pw });
+    finishUnlock(true);
+  } catch (e) {
+    unlockMsg.classList.add("error");
+    unlockMsg.textContent = String(e);
+  }
+});
+unlockCancel.addEventListener("click", () => finishUnlock(false));
+// Dialog dismissed via Esc → treat as cancel.
+unlockDialog.addEventListener("cancel", (ev) => {
+  ev.preventDefault();
+  finishUnlock(false);
+});
+
+/// Ensure configuration changes are permitted; prompts for the password when a
+/// password is set and no unlock window is active. Returns false if the user
+/// cancels (caller should abort the action).
+async function ensureUnlocked(): Promise<boolean> {
+  try {
+    const s = await invoke<Status>("get_status");
+    if (!s.password_set || s.unlocked) return true;
+  } catch {
+    // If status can't be read, let the action proceed and surface its own error.
+    return true;
+  }
+  return await promptUnlock();
+}
+
+async function refreshSettings() {
+  pwMsg.classList.remove("error");
+  pwMsg.textContent = "";
+  pwForm.reset();
+  try {
+    const s = await invoke<Status>("get_status");
+    if (!s.password_set) {
+      lockStateEl.textContent = "No settings password is set. Configuration can be changed freely.";
+      lockStateEl.className = "lock-state";
+      oldPwLabel.hidden = true;
+      pwClear.hidden = true;
+      pwSubmit.textContent = "Set password";
+    } else {
+      lockStateEl.textContent = s.unlocked
+        ? "Password is set. Settings are currently unlocked."
+        : "Password is set. Settings are locked.";
+      lockStateEl.className = `lock-state${s.unlocked ? " unlocked" : " locked"}`;
+      oldPwLabel.hidden = false;
+      pwClear.hidden = false;
+      pwSubmit.textContent = "Change password";
+    }
+  } catch (e) {
+    lockStateEl.textContent = `Failed to reach daemon: ${e}`;
+    lockStateEl.className = "lock-state locked";
+  }
+}
+
+pwForm.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  pwMsg.classList.remove("error");
+  pwMsg.textContent = "";
+  const fd = new FormData(pwForm);
+  const old = String(fd.get("old") ?? "");
+  const next = String(fd.get("new") ?? "");
+  const confirm = String(fd.get("confirm") ?? "");
+  if (!next) {
+    pwMsg.classList.add("error");
+    pwMsg.textContent = "new password cannot be empty";
+    return;
+  }
+  if (next !== confirm) {
+    pwMsg.classList.add("error");
+    pwMsg.textContent = "passwords do not match";
+    return;
+  }
+  try {
+    await invoke("set_password", { old: old || null, new: next });
+    pwMsg.textContent = "password updated";
+    refreshSettings();
+  } catch (e) {
+    pwMsg.classList.add("error");
+    pwMsg.textContent = String(e);
+  }
+});
+
+pwClear.addEventListener("click", async () => {
+  pwMsg.classList.remove("error");
+  pwMsg.textContent = "";
+  const fd = new FormData(pwForm);
+  const old = String(fd.get("old") ?? "");
+  if (!old) {
+    pwMsg.classList.add("error");
+    pwMsg.textContent = "enter your current password to remove it";
+    return;
+  }
+  try {
+    await invoke("set_password", { old, new: null });
+    pwMsg.textContent = "password removed";
+    refreshSettings();
+  } catch (e) {
+    pwMsg.classList.add("error");
+    pwMsg.textContent = String(e);
   }
 });
 

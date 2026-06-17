@@ -10,6 +10,9 @@ fn main() {
             "add_schedule",
             "update_schedule",
             "delete_schedule",
+            "set_password",
+            "unlock",
+            "take_break",
         ]),
     );
     tauri_build::try_build(attributes).expect("tauri-build failed");

@@ -10,6 +10,7 @@ use anyhow::Context;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
+mod auth;
 mod enforce;
 mod hosts;
 mod ipc;
@@ -27,6 +28,9 @@ pub struct Daemon {
     pub state: Mutex<State>,
     /// HMAC key loaded from /etc/frostbite/secret at startup.
     pub key: Vec<u8>,
+    /// Unix time until which configuration changes are unlocked. In-memory
+    /// only: a daemon restart relocks the settings. `0` means locked.
+    pub unlocked_until: Mutex<u64>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -87,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Re-apply the union of all still-active blocks before accepting clients.
-    let startup_domains = enforce::union_domains(&initial.active);
+    let startup_domains = enforce::union_domains(&initial.active, now);
     if let Err(e) = enforce::apply(&startup_domains) {
         error!(?e, "failed to re-apply hosts enforcement on startup");
     }
@@ -95,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
     let daemon = Arc::new(Daemon {
         state: Mutex::new(initial),
         key,
+        unlocked_until: Mutex::new(0),
     });
 
     let ipc_handle = tokio::spawn(ipc::serve(daemon.clone()));

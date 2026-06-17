@@ -16,6 +16,10 @@ pub struct Block {
     pub name: String,
     pub domains: Vec<String>,
     pub apps: Vec<AppMatcher>,
+    /// Daily "break allowance": total seconds per local day the user may pause
+    /// this block while it is active. `0` disables breaks for the block.
+    #[serde(default)]
+    pub allowance_secs_per_day: u64,
 }
 
 /// How to identify a process to kill.
@@ -48,10 +52,23 @@ pub struct ActiveBlock {
     pub ends_at_unix: u64,
     #[serde(default = "default_originator")]
     pub originator: Originator,
+    /// If set and `> now`, the block is on a break and not currently enforced.
+    /// The block does not end — enforcement resumes when this passes.
+    #[serde(default)]
+    pub break_until_unix: Option<u64>,
 }
 
 fn default_originator() -> Originator {
     Originator::Manual
+}
+
+/// Per-block record of break time spent on a given local day. Used to enforce
+/// the daily break allowance. `day` is days since the Unix epoch in local time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AllowanceLedger {
+    pub block_id: u64,
+    pub day: i64,
+    pub used_secs: u64,
 }
 
 /// A recurring weekly schedule that automatically activates a block during a
@@ -85,6 +102,13 @@ pub struct State {
     pub schedules: Vec<Schedule>,
     #[serde(default)]
     pub next_schedule_id: u64,
+    /// Argon2 PHC hash of the settings password, or `None` if unset.
+    /// When set, configuration-changing requests require an active unlock.
+    #[serde(default)]
+    pub password_hash: Option<String>,
+    /// Break-allowance consumption per block per local day.
+    #[serde(default)]
+    pub allowance: Vec<AllowanceLedger>,
 }
 
 fn deserialize_active<'de, D>(d: D) -> Result<Vec<ActiveBlock>, D::Error>
@@ -116,10 +140,19 @@ pub enum Request {
     StartBlock { id: u64, duration_secs: u64 },
     /// Rejected while any block is active in strict mode.
     CancelBlock {},
+    /// Pause an active block for up to `secs`, capped by its remaining daily
+    /// allowance. Does not end the block.
+    TakeBreak { block_id: u64, secs: u64 },
     AddSchedule { schedule: Schedule },
     UpdateSchedule { schedule: Schedule },
     DeleteSchedule { id: u64 },
     ListSchedules {},
+    /// Set, change, or clear the settings password. `new: None` clears it.
+    /// `old` must match the current password when one is already set
+    /// (unless an unlock window is currently active).
+    SetPassword { old: Option<String>, new: Option<String> },
+    /// Open a time-limited unlock window so configuration changes are allowed.
+    Unlock { password: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -127,7 +160,21 @@ pub enum Request {
 pub enum Response {
     Ok {},
     Blocks { blocks: Vec<Block> },
-    Status { active: Vec<ActiveBlock>, now_unix: u64 },
+    Status {
+        active: Vec<ActiveBlock>,
+        now_unix: u64,
+        /// Whether a settings password is configured.
+        #[serde(default)]
+        password_set: bool,
+        /// Whether configuration changes are currently permitted (no password
+        /// set, or an unlock window is active).
+        #[serde(default)]
+        unlocked: bool,
+        /// Today's break-allowance ledger entries for the active blocks, so the
+        /// client can show remaining allowance per block.
+        #[serde(default)]
+        allowance_used: Vec<AllowanceLedger>,
+    },
     Added { id: u64 },
     Schedules { schedules: Vec<Schedule> },
     Error { message: String },
