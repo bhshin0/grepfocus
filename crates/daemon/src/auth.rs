@@ -7,7 +7,9 @@
 //! the password, and store the PHC string in the HMAC-protected state file.
 
 use anyhow::anyhow;
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+};
 use argon2::Argon2;
 
 /// Hash a plaintext password into a PHC string (`$argon2id$...`).

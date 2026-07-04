@@ -30,7 +30,13 @@ pub fn apply_block(domains: &[String]) -> anyhow::Result<()> {
     let new = if domains.is_empty() {
         stripped
     } else {
-        format!("{}\n{}\n{}{}\n", stripped.trim_end(), HOSTS_BEGIN, render_block(domains), HOSTS_END)
+        format!(
+            "{}\n{}\n{}{}\n",
+            stripped.trim_end(),
+            HOSTS_BEGIN,
+            render_block(domains),
+            HOSTS_END
+        )
     };
     write_atomic(HOSTS, &new, HOSTS_MODE)?;
     chattr_immutable(HOSTS, true)?;

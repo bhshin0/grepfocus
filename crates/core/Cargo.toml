@@ -11,3 +11,8 @@ hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"
 tokio = { version = "1", default-features = false, features = ["io-util"] }
+
+[dev-dependencies]
+# #[tokio::test] needs macros + a runtime; io-util (for duplex) comes from the
+# normal dependency via feature unification.
+tokio = { version = "1", default-features = false, features = ["macros", "rt"] }

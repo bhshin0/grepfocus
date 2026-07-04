@@ -231,7 +231,9 @@ fn main() {
             }
         })
         .setup(move |app| {
-            let url = format!("http://localhost:{port}/index.html").parse().unwrap();
+            let url = format!("http://localhost:{port}/index.html")
+                .parse()
+                .unwrap();
             let _win = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
                 .title("Frostbite")
                 .inner_size(900.0, 640.0)

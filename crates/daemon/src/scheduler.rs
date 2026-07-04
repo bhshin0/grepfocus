@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
-use frostbite_core::{day_set, now_unix, ActiveBlock, Originator, Schedule};
+use frostbite_core::{day_set, now_unix, ActiveBlock, Originator, Schedule, State};
 use tracing::{error, info, warn};
 
 use crate::{enforce, state, Daemon};
@@ -34,97 +34,11 @@ pub async fn run(daemon: Arc<Daemon>) {
 async fn tick(daemon: &Arc<Daemon>) {
     let now_unix = now_unix();
     let now_local = Local::now();
+    let today = now_local.date_naive().num_days_from_ce() as i64;
 
     {
         let mut st = daemon.state.lock().await;
-
-        // Snapshot schedules so we can iterate them while mutating st.active.
-        let schedules: Vec<Schedule> = st.schedules.clone();
-        let mut changed = false;
-
-        // 1. Expire by wall clock.
-        let before = st.active.len();
-        st.active.retain(|a| a.ends_at_unix > now_unix);
-        let expired = before - st.active.len();
-        if expired > 0 {
-            info!(count = expired, "expired active blocks");
-            changed = true;
-        }
-
-        // 2. End scheduled actives whose driving schedule disappeared,
-        //    was disabled, or slid out of its window.
-        let before = st.active.len();
-        st.active.retain(|a| match &a.originator {
-            Originator::Manual => true,
-            Originator::Schedule { schedule_id } => schedules
-                .iter()
-                .find(|s| s.id == *schedule_id)
-                .map(|s| s.enabled && schedule_active_at(s, &now_local))
-                .unwrap_or(false),
-        });
-        let auto_ended = before - st.active.len();
-        if auto_ended > 0 {
-            info!(count = auto_ended, "ended schedule-driven blocks");
-            changed = true;
-        }
-
-        // 3. Auto-start schedules whose window is now open.
-        for s in &schedules {
-            if !s.enabled || !schedule_active_at(s, &now_local) {
-                continue;
-            }
-            // One ActiveBlock per block, no matter who started it: a manual
-            // run or another schedule already enforcing this block means
-            // there is nothing to add. (Two entries for one block would let
-            // TakeBreak pause one while the other keeps enforcing.)
-            let already_active = st.active.iter().any(|a| a.block.id == s.block_id);
-            if already_active {
-                continue;
-            }
-            let block = match st.blocks.iter().find(|b| b.id == s.block_id) {
-                Some(b) => b.clone(),
-                None => {
-                    warn!(
-                        schedule_id = s.id,
-                        block_id = s.block_id,
-                        "schedule references missing block"
-                    );
-                    continue;
-                }
-            };
-            let ends_at_unix = compute_window_end_unix(s, &now_local);
-            st.active.push(ActiveBlock {
-                block,
-                started_at_unix: now_unix,
-                ends_at_unix,
-                originator: Originator::Schedule { schedule_id: s.id },
-                break_until_unix: None,
-            });
-            info!(
-                schedule_id = s.id,
-                block_id = s.block_id,
-                "auto-started block from schedule"
-            );
-            changed = true;
-        }
-
-        // 4. Resume any block whose break has ended (enforcement returns).
-        for a in st.active.iter_mut() {
-            if a.break_until_unix.is_some_and(|t| t <= now_unix) {
-                a.break_until_unix = None;
-                info!(block_id = a.block.id, "break ended");
-                changed = true;
-            }
-        }
-
-        // Prune break-allowance ledger entries from previous days (resets the
-        // daily allowance). This needs a save but not a re-apply on its own.
-        let today = local_day();
-        let before = st.allowance.len();
-        st.allowance.retain(|l| l.day == today);
-        let ledger_pruned = st.allowance.len() != before;
-
-        if changed || ledger_pruned {
+        if reconcile(&mut st, now_unix, &now_local, today) {
             if let Err(e) = state::save(&st, &daemon.key) {
                 error!(?e, "scheduler save failed");
             }
@@ -136,6 +50,108 @@ async fn tick(daemon: &Arc<Daemon>) {
     if let Err(e) = enforce::sync(daemon).await {
         error!(?e, "scheduler enforce sync failed");
     }
+}
+
+/// Bring `st.active` into agreement with wall-clock expiry and the schedule
+/// table, and prune stale allowance-ledger entries. Pure over its inputs (no
+/// clock, no IO) so it can be unit-tested. Returns whether anything changed and
+/// the state therefore needs persisting.
+///
+/// Steps, in order:
+/// 1. Drop actives whose `ends_at_unix <= now_unix`.
+/// 2. Drop schedule-originated actives whose schedule was disabled/deleted or
+///    slid out of its window.
+/// 3. Start any enabled schedule currently in-window and not already active.
+/// 4. Clear breaks that have elapsed (enforcement resumes).
+///
+/// It also prunes allowance-ledger rows from days other than `today`.
+fn reconcile(st: &mut State, now_unix: u64, now_local: &DateTime<Local>, today: i64) -> bool {
+    // Snapshot schedules so we can iterate them while mutating st.active.
+    let schedules: Vec<Schedule> = st.schedules.clone();
+    let mut changed = false;
+
+    // 1. Expire by wall clock.
+    let before = st.active.len();
+    st.active.retain(|a| a.ends_at_unix > now_unix);
+    let expired = before - st.active.len();
+    if expired > 0 {
+        info!(count = expired, "expired active blocks");
+        changed = true;
+    }
+
+    // 2. End scheduled actives whose driving schedule disappeared,
+    //    was disabled, or slid out of its window.
+    let before = st.active.len();
+    st.active.retain(|a| match &a.originator {
+        Originator::Manual => true,
+        Originator::Schedule { schedule_id } => schedules
+            .iter()
+            .find(|s| s.id == *schedule_id)
+            .map(|s| s.enabled && schedule_active_at(s, now_local))
+            .unwrap_or(false),
+    });
+    let auto_ended = before - st.active.len();
+    if auto_ended > 0 {
+        info!(count = auto_ended, "ended schedule-driven blocks");
+        changed = true;
+    }
+
+    // 3. Auto-start schedules whose window is now open.
+    for s in &schedules {
+        if !s.enabled || !schedule_active_at(s, now_local) {
+            continue;
+        }
+        // One ActiveBlock per block, no matter who started it: a manual
+        // run or another schedule already enforcing this block means
+        // there is nothing to add. (Two entries for one block would let
+        // TakeBreak pause one while the other keeps enforcing.)
+        let already_active = st.active.iter().any(|a| a.block.id == s.block_id);
+        if already_active {
+            continue;
+        }
+        let block = match st.blocks.iter().find(|b| b.id == s.block_id) {
+            Some(b) => b.clone(),
+            None => {
+                warn!(
+                    schedule_id = s.id,
+                    block_id = s.block_id,
+                    "schedule references missing block"
+                );
+                continue;
+            }
+        };
+        let ends_at_unix = compute_window_end_unix(s, now_local);
+        st.active.push(ActiveBlock {
+            block,
+            started_at_unix: now_unix,
+            ends_at_unix,
+            originator: Originator::Schedule { schedule_id: s.id },
+            break_until_unix: None,
+        });
+        info!(
+            schedule_id = s.id,
+            block_id = s.block_id,
+            "auto-started block from schedule"
+        );
+        changed = true;
+    }
+
+    // 4. Resume any block whose break has ended (enforcement returns).
+    for a in st.active.iter_mut() {
+        if a.break_until_unix.is_some_and(|t| t <= now_unix) {
+            a.break_until_unix = None;
+            info!(block_id = a.block.id, "break ended");
+            changed = true;
+        }
+    }
+
+    // Prune break-allowance ledger entries from previous days (resets the
+    // daily allowance). This needs a save but not a re-apply on its own.
+    let before = st.allowance.len();
+    st.allowance.retain(|l| l.day == today);
+    let ledger_pruned = st.allowance.len() != before;
+
+    changed || ledger_pruned
 }
 
 /// Days since the Common-Era epoch in local time. The absolute value is
@@ -178,7 +194,7 @@ fn compute_window_end_unix(s: &Schedule, now: &DateTime<Local>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frostbite_core::DAY_MON;
+    use frostbite_core::{AllowanceLedger, Block, DAY_MON};
 
     fn s(start: u16, dur: u16, days: u8) -> Schedule {
         Schedule {
@@ -218,5 +234,177 @@ mod tests {
     fn wrong_weekday() {
         let sch = s(540, 60, DAY_MON);
         assert!(!schedule_active_at(&sch, &t(9, 30, chrono::Weekday::Tue)));
+    }
+
+    // ── reconcile() ─────────────────────────────────────────────────────────
+
+    fn block(id: u64) -> Block {
+        Block {
+            id,
+            name: format!("block-{id}"),
+            domains: vec!["example.com".into()],
+            apps: vec![],
+            allowance_secs_per_day: 0,
+        }
+    }
+
+    fn manual_active(block_id: u64, ends_at_unix: u64) -> ActiveBlock {
+        ActiveBlock {
+            block: block(block_id),
+            started_at_unix: 0,
+            ends_at_unix,
+            originator: Originator::Manual,
+            break_until_unix: None,
+        }
+    }
+
+    fn sched_active(block_id: u64, schedule_id: u64, ends_at_unix: u64) -> ActiveBlock {
+        ActiveBlock {
+            block: block(block_id),
+            started_at_unix: 0,
+            ends_at_unix,
+            originator: Originator::Schedule { schedule_id },
+            break_until_unix: None,
+        }
+    }
+
+    fn unix(dt: &DateTime<Local>) -> u64 {
+        dt.timestamp() as u64
+    }
+
+    fn day_of(dt: &DateTime<Local>) -> i64 {
+        dt.date_naive().num_days_from_ce() as i64
+    }
+
+    #[test]
+    fn expires_by_wall_clock() {
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let mut st = State::default();
+        st.active.push(manual_active(0, now - 1)); // ended a second ago
+        st.active.push(manual_active(1, now + 100)); // still live
+        let changed = reconcile(&mut st, now, &now_l, day_of(&now_l));
+        assert!(changed);
+        assert_eq!(st.active.len(), 1);
+        assert_eq!(st.active[0].block.id, 1);
+    }
+
+    #[test]
+    fn auto_starts_in_window_schedule() {
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let mut st = State::default();
+        st.blocks.push(block(0));
+        st.schedules.push(s(540, 60, DAY_MON)); // Mon 09:00–10:00, id 1, block 0
+        let changed = reconcile(&mut st, now, &now_l, day_of(&now_l));
+        assert!(changed);
+        assert_eq!(st.active.len(), 1);
+        assert!(matches!(
+            st.active[0].originator,
+            Originator::Schedule { schedule_id: 1 }
+        ));
+    }
+
+    #[test]
+    fn does_not_duplicate_existing_manual_active() {
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let mut st = State::default();
+        st.blocks.push(block(0));
+        st.schedules.push(s(540, 60, DAY_MON));
+        st.active.push(manual_active(0, now + 3600)); // manual already enforcing block 0
+        let changed = reconcile(&mut st, now, &now_l, day_of(&now_l));
+        assert_eq!(st.active.len(), 1);
+        assert!(matches!(st.active[0].originator, Originator::Manual));
+        assert!(!changed);
+    }
+
+    #[test]
+    fn ends_scheduled_active_when_disabled() {
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let mut st = State::default();
+        st.blocks.push(block(0));
+        let mut sch = s(540, 60, DAY_MON);
+        sch.enabled = false;
+        st.schedules.push(sch);
+        st.active.push(sched_active(0, 1, now + 3600));
+        let changed = reconcile(&mut st, now, &now_l, day_of(&now_l));
+        assert!(changed);
+        assert!(st.active.is_empty());
+    }
+
+    #[test]
+    fn ends_scheduled_active_when_window_slides() {
+        let now_l = t(10, 30, chrono::Weekday::Mon); // past the 09:00–10:00 window
+        let now = unix(&now_l);
+        let mut st = State::default();
+        st.blocks.push(block(0));
+        st.schedules.push(s(540, 60, DAY_MON));
+        st.active.push(sched_active(0, 1, now + 3600));
+        let changed = reconcile(&mut st, now, &now_l, day_of(&now_l));
+        assert!(changed);
+        assert!(st.active.is_empty());
+    }
+
+    #[test]
+    fn ends_scheduled_active_when_schedule_deleted() {
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let mut st = State::default();
+        st.blocks.push(block(0));
+        // No schedule with id 99 exists.
+        st.active.push(sched_active(0, 99, now + 3600));
+        let changed = reconcile(&mut st, now, &now_l, day_of(&now_l));
+        assert!(changed);
+        assert!(st.active.is_empty());
+    }
+
+    #[test]
+    fn resumes_after_break_ends() {
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let mut st = State::default();
+        let mut ab = manual_active(0, now + 3600);
+        ab.break_until_unix = Some(now - 5); // break already elapsed
+        st.active.push(ab);
+        let changed = reconcile(&mut st, now, &now_l, day_of(&now_l));
+        assert!(changed);
+        assert!(st.active[0].break_until_unix.is_none());
+    }
+
+    #[test]
+    fn keeps_ongoing_break() {
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let mut st = State::default();
+        let mut ab = manual_active(0, now + 3600);
+        ab.break_until_unix = Some(now + 30); // still on break
+        st.active.push(ab);
+        let changed = reconcile(&mut st, now, &now_l, day_of(&now_l));
+        assert!(!changed);
+        assert_eq!(st.active[0].break_until_unix, Some(now + 30));
+    }
+
+    #[test]
+    fn prunes_old_allowance_rows() {
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let today = day_of(&now_l);
+        let mut st = State::default();
+        st.allowance.push(AllowanceLedger {
+            block_id: 0,
+            day: today - 1,
+            used_secs: 100,
+        });
+        st.allowance.push(AllowanceLedger {
+            block_id: 0,
+            day: today,
+            used_secs: 50,
+        });
+        let changed = reconcile(&mut st, now, &now_l, today);
+        assert!(changed);
+        assert_eq!(st.allowance.len(), 1);
+        assert_eq!(st.allowance[0].day, today);
     }
 }

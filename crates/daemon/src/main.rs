@@ -63,7 +63,10 @@ async fn main() -> anyhow::Result<()> {
             if missing {
                 info!("no state file yet — first run, starting fresh");
             } else {
-                error!(?err, "state file corrupted — starting fresh and clearing any leftover hosts block");
+                error!(
+                    ?err,
+                    "state file corrupted — starting fresh and clearing any leftover hosts block"
+                );
                 if let Err(e) = hosts::clear_block() {
                     error!(?e, "failed to clear leftover hosts block");
                 }

@@ -224,19 +224,15 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             {
                 let mut st = daemon.state.lock().await;
 
-                let (allowance, ends_at) =
-                    match st.active.iter().find(|a| a.block.id == block_id) {
-                        Some(a) => {
-                            if a.break_until_unix.is_some_and(|t| t > now) {
-                                return err("this block is already on a break");
-                            }
-                            (a.block.allowance_secs_per_day, a.ends_at_unix)
+                let (allowance, ends_at) = match st.active.iter().find(|a| a.block.id == block_id) {
+                    Some(a) => {
+                        if a.break_until_unix.is_some_and(|t| t > now) {
+                            return err("this block is already on a break");
                         }
-                        None => return err(format!("block {block_id} is not active")),
-                    };
-                if allowance == 0 {
-                    return err("this block has no break allowance");
-                }
+                        (a.block.allowance_secs_per_day, a.ends_at_unix)
+                    }
+                    None => return err(format!("block {block_id} is not active")),
+                };
 
                 // How much has already been spent today on this block.
                 let used: u64 = st
@@ -245,19 +241,10 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                     .filter(|l| l.block_id == block_id && l.day == today)
                     .map(|l| l.used_secs)
                     .sum();
-                let remaining = allowance.saturating_sub(used);
-                if remaining == 0 {
-                    return err("no break allowance left today");
-                }
-                // A break can never outlive the block, so never charge for
-                // time past its end.
-                if ends_at <= now {
-                    return err("this block has already ended");
-                }
-                let grant = secs.min(remaining).min(ends_at - now);
-                if grant == 0 {
-                    return err("break length must be at least 1 second");
-                }
+                let grant = match compute_grant(allowance, used, ends_at, now, secs) {
+                    Ok(g) => g,
+                    Err(msg) => return err(msg),
+                };
 
                 // Mutate break state + ledger, keeping enough to roll back if
                 // the save fails. Every active entry for the block is flagged
@@ -266,21 +253,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 for a in st.active.iter_mut().filter(|a| a.block.id == block_id) {
                     a.break_until_unix = Some(now + grant);
                 }
-
-                // Record consumption; drop stale (other-day) entries.
-                st.allowance.retain(|l| l.day == today);
-                match st
-                    .allowance
-                    .iter_mut()
-                    .find(|l| l.block_id == block_id && l.day == today)
-                {
-                    Some(l) => l.used_secs += grant,
-                    None => st.allowance.push(AllowanceLedger {
-                        block_id,
-                        day: today,
-                        used_secs: grant,
-                    }),
-                }
+                record_break(&mut st.allowance, block_id, today, grant);
 
                 if let Err(e) = state::save(&st, &daemon.key) {
                     for a in st.active.iter_mut().filter(|a| a.block.id == block_id) {
@@ -311,7 +284,11 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             if let Some(msg) = validate_schedule(&schedule) {
                 return err(msg);
             }
-            if st.schedules.iter().any(|s| schedules_equivalent(s, &schedule)) {
+            if st
+                .schedules
+                .iter()
+                .any(|s| schedules_equivalent(s, &schedule))
+            {
                 return err("an identical schedule already exists");
             }
             let prev_schedules = st.schedules.clone();
@@ -394,7 +371,8 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                     Some(phc) => phc.clone(),
                 }
             };
-            let ok = match tokio::task::spawn_blocking(move || auth::verify(&password, &phc)).await {
+            let ok = match tokio::task::spawn_blocking(move || auth::verify(&password, &phc)).await
+            {
                 Ok(ok) => ok,
                 Err(e) => return err(format!("verify task failed: {e}")),
             };
@@ -467,9 +445,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
 /// Returns `Some(error)` when a settings password is set and no unlock window
 /// is currently active — used to gate configuration-changing requests.
 async fn gate_config(daemon: &Arc<Daemon>, st: &State) -> Option<Response> {
-    if st.password_hash.is_none() {
-        return None;
-    }
+    st.password_hash.as_ref()?; // no password set → nothing to gate
     if *daemon.unlocked_until.lock().await >= now_unix() {
         None
     } else {
@@ -511,9 +487,168 @@ fn validate_schedule(s: &Schedule) -> Option<String> {
         return Some("duration_minutes must be >= 1".into());
     }
     if s.start_minute as u32 + s.duration_minutes as u32 > 1440 {
-        return Some(
-            "schedule cannot span midnight; split into two schedules instead".into(),
-        );
+        return Some("schedule cannot span midnight; split into two schedules instead".into());
     }
     None
+}
+
+/// Compute the grantable break length (seconds) for a TakeBreak request, capped
+/// by both the remaining daily allowance and the block's remaining time. Pure,
+/// so the accounting can be unit-tested without a live daemon.
+///
+/// Returns a user-facing error string when: no allowance is configured, the
+/// allowance is exhausted for today, the block has already ended, or the
+/// computed grant is zero.
+fn compute_grant(
+    allowance: u64,
+    used_today: u64,
+    ends_at: u64,
+    now: u64,
+    requested: u64,
+) -> Result<u64, &'static str> {
+    if allowance == 0 {
+        return Err("this block has no break allowance");
+    }
+    let remaining = allowance.saturating_sub(used_today);
+    if remaining == 0 {
+        return Err("no break allowance left today");
+    }
+    // A break can never outlive the block, so never charge for time past its end.
+    if ends_at <= now {
+        return Err("this block has already ended");
+    }
+    let grant = requested.min(remaining).min(ends_at - now);
+    if grant == 0 {
+        return Err("break length must be at least 1 second");
+    }
+    Ok(grant)
+}
+
+/// Record `grant` seconds of break against `block_id` for `today`, first
+/// dropping ledger rows from other days (the daily allowance reset).
+fn record_break(ledger: &mut Vec<AllowanceLedger>, block_id: u64, today: i64, grant: u64) {
+    ledger.retain(|l| l.day == today);
+    match ledger
+        .iter_mut()
+        .find(|l| l.block_id == block_id && l.day == today)
+    {
+        Some(l) => l.used_secs += grant,
+        None => ledger.push(AllowanceLedger {
+            block_id,
+            day: today,
+            used_secs: grant,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grant_errors_without_allowance() {
+        assert_eq!(
+            compute_grant(0, 0, 2000, 1000, 60),
+            Err("this block has no break allowance")
+        );
+    }
+
+    #[test]
+    fn grant_errors_when_exhausted() {
+        assert_eq!(
+            compute_grant(600, 600, 2000, 1000, 60),
+            Err("no break allowance left today")
+        );
+        // Saturating: used beyond allowance still reads as exhausted.
+        assert_eq!(
+            compute_grant(600, 700, 2000, 1000, 60),
+            Err("no break allowance left today")
+        );
+    }
+
+    #[test]
+    fn grant_errors_when_block_ended() {
+        assert_eq!(
+            compute_grant(600, 0, 1000, 1000, 60),
+            Err("this block has already ended")
+        );
+        assert_eq!(
+            compute_grant(600, 0, 999, 1000, 60),
+            Err("this block has already ended")
+        );
+    }
+
+    #[test]
+    fn grant_errors_on_zero_request() {
+        assert_eq!(
+            compute_grant(600, 0, 2000, 1000, 0),
+            Err("break length must be at least 1 second")
+        );
+    }
+
+    #[test]
+    fn grant_capped_by_remaining_allowance() {
+        // remaining = 600 - 590 = 10; block time is ample.
+        assert_eq!(compute_grant(600, 590, 1_000_000, 1000, 100), Ok(10));
+    }
+
+    #[test]
+    fn grant_capped_by_remaining_block_time() {
+        // block ends in 5s; allowance is ample.
+        assert_eq!(compute_grant(600, 0, 1005, 1000, 100), Ok(5));
+    }
+
+    #[test]
+    fn grant_uses_request_when_smallest() {
+        assert_eq!(compute_grant(600, 0, 1_000_000, 1000, 30), Ok(30));
+    }
+
+    #[test]
+    fn record_break_adds_new_row() {
+        let mut ledger = vec![];
+        record_break(&mut ledger, 7, 42, 60);
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].block_id, 7);
+        assert_eq!(ledger[0].day, 42);
+        assert_eq!(ledger[0].used_secs, 60);
+    }
+
+    #[test]
+    fn record_break_increments_existing_row() {
+        let mut ledger = vec![AllowanceLedger {
+            block_id: 7,
+            day: 42,
+            used_secs: 60,
+        }];
+        record_break(&mut ledger, 7, 42, 30);
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].used_secs, 90);
+    }
+
+    #[test]
+    fn record_break_prunes_other_days_keeps_other_blocks() {
+        let mut ledger = vec![
+            // yesterday → pruned
+            AllowanceLedger {
+                block_id: 7,
+                day: 41,
+                used_secs: 60,
+            },
+            // today, different block → kept
+            AllowanceLedger {
+                block_id: 9,
+                day: 42,
+                used_secs: 15,
+            },
+        ];
+        record_break(&mut ledger, 7, 42, 30);
+        assert_eq!(ledger.len(), 2);
+        assert!(ledger
+            .iter()
+            .any(|l| l.block_id == 9 && l.day == 42 && l.used_secs == 15));
+        assert!(ledger
+            .iter()
+            .any(|l| l.block_id == 7 && l.day == 42 && l.used_secs == 30));
+        assert!(!ledger.iter().any(|l| l.day == 41));
+    }
 }

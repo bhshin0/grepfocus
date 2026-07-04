@@ -1,6 +1,6 @@
 fn main() {
-    let attributes = tauri_build::Attributes::new().app_manifest(
-        tauri_build::AppManifest::new().commands(&[
+    let attributes =
+        tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(&[
             "list_blocks",
             "add_block",
             "delete_block",
@@ -13,7 +13,6 @@ fn main() {
             "set_password",
             "unlock",
             "take_break",
-        ]),
-    );
+        ]));
     tauri_build::try_build(attributes).expect("tauri-build failed");
 }

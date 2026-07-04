@@ -132,34 +132,59 @@ where
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum Request {
-    AddBlock { block: Block },
-    UpdateBlock { block: Block },
-    DeleteBlock { id: u64 },
+    AddBlock {
+        block: Block,
+    },
+    UpdateBlock {
+        block: Block,
+    },
+    DeleteBlock {
+        id: u64,
+    },
     ListBlocks {},
     GetStatus {},
-    StartBlock { id: u64, duration_secs: u64 },
+    StartBlock {
+        id: u64,
+        duration_secs: u64,
+    },
     /// Rejected while any block is active in strict mode.
     CancelBlock {},
     /// Pause an active block for up to `secs`, capped by its remaining daily
     /// allowance. Does not end the block.
-    TakeBreak { block_id: u64, secs: u64 },
-    AddSchedule { schedule: Schedule },
-    UpdateSchedule { schedule: Schedule },
-    DeleteSchedule { id: u64 },
+    TakeBreak {
+        block_id: u64,
+        secs: u64,
+    },
+    AddSchedule {
+        schedule: Schedule,
+    },
+    UpdateSchedule {
+        schedule: Schedule,
+    },
+    DeleteSchedule {
+        id: u64,
+    },
     ListSchedules {},
     /// Set, change, or clear the settings password. `new: None` clears it.
     /// `old` must match the current password when one is already set
     /// (unless an unlock window is currently active).
-    SetPassword { old: Option<String>, new: Option<String> },
+    SetPassword {
+        old: Option<String>,
+        new: Option<String>,
+    },
     /// Open a time-limited unlock window so configuration changes are allowed.
-    Unlock { password: String },
+    Unlock {
+        password: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
     Ok {},
-    Blocks { blocks: Vec<Block> },
+    Blocks {
+        blocks: Vec<Block>,
+    },
     Status {
         active: Vec<ActiveBlock>,
         now_unix: u64,
@@ -175,9 +200,15 @@ pub enum Response {
         #[serde(default)]
         allowance_used: Vec<AllowanceLedger>,
     },
-    Added { id: u64 },
-    Schedules { schedules: Vec<Schedule> },
-    Error { message: String },
+    Added {
+        id: u64,
+    },
+    Schedules {
+        schedules: Vec<Schedule>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 pub fn now_unix() -> u64 {

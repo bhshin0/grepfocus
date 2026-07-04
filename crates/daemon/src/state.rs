@@ -195,7 +195,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let key = b"missing-file-test-key-0123456789a";
         let err = load_in(dir.path(), key).unwrap_err();
-        assert!(is_not_found(&err), "a missing state.json must read as NotFound");
+        assert!(
+            is_not_found(&err),
+            "a missing state.json must read as NotFound"
+        );
     }
 
     #[test]

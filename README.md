@@ -98,6 +98,42 @@ cargo install tauri-cli --version "^2.0"
 cd crates/gui && cargo tauri dev
 ```
 
+## Development
+
+Run the full pre-flight suite before committing:
+
+```bash
+./scripts/check.sh
+```
+
+It runs, stopping on the first failure:
+
+- `cargo fmt --all --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`
+- `pnpm --dir crates/gui/ui build` (`tsc -noEmit` + `vite build`)
+
+Requirements: the `rustfmt` and `clippy` components
+(`rustup component add rustfmt clippy`), `pnpm`, and — for the workspace-wide
+clippy/test that include the GUI crate — the webkit2gtk-4.1 + gtk-3 dev libs.
+On a headless box without those, scope the Rust steps to
+`-p frostbite-core -p frostbited`.
+
+You can wire it up as a pre-commit hook if you like (not installed
+automatically):
+
+```bash
+ln -s ../../scripts/check.sh .git/hooks/pre-commit
+```
+
+To rebuild and redeploy onto the local machine in one step (installs the
+daemon/GUI binaries, restarts the service, and installs the launcher + tray
+autostart entry), use the upgrade loop:
+
+```bash
+./packaging/upgrade.sh   # run as your normal user; uses sudo for system steps
+```
+
 ## Wire protocol
 
 The daemon listens on a Unix socket. Each frame is a 4-byte big-endian
