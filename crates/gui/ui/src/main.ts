@@ -526,22 +526,28 @@ const unlockMsg = document.querySelector<HTMLParagraphElement>("#unlock-msg")!;
 const unlockCancel = document.querySelector<HTMLButtonElement>("#unlock-cancel")!;
 
 let unlockResolver: ((ok: boolean) => void) | null = null;
+let unlockPromise: Promise<boolean> | null = null;
 
-/// Resolve once the user unlocks (true) or cancels (false).
+/// Resolve once the user unlocks (true) or cancels (false). Concurrent gated
+/// actions share the single in-flight prompt instead of each opening its own
+/// and clobbering the previous resolver (which would leak that promise).
 function promptUnlock(): Promise<boolean> {
-  return new Promise((resolve) => {
+  if (unlockPromise) return unlockPromise;
+  unlockPromise = new Promise((resolve) => {
     unlockResolver = resolve;
     (unlockForm.querySelector('input[name="password"]') as HTMLInputElement).value = "";
     unlockMsg.classList.remove("error");
     unlockMsg.textContent = "";
     unlockDialog.showModal();
   });
+  return unlockPromise;
 }
 
 function finishUnlock(ok: boolean) {
   if (unlockDialog.open) unlockDialog.close();
   const r = unlockResolver;
   unlockResolver = null;
+  unlockPromise = null;
   r?.(ok);
 }
 

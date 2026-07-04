@@ -161,7 +161,16 @@ fn spawn_status_watcher(app: AppHandle) {
             ticker.tick().await;
             let active = match client::call(Request::GetStatus {}).await {
                 Ok(Response::Status { active, .. }) => active,
-                _ => continue, // daemon down / transient error — try again next tick
+                _ => {
+                    // Daemon down / transient error. Surface it in the tooltip
+                    // instead of leaving the stale "N active" text, but do NOT
+                    // touch `prev`: keeping the notification baseline avoids a
+                    // spurious burst of "block started/ended" when it recovers.
+                    if let Some(tray) = app.tray_by_id("frostbite-tray") {
+                        let _ = tray.set_tooltip(Some("Frostbite — daemon unreachable"));
+                    }
+                    continue;
+                }
             };
             let cur: HashMap<u64, String> = active
                 .iter()

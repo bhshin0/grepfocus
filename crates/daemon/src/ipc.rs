@@ -65,7 +65,18 @@ async fn handle(mut stream: UnixStream, daemon: Arc<Daemon>) -> anyhow::Result<(
             Err(e) => return Err(e.into()),
         };
         let resp = dispatch(req, &daemon).await;
-        frostbite_core::wire::write_json(&mut stream, &resp).await?;
+        if let Err(e) = frostbite_core::wire::write_json(&mut stream, &resp).await {
+            if e.kind() == std::io::ErrorKind::InvalidData {
+                // The response was too large (or unserializable) to frame.
+                // write_json serializes and size-checks before writing any
+                // bytes, so the stream is still intact — report a small error
+                // and keep the connection open instead of dropping it.
+                warn!(?e, "response could not be framed; sending error instead");
+                frostbite_core::wire::write_json(&mut stream, &err("response too large")).await?;
+            } else {
+                return Err(e.into());
+            }
+        }
     }
 }
 
@@ -106,11 +117,15 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             if let Some(resp) = gate_config(daemon, &st).await {
                 return resp;
             }
+            let prev_blocks = st.blocks.clone();
+            let prev_next_id = st.next_id;
             block.id = st.next_id;
             st.next_id += 1;
             let id = block.id;
             st.blocks.push(block);
             if let Err(e) = state::save(&st, &daemon.key) {
+                st.blocks = prev_blocks;
+                st.next_id = prev_next_id;
                 return err(format!("save failed: {e}"));
             }
             Response::Added { id }
@@ -124,11 +139,13 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             if st.active.iter().any(|a| a.block.id == block.id) {
                 return err("cannot edit a block while it is active");
             }
+            let prev_blocks = st.blocks.clone();
             match st.blocks.iter_mut().find(|b| b.id == block.id) {
                 Some(slot) => *slot = block,
                 None => return err(format!("no block with id {}", block.id)),
             }
             if let Err(e) = state::save(&st, &daemon.key) {
+                st.blocks = prev_blocks;
                 return err(format!("save failed: {e}"));
             }
             Response::Ok {}
@@ -145,12 +162,14 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             if st.schedules.iter().any(|s| s.block_id == id) {
                 return err("cannot delete a block referenced by a schedule");
             }
+            let prev_blocks = st.blocks.clone();
             let before = st.blocks.len();
             st.blocks.retain(|b| b.id != id);
             if st.blocks.len() == before {
                 return err(format!("no block with id {id}"));
             }
             if let Err(e) = state::save(&st, &daemon.key) {
+                st.blocks = prev_blocks;
                 return err(format!("save failed: {e}"));
             }
             Response::Ok {}
@@ -295,11 +314,15 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             if st.schedules.iter().any(|s| schedules_equivalent(s, &schedule)) {
                 return err("an identical schedule already exists");
             }
+            let prev_schedules = st.schedules.clone();
+            let prev_next = st.next_schedule_id;
             schedule.id = st.next_schedule_id;
             st.next_schedule_id += 1;
             let id = schedule.id;
             st.schedules.push(schedule);
             if let Err(e) = state::save(&st, &daemon.key) {
+                st.schedules = prev_schedules;
+                st.next_schedule_id = prev_next;
                 return err(format!("save failed: {e}"));
             }
             Response::Added { id }
@@ -323,11 +346,13 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             {
                 return err("an identical schedule already exists");
             }
+            let prev_schedules = st.schedules.clone();
             match st.schedules.iter_mut().find(|s| s.id == schedule.id) {
                 Some(slot) => *slot = schedule,
                 None => return err(format!("no schedule with id {}", schedule.id)),
             }
             if let Err(e) = state::save(&st, &daemon.key) {
+                st.schedules = prev_schedules;
                 return err(format!("save failed: {e}"));
             }
             Response::Ok {}
@@ -338,12 +363,14 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             if let Some(resp) = gate_config(daemon, &st).await {
                 return resp;
             }
+            let prev_schedules = st.schedules.clone();
             let before = st.schedules.len();
             st.schedules.retain(|s| s.id != id);
             if st.schedules.len() == before {
                 return err(format!("no schedule with id {id}"));
             }
             if let Err(e) = state::save(&st, &daemon.key) {
+                st.schedules = prev_schedules;
                 return err(format!("save failed: {e}"));
             }
             Response::Ok {}
@@ -357,43 +384,69 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
         }
 
         Request::Unlock { password } => {
-            let st = daemon.state.lock().await;
-            match &st.password_hash {
-                None => Response::Ok {}, // nothing to unlock
-                Some(phc) => {
-                    let ok = auth::verify(&password, phc);
-                    drop(st);
-                    if ok {
-                        *daemon.unlocked_until.lock().await = now_unix() + UNLOCK_SECS;
-                        info!("settings unlocked");
-                        Response::Ok {}
-                    } else {
-                        err("incorrect password")
-                    }
+            // Snapshot the stored hash, then release the state lock before the
+            // CPU-heavy Argon2 verify so the scheduler, procwatch, and other
+            // IPC clients aren't stalled for the hash duration.
+            let phc = {
+                let st = daemon.state.lock().await;
+                match &st.password_hash {
+                    None => return Response::Ok {}, // nothing to unlock
+                    Some(phc) => phc.clone(),
                 }
+            };
+            let ok = match tokio::task::spawn_blocking(move || auth::verify(&password, &phc)).await {
+                Ok(ok) => ok,
+                Err(e) => return err(format!("verify task failed: {e}")),
+            };
+            if ok {
+                *daemon.unlocked_until.lock().await = now_unix() + UNLOCK_SECS;
+                info!("settings unlocked");
+                Response::Ok {}
+            } else {
+                err("incorrect password")
             }
         }
 
         Request::SetPassword { old, new } => {
-            let mut st = daemon.state.lock().await;
-            // Changing or clearing an existing password requires proof: either
-            // the old password, or a currently-active unlock window.
-            if let Some(phc) = &st.password_hash {
-                let unlocked = *daemon.unlocked_until.lock().await >= now_unix();
-                let old_ok = old.as_deref().is_some_and(|o| auth::verify(o, phc));
-                if !old_ok && !unlocked {
-                    return err("current password required to change it");
+            // Snapshot the current hash and unlock state, then do all Argon2
+            // work (verify old + hash new) off the state lock so the scheduler,
+            // procwatch, and other IPC clients keep running during the hash.
+            let snapshot = daemon.state.lock().await.password_hash.clone();
+            let unlocked = *daemon.unlocked_until.lock().await >= now_unix();
+
+            let snap_for_task = snapshot.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                // Changing or clearing an existing password requires proof:
+                // either the old password, or a currently-active unlock window.
+                if let Some(phc) = &snap_for_task {
+                    let old_ok = old.as_deref().is_some_and(|o| auth::verify(o, phc));
+                    if !old_ok && !unlocked {
+                        return Err("current password required to change it".to_string());
+                    }
                 }
-            }
-            let new_hash = match new.as_deref() {
-                Some("") => return err("new password cannot be empty"),
-                Some(p) => match auth::hash(p) {
-                    Ok(h) => Some(h),
-                    Err(e) => return err(format!("hashing failed: {e}")),
-                },
-                None => None,
+                match new.as_deref() {
+                    Some("") => Err("new password cannot be empty".to_string()),
+                    Some(p) => auth::hash(p)
+                        .map(Some)
+                        .map_err(|e| format!("hashing failed: {e}")),
+                    None => Ok(None),
+                }
+            })
+            .await;
+            let new_hash = match task {
+                Ok(Ok(h)) => h,
+                Ok(Err(msg)) => return err(msg),
+                Err(e) => return err(format!("password task failed: {e}")),
             };
             let cleared = new_hash.is_none();
+
+            // Re-acquire the lock and guard against a concurrent password change
+            // during the hash: if the stored hash moved, the caller's decision
+            // was based on stale state, so make them retry.
+            let mut st = daemon.state.lock().await;
+            if st.password_hash != snapshot {
+                return err("password changed concurrently; please retry");
+            }
             let prev = std::mem::replace(&mut st.password_hash, new_hash);
             if let Err(e) = state::save(&st, &daemon.key) {
                 // Roll back so we never end up requiring a password the user

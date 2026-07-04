@@ -4,7 +4,7 @@ use std::io;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const MAX_FRAME: usize = 1 << 20; // 1 MiB
+const MAX_FRAME: usize = 1 << 24; // 16 MiB
 
 pub async fn write_json<W, T>(w: &mut W, value: &T) -> io::Result<()>
 where
