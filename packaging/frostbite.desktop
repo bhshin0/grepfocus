@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Frostbite
+Comment=Website and app blocker
+Exec=/usr/local/bin/frostbite-gui
+Icon=frostbite
+Categories=Utility;
+Terminal=false
+StartupNotify=false
