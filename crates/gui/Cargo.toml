@@ -21,4 +21,5 @@ tauri = { version = "2", features = ["devtools", "tray-icon", "image-png"] }
 tauri-plugin-shell = "2"
 tauri-plugin-localhost = "2"
 tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
 portpicker = "0.1"

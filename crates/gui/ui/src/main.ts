@@ -185,6 +185,16 @@ function renderBlockCard(b: Block): HTMLLIElement {
 const statusEl = document.querySelector<HTMLDivElement>("#status-content")!;
 let activeServerSkew = 0; // server now - client now, in seconds
 let countdownTimer: number | null = null;
+let breakRequestInFlight = false;
+
+/// True while re-rendering the status list would yank the DOM out from under
+/// the user: a take-break request is in flight (a re-render would produce a
+/// fresh, enabled button mid-request) or they are typing in a status input.
+function statusInteractionBusy(): boolean {
+  if (breakRequestInFlight) return true;
+  const el = document.activeElement;
+  return el instanceof HTMLInputElement && statusEl.contains(el);
+}
 
 async function refreshStatus() {
   try {
@@ -195,7 +205,11 @@ async function refreshStatus() {
       stopCountdownTimer();
       return;
     }
-    renderActive(s);
+    // Countdowns keep ticking off the existing DOM; the next idle poll
+    // re-renders with fresh data.
+    if (!statusInteractionBusy()) {
+      renderActive(s);
+    }
     if (countdownTimer == null) {
       countdownTimer = window.setInterval(tickCountdowns, 1000);
     }
@@ -278,13 +292,18 @@ function renderActive(s: Status) {
         btn.addEventListener("click", async () => {
           const minutes = Math.max(1, parseInt(input.value, 10) || 1);
           btn.disabled = true;
+          breakRequestInFlight = true;
+          let ok = false;
           try {
             await invoke("take_break", { blockId: a.block.id, secs: minutes * 60 });
-            refreshStatus();
+            ok = true;
           } catch (e) {
             left.textContent = String(e);
             btn.disabled = false;
+          } finally {
+            breakRequestInFlight = false;
           }
+          if (ok) refreshStatus();
         });
         div.appendChild(row);
       }

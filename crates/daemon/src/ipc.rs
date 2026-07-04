@@ -157,7 +157,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
         }
 
         Request::StartBlock { id, duration_secs } => {
-            let domains = {
+            {
                 let mut st = daemon.state.lock().await;
                 if st.active.iter().any(|a| a.block.id == id) {
                     return err(format!("block {id} is already active"));
@@ -170,7 +170,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 st.active.push(ActiveBlock {
                     block,
                     started_at_unix: now,
-                    ends_at_unix: now + duration_secs,
+                    ends_at_unix: now.saturating_add(duration_secs),
                     originator: Originator::Manual,
                     break_until_unix: None,
                 });
@@ -178,11 +178,12 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                     st.active.pop();
                     return err(format!("save failed: {e}"));
                 }
-                enforce::union_domains(&st.active, now)
-            };
-            if let Err(e) = enforce::apply(&domains) {
-                error!(?e, "failed to apply hosts after start_block");
-                return err(format!("apply failed: {e}"));
+            }
+            if let Err(e) = enforce::sync(daemon).await {
+                error!(?e, "failed to apply enforcement after start_block");
+                return err(format!(
+                    "block started, but enforcement failed to apply (will retry): {e}"
+                ));
             }
             info!(id, duration_secs, "block started (manual)");
             Response::Ok {}
@@ -201,13 +202,19 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
         Request::TakeBreak { block_id, secs } => {
             let now = now_unix();
             let today = scheduler::local_day();
-            let domains = {
+            {
                 let mut st = daemon.state.lock().await;
 
-                let allowance = match st.active.iter().find(|a| a.block.id == block_id) {
-                    Some(a) => a.block.allowance_secs_per_day,
-                    None => return err(format!("block {block_id} is not active")),
-                };
+                let (allowance, ends_at) =
+                    match st.active.iter().find(|a| a.block.id == block_id) {
+                        Some(a) => {
+                            if a.break_until_unix.is_some_and(|t| t > now) {
+                                return err("this block is already on a break");
+                            }
+                            (a.block.allowance_secs_per_day, a.ends_at_unix)
+                        }
+                        None => return err(format!("block {block_id} is not active")),
+                    };
                 if allowance == 0 {
                     return err("this block has no break allowance");
                 }
@@ -223,13 +230,21 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 if remaining == 0 {
                     return err("no break allowance left today");
                 }
-                let grant = secs.min(remaining);
+                // A break can never outlive the block, so never charge for
+                // time past its end.
+                if ends_at <= now {
+                    return err("this block has already ended");
+                }
+                let grant = secs.min(remaining).min(ends_at - now);
                 if grant == 0 {
                     return err("break length must be at least 1 second");
                 }
 
-                // Apply the break to the active block.
-                if let Some(a) = st.active.iter_mut().find(|a| a.block.id == block_id) {
+                // Mutate break state + ledger, keeping enough to roll back if
+                // the save fails. Every active entry for the block is flagged
+                // so a duplicate entry (however it arose) can't keep enforcing.
+                let prev_ledger = st.allowance.clone();
+                for a in st.active.iter_mut().filter(|a| a.block.id == block_id) {
                     a.break_until_unix = Some(now + grant);
                 }
 
@@ -249,14 +264,19 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 }
 
                 if let Err(e) = state::save(&st, &daemon.key) {
+                    for a in st.active.iter_mut().filter(|a| a.block.id == block_id) {
+                        a.break_until_unix = None;
+                    }
+                    st.allowance = prev_ledger;
                     return err(format!("save failed: {e}"));
                 }
                 info!(block_id, grant, "break started");
-                enforce::union_domains(&st.active, now)
-            };
-            if let Err(e) = enforce::apply(&domains) {
-                error!(?e, "failed to apply hosts after take_break");
-                return err(format!("apply failed: {e}"));
+            }
+            if let Err(e) = enforce::sync(daemon).await {
+                error!(?e, "failed to lift enforcement after take_break");
+                return err(format!(
+                    "break recorded, but lifting enforcement failed (will retry): {e}"
+                ));
             }
             Response::Ok {}
         }
@@ -374,8 +394,11 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 None => None,
             };
             let cleared = new_hash.is_none();
-            st.password_hash = new_hash;
+            let prev = std::mem::replace(&mut st.password_hash, new_hash);
             if let Err(e) = state::save(&st, &daemon.key) {
+                // Roll back so we never end up requiring a password the user
+                // was just told failed to apply.
+                st.password_hash = prev;
                 return err(format!("save failed: {e}"));
             }
             drop(st);

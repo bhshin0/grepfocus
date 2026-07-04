@@ -9,15 +9,48 @@
 
 use std::collections::BTreeSet;
 
-use frostbite_core::ActiveBlock;
+use frostbite_core::{now_unix, ActiveBlock};
 use tracing::warn;
 
-use crate::{hosts, nftables};
+use crate::{hosts, nftables, Daemon};
+
+/// Reconcile the live system (`/etc/hosts` + nftables) with the current
+/// `state.active`. This is the only enforcement entry point callers should
+/// use after mutating state:
+///
+/// - All applies are serialized by `daemon.applied`, and the domain union is
+///   computed *inside* that critical section, so a stale union can never be
+///   applied after a fresher one.
+/// - The last successfully applied union is memoized; matching unions are a
+///   cheap no-op, which lets the scheduler call this every tick.
+/// - On failure the memo is cleared, so the next tick retries automatically.
+///
+/// Callers must NOT hold the state lock (lock order is `applied` → `state`).
+pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
+    let mut applied = daemon.applied.lock().await;
+    let domains = {
+        let st = daemon.state.lock().await;
+        union_domains(&st.active, now_unix())
+    };
+    if applied.as_ref() == Some(&domains) {
+        return Ok(());
+    }
+    match apply(&domains) {
+        Ok(()) => {
+            *applied = Some(domains);
+            Ok(())
+        }
+        Err(e) => {
+            *applied = None;
+            Err(e)
+        }
+    }
+}
 
 /// Deduplicated, sorted union of all domains across the active blocks that are
 /// currently being enforced. Blocks on a break (`break_until_unix > now`) are
 /// skipped so their domains resolve again until the break ends.
-pub fn union_domains(active: &[ActiveBlock], now: u64) -> Vec<String> {
+fn union_domains(active: &[ActiveBlock], now: u64) -> Vec<String> {
     let mut set: BTreeSet<String> = BTreeSet::new();
     for a in active {
         if a.break_until_unix.is_some_and(|t| t > now) {
@@ -38,7 +71,7 @@ pub fn union_domains(active: &[ActiveBlock], now: u64) -> Vec<String> {
 ///
 /// DoH blocking only matters when websites are being blocked — an
 /// app-only block (`domains: []`) doesn't need it.
-pub fn apply(domains: &[String]) -> anyhow::Result<()> {
+fn apply(domains: &[String]) -> anyhow::Result<()> {
     if domains.is_empty() {
         hosts::clear_block()?;
         if let Err(e) = nftables::clear() {

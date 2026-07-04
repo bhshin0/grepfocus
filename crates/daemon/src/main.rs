@@ -31,6 +31,10 @@ pub struct Daemon {
     /// Unix time until which configuration changes are unlocked. In-memory
     /// only: a daemon restart relocks the settings. `0` means locked.
     pub unlocked_until: Mutex<u64>,
+    /// Serializes enforcement writes and memoizes the domain union that was
+    /// last applied successfully. `None` means unknown/dirty — the next
+    /// `enforce::sync` re-applies unconditionally. See `enforce::sync`.
+    pub applied: Mutex<Option<Vec<String>>>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -90,17 +94,17 @@ async fn main() -> anyhow::Result<()> {
         "daemon starting"
     );
 
-    // Re-apply the union of all still-active blocks before accepting clients.
-    let startup_domains = enforce::union_domains(&initial.active, now);
-    if let Err(e) = enforce::apply(&startup_domains) {
-        error!(?e, "failed to re-apply hosts enforcement on startup");
-    }
-
     let daemon = Arc::new(Daemon {
         state: Mutex::new(initial),
         key,
         unlocked_until: Mutex::new(0),
+        applied: Mutex::new(None),
     });
+
+    // Re-apply the union of all still-active blocks before accepting clients.
+    if let Err(e) = enforce::sync(&daemon).await {
+        error!(?e, "failed to re-apply hosts enforcement on startup");
+    }
 
     let ipc_handle = tokio::spawn(ipc::serve(daemon.clone()));
     let watch_handle = tokio::spawn(procwatch::run(daemon.clone()));

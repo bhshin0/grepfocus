@@ -35,7 +35,7 @@ async fn tick(daemon: &Arc<Daemon>) {
     let now_unix = now_unix();
     let now_local = Local::now();
 
-    let domains_to_apply = {
+    {
         let mut st = daemon.state.lock().await;
 
         // Snapshot schedules so we can iterate them while mutating st.active.
@@ -73,9 +73,11 @@ async fn tick(daemon: &Arc<Daemon>) {
             if !s.enabled || !schedule_active_at(s, &now_local) {
                 continue;
             }
-            let already_active = st.active.iter().any(|a| {
-                matches!(&a.originator, Originator::Schedule { schedule_id } if *schedule_id == s.id)
-            });
+            // One ActiveBlock per block, no matter who started it: a manual
+            // run or another schedule already enforcing this block means
+            // there is nothing to add. (Two entries for one block would let
+            // TakeBreak pause one while the other keeps enforcing.)
+            let already_active = st.active.iter().any(|a| a.block.id == s.block_id);
             if already_active {
                 continue;
             }
@@ -127,17 +129,12 @@ async fn tick(daemon: &Arc<Daemon>) {
                 error!(?e, "scheduler save failed");
             }
         }
-        if changed {
-            Some(enforce::union_domains(&st.active, now_unix))
-        } else {
-            None
-        }
-    };
+    }
 
-    if let Some(domains) = domains_to_apply {
-        if let Err(e) = enforce::apply(&domains) {
-            error!(?e, "scheduler enforce::apply failed");
-        }
+    // Reconcile enforcement every tick: sync() is a no-op while the applied
+    // union is unchanged, and retries automatically after a failed apply.
+    if let Err(e) = enforce::sync(daemon).await {
+        error!(?e, "scheduler enforce sync failed");
     }
 }
 

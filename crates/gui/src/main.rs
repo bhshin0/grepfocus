@@ -202,6 +202,15 @@ fn main() {
     let port = portpicker::pick_unused_port().expect("no free port");
 
     tauri::Builder::default()
+        // Must be the first plugin: a second launch surfaces the existing
+        // window (likely hidden in the tray) instead of spawning a duplicate
+        // process with its own tray icon and notification stream.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_localhost::Builder::new(port).build())
         .plugin(tauri_plugin_notification::init())
         .on_window_event(|window, event| {
