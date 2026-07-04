@@ -5,9 +5,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 pub const HOSTS: &str = "/etc/hosts";
+/// Recovery copy of the unmanaged `/etc/hosts` content, written before every
+/// managed-region edit so the real hosts file can be restored by hand.
+pub const HOSTS_ORIG: &str = "/var/lib/frostbite/hosts.orig";
 pub const STATE_DIR: &str = "/var/lib/frostbite";
-pub const STATE_FILE: &str = "/var/lib/frostbite/state.json";
-pub const STATE_MAC: &str = "/var/lib/frostbite/state.json.mac";
 pub const SECRET_DIR: &str = "/etc/frostbite";
 pub const SECRET_FILE: &str = "/etc/frostbite/secret";
 pub const RUN_DIR: &str = "/run/frostbite";

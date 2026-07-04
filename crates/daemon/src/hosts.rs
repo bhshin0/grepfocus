@@ -4,12 +4,19 @@
 //! Any content outside that region is preserved verbatim.
 
 use std::fs;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::process::Command;
 
 use anyhow::{anyhow, Context};
 use tracing::debug;
 
-use crate::paths::{HOSTS, HOSTS_BEGIN, HOSTS_END};
+use crate::paths::{HOSTS, HOSTS_BEGIN, HOSTS_END, HOSTS_ORIG};
+
+/// Standard mode for `/etc/hosts`: world-readable so the libc resolver works
+/// for non-root processes.
+const HOSTS_MODE: u32 = 0o644;
+/// Recovery copy is root-only.
+const HOSTS_ORIG_MODE: u32 = 0o600;
 
 /// Apply the block: remove any existing managed region, append a fresh one
 /// with all blocked domains, then mark /etc/hosts immutable.
@@ -17,12 +24,15 @@ pub fn apply_block(domains: &[String]) -> anyhow::Result<()> {
     chattr_immutable(HOSTS, false).ok(); // best-effort unlock if previously locked
     let original = fs::read_to_string(HOSTS).context("reading /etc/hosts")?;
     let stripped = strip_managed(&original);
+    // Snapshot the unmanaged content before we touch /etc/hosts, so it can be
+    // recovered by hand if a later edit corrupts the live file.
+    write_atomic(HOSTS_ORIG, &stripped, HOSTS_ORIG_MODE)?;
     let new = if domains.is_empty() {
         stripped
     } else {
         format!("{}\n{}\n{}{}\n", stripped.trim_end(), HOSTS_BEGIN, render_block(domains), HOSTS_END)
     };
-    write_atomic(HOSTS, &new)?;
+    write_atomic(HOSTS, &new, HOSTS_MODE)?;
     chattr_immutable(HOSTS, true)?;
     Ok(())
 }
@@ -36,8 +46,10 @@ pub fn clear_block() -> anyhow::Result<()> {
         Err(e) => return Err(e).context("reading /etc/hosts"),
     };
     let stripped = strip_managed(&original);
+    // Refresh the recovery copy before editing (matches apply_block).
+    write_atomic(HOSTS_ORIG, &stripped, HOSTS_ORIG_MODE)?;
     if stripped != original {
-        write_atomic(HOSTS, &stripped)?;
+        write_atomic(HOSTS, &stripped, HOSTS_MODE)?;
     }
     Ok(())
 }
@@ -77,10 +89,30 @@ fn strip_managed(s: &str) -> String {
     out
 }
 
-fn write_atomic(path: &str, content: &str) -> anyhow::Result<()> {
+/// Write `content` to `path` durably: write a sibling tmp file, fsync it, then
+/// rename over the target. Mirrors `state::save_in`. `mode` is the final file
+/// mode (0644 for /etc/hosts so the resolver can read it, 0600 for the
+/// root-only recovery copy).
+fn write_atomic(path: &str, content: &str, mode: u32) -> anyhow::Result<()> {
+    use std::io::Write;
     let tmp = format!("{}.frostbite.tmp", path);
-    fs::write(&tmp, content).with_context(|| format!("writing {}", tmp))?;
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(&tmp)
+            .with_context(|| format!("opening {}", tmp))?;
+        f.write_all(content.as_bytes())
+            .with_context(|| format!("writing {}", tmp))?;
+        f.sync_all().with_context(|| format!("fsync {}", tmp))?;
+    }
     fs::rename(&tmp, path).with_context(|| format!("renaming over {}", path))?;
+    // Guarantee the final mode even if a stale tmp was reused (mode() only
+    // applies on fresh creation).
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("setting mode on {}", path))?;
     Ok(())
 }
 
