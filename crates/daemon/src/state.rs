@@ -116,8 +116,8 @@ pub fn save_in(dir: &Path, state: &State, key: &[u8]) -> anyhow::Result<()> {
     // right after this returns could resurrect the old state.json on some
     // journaling filesystems. Best-effort — the file contents are already
     // durable from the sync_all above.
-    if let Ok(d) = fs::File::open(dir) {
-        let _ = d.sync_all();
+    if let Err(e) = fs::File::open(dir).and_then(|d| d.sync_all()) {
+        tracing::debug!(?e, "best-effort state directory fsync failed");
     }
 
     // Best-effort cleanup of the legacy sidecar; its absence is expected once

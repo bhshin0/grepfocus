@@ -139,8 +139,8 @@ fn write_recovery_copy(stripped: &str) {
 /// durable across power loss. A failure here doesn't undo the write.
 fn fsync_parent_dir(path: &std::path::Path) {
     if let Some(parent) = path.parent() {
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
+        if let Err(e) = fs::File::open(parent).and_then(|d| d.sync_all()) {
+            debug!(?e, "best-effort parent-dir fsync failed");
         }
     }
 }
