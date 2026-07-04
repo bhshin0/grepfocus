@@ -292,3 +292,84 @@ the implementation itself needs none of it until deploy time:
 - Log out/in for the autostart check.
 - If verifying in a container: `apt-get install libwebkit2gtk-4.1-dev
   libgtk-3-dev` (best-effort, may be unavailable).
+
+## 12. Implementation status (2026-07-04)
+
+All four repository-level phases are implemented and committed on `master`, one
+commit per phase, in order:
+
+- Phase 1 — `43fd859` (durability: hosts fsync + `hosts.orig`, single-file
+  state)
+- Phase 2 — `b09c052` (backlog lows: config-arm rollback, off-lock Argon2,
+  wire cap, GUI races)
+- Phase 3 — `0adba4d` (launcher `.desktop` + `upgrade.sh`)
+- Phase 4 — `f7ae9c2` (test floor, extracted helpers, `scripts/check.sh`,
+  tree-wide `cargo fmt`)
+
+Repository acceptance criteria all pass on the author's machine:
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
+warnings`, `cargo test --workspace` (45 tests, up from 12), the pnpm UI
+build (`tsc -noEmit` + vite), and `cargo build --release` (both binaries).
+
+### Deviations from the plan as written
+
+- **State-format tests moved from Phase 4 to Phase 1.** They cover the
+  riskiest change (the state rewrite), so they were co-located with it for
+  revertability and to test the risky change as it landed. All other tests
+  stayed in Phase 4 as planned.
+- **`write_atomic` gained a `mode` parameter** (hosts.rs) instead of a single
+  hardcoded mode. The plan said "reuse `write_atomic`" with mode 0600 for
+  `hosts.orig`; a single hardcoded 0600 would have regressed `/etc/hosts` from
+  its required 0644 (world-readable, needed by the libc resolver). `/etc/hosts`
+  is written 0644, the recovery copy 0600, both re-asserted via
+  `set_permissions` after rename.
+- **`load_in` corruption classification made explicit.** A present-but-
+  unverifiable `state.json` now returns a non-`NotFound` error (→ "corrupted"),
+  while only an absent file yields `NotFound` (→ "first run"), realizing the
+  plan's stated intent precisely.
+- **`paths::STATE_FILE`/`STATE_MAC` removed** (dead after the dir-based
+  `save_in`/`load_in`); filenames now live in `state.rs`. Required to pass
+  `clippy -D warnings`.
+- **Pre-existing clippy lints fixed in Phase 4** (`procwatch` `is_none_or`,
+  `gate_config` `?`), alongside the tree-wide `cargo fmt`, so the new
+  `check.sh` gate passes.
+- **`.desktop` includes `Terminal=false`** (standard for GUI entries) beyond
+  the plan's literal field list.
+- **BACKLOG "fixed" markers** reference the fixing phase (and the real Phase 1
+  hash for the crash-window item); a commit cannot embed its own hash, so the
+  Phase 2 items cite the phase rather than a literal SHA.
+- **rustfmt + clippy components were installed** into the user's `~/.rustup`
+  (`rustup component add`) — a per-user toolchain change, not a system/sudo
+  modification — because `check.sh` requires them.
+
+### Adversarial review
+
+A multi-agent adversarial review of the full diff (`195095d..HEAD`, 8
+dimensions, each finding double-verified) surfaced four real low/medium issues,
+all fixed:
+
+- `03b4dff` — fsync the parent directory after rename in `state::save_in` /
+  `hosts::write_atomic` (power-loss lost-update window); make the `hosts.orig`
+  recovery-copy write best-effort so a full/RO `/var/lib` can't block an
+  `/etc/hosts` enforcement change.
+- `91f0380` — `check.sh` now finds the repo root via `git rev-parse
+  --show-toplevel` (the old `$0`-based path broke the documented pre-commit
+  hook) and runs `pnpm install` before the UI build (broke on a fresh clone).
+
+One finding was investigated and dismissed as not a defect: `Unlock` verifying
+against a password-hash snapshot without a re-check is intentional (only
+`SetPassword`, which persists, needs the concurrent-change guard; `Unlock` only
+opens a time-limited window, and the single-user race is benign).
+
+### Pending live-system steps (need the machine owner's sudo/session)
+
+Unchanged from §8/§11 — none were run by the implementation:
+
+1. `./packaging/upgrade.sh` (first run also closes the `77a2e92` deployment
+   skew). Validated with `bash -n` + `desktop-file-validate`; not executed.
+2. `kill -9`-mid-save durability test against the live daemon; confirm
+   blocks/schedules/password survive and `state.json.mac` is gone after the
+   first save; confirm `/var/lib/frostbite/hosts.orig` exists and matches the
+   unmanaged hosts content.
+3. Launcher + autostart check (app grid; log out/in).
+4. Live-verify the `96bef82` daemon fixes and re-run the 2026-07-04 E2E suite.
