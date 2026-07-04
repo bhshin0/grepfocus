@@ -18,7 +18,9 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Resolve the repo root via git so this works both when run directly and when
+# symlinked as .git/hooks/pre-commit (where $0 is the hook path under .git).
+REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
 echo "==> cargo fmt --all --check"
@@ -29,6 +31,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 echo "==> cargo test --workspace"
 cargo test --workspace
+
+echo "==> pnpm --dir crates/gui/ui install"
+pnpm --dir crates/gui/ui install
 
 echo "==> pnpm --dir crates/gui/ui build (tsc -noEmit + vite build)"
 pnpm --dir crates/gui/ui build
