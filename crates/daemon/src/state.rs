@@ -112,6 +112,13 @@ pub fn save_in(dir: &Path, state: &State, key: &[u8]) -> anyhow::Result<()> {
     }
     fs::rename(&tmp, &state_path)?;
     fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600))?;
+    // Persist the rename itself: without fsyncing the directory, a power loss
+    // right after this returns could resurrect the old state.json on some
+    // journaling filesystems. Best-effort — the file contents are already
+    // durable from the sync_all above.
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
 
     // Best-effort cleanup of the legacy sidecar; its absence is expected once
     // migrated.

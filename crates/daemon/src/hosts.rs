@@ -8,7 +8,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::process::Command;
 
 use anyhow::{anyhow, Context};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::paths::{HOSTS, HOSTS_BEGIN, HOSTS_END, HOSTS_ORIG};
 
@@ -25,8 +25,9 @@ pub fn apply_block(domains: &[String]) -> anyhow::Result<()> {
     let original = fs::read_to_string(HOSTS).context("reading /etc/hosts")?;
     let stripped = strip_managed(&original);
     // Snapshot the unmanaged content before we touch /etc/hosts, so it can be
-    // recovered by hand if a later edit corrupts the live file.
-    write_atomic(HOSTS_ORIG, &stripped, HOSTS_ORIG_MODE)?;
+    // recovered by hand if a later edit corrupts the live file. Best-effort:
+    // a state-dir write failure must not block the enforcement change itself.
+    write_recovery_copy(&stripped);
     let new = if domains.is_empty() {
         stripped
     } else {
@@ -52,8 +53,8 @@ pub fn clear_block() -> anyhow::Result<()> {
         Err(e) => return Err(e).context("reading /etc/hosts"),
     };
     let stripped = strip_managed(&original);
-    // Refresh the recovery copy before editing (matches apply_block).
-    write_atomic(HOSTS_ORIG, &stripped, HOSTS_ORIG_MODE)?;
+    // Refresh the recovery copy before editing (matches apply_block); best-effort.
+    write_recovery_copy(&stripped);
     if stripped != original {
         write_atomic(HOSTS, &stripped, HOSTS_MODE)?;
     }
@@ -119,7 +120,29 @@ fn write_atomic(path: &str, content: &str, mode: u32) -> anyhow::Result<()> {
     // applies on fresh creation).
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
         .with_context(|| format!("setting mode on {}", path))?;
+    // Persist the rename itself: fsync the parent directory so the new entry
+    // survives a power loss, not just the file's contents. Best-effort.
+    fsync_parent_dir(std::path::Path::new(path));
     Ok(())
+}
+
+/// Best-effort recovery snapshot of the unmanaged hosts content. Failures are
+/// logged, never propagated, so a full or read-only state dir cannot block the
+/// actual `/etc/hosts` enforcement change.
+fn write_recovery_copy(stripped: &str) {
+    if let Err(e) = write_atomic(HOSTS_ORIG, stripped, HOSTS_ORIG_MODE) {
+        warn!(?e, "failed to write hosts recovery copy (continuing)");
+    }
+}
+
+/// Best-effort `fsync` of a path's parent directory, so a `rename` into it is
+/// durable across power loss. A failure here doesn't undo the write.
+fn fsync_parent_dir(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
 }
 
 /// Set or clear the immutable bit by shelling out to `chattr`.
