@@ -56,17 +56,24 @@ Prerequisites:
 # Rust toolchain (rustup is recommended)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Tauri / WebKit dev headers (only needed for the GUI later)
+# Tauri / WebKit dev headers (install.sh builds the GUI)
 sudo dnf install webkit2gtk4.1-devel libsoup3-devel gtk3-devel javascriptcoregtk4.1-devel
+
+# pnpm — the UI is built and embedded into the GUI binary at compile time
+# https://pnpm.io/installation
 ```
 
-Build and install the daemon:
+Build and install the full product — daemon + systemd unit, GUI binary,
+app-grid launcher, icon, and login autostart entry:
 
 ```bash
 git clone <repo> frostbite && cd frostbite
 sudo ./packaging/install.sh
 # log out and back in for `frostbite` group membership to take effect
 ```
+
+To remove it later, use `sudo ./packaging/uninstall.sh` (see *Recovery*
+below).
 
 Verify it's running:
 
@@ -153,6 +160,50 @@ A `Block` is `{ id, name, domains: [..], apps: [AppMatcher, ..] }` where
 `AppMatcher` is one of `{kind: "exe_path", path}`, `{kind: "basename", name}`,
 or `{kind: "cmdline", contains}`.
 
+## Recovery
+
+Frostbite must never brick a machine, so every enforcement artifact has a
+supported teardown path — and a manual escape hatch for when the binaries
+are already gone.
+
+Supported paths (both idempotent; running them twice is safe):
+
+```bash
+# Full uninstall. Tears down enforcement FIRST, then removes the binaries,
+# systemd unit, launcher/autostart files, and /run/frostbite. --purge
+# additionally deletes saved blocks, the password, the HMAC secret, and
+# the frostbite group.
+sudo ./packaging/uninstall.sh [--purge]
+
+# Offline teardown without uninstalling: clears the immutable bit, strips
+# the managed /etc/hosts region, removes stale atomic-write temp files,
+# drops the nftables table, and clears persisted active blocks so a later
+# `systemctl start` won't re-apply them. Refuses to run while the daemon
+# is up (its 1s reconcile tick would re-apply enforcement right behind
+# it) unless you pass --force. --purge as above.
+sudo frostbited cleanup [--purge] [--force]
+```
+
+If the binaries are already gone, everything Frostbite enforces can be
+undone by hand:
+
+```bash
+sudo chattr -i /etc/hosts
+sudo sed -i '/# frostbite-begin/,/# frostbite-end/d' /etc/hosts
+sudo nft delete table inet frostbite_doh
+sudo rm -f /etc/hosts.frostbite.tmp
+```
+
+`/var/lib/frostbite/hosts.orig` is a root-only snapshot of the *unmanaged*
+`/etc/hosts` content (everything outside the marker region), refreshed
+before every managed edit. You normally never need it — the `sed` above
+removes the managed region and leaves the rest untouched. Copy it over
+`/etc/hosts` only if the file is mangled *beyond* the marker region:
+
+```bash
+sudo cp /var/lib/frostbite/hosts.orig /etc/hosts
+```
+
 ## Known limits
 
 We're honest about what we don't defend against. None of these are bypasses
@@ -167,14 +218,23 @@ that Cold Turkey beats either.
 - **Custom DoH/DoT endpoints.** An `nftables` table drops DoH (TCP 443)
   and DNS-over-TLS (TCP/UDP 853) to known public resolver IPs, so stock
   Firefox/Chrome DoH can't bypass `/etc/hosts` — but unlisted or
-  self-hosted endpoints are allowed by design. Flip side: a system
-  resolver doing DoT to a listed IP (e.g. systemd-resolved with
-  `DNSOverTLS=yes` pointed at `1.1.1.1`) loses DNS during active blocks;
-  point it at an unlisted resolver or plain DNS.
+  self-hosted endpoints are allowed by design.
+- **System resolvers doing DoT to a listed IP.** The flip side of that
+  table: if your system resolver does DNS-over-TLS to one of the listed
+  public resolver IPs (e.g. systemd-resolved with `DNSOverTLS=yes`
+  pointed at `1.1.1.1`), DNS breaks entirely during active blocks. Use
+  plain DNS or an unlisted resolver.
+- **Systems that forbid the immutable flag.** Where policy (e.g. SELinux)
+  or the filesystem denies `chattr +i`, blocks still work — the hosts
+  *content* is the enforcement — but tamper protection is degraded. The
+  daemon logs a warning when this happens.
 - **VPNs over IP literals.** If the user knows the IP address of a blocked
   site and types it directly, hosts-file blocking won't catch them.
-- **Uninstalling the package** while a block is active is currently allowed.
-  v0.2 will add a postrm hook that refuses uninstall during enforcement.
+- **Uninstalling works even mid-block — by design.** A Cold Turkey-style
+  uninstall lockout was considered and deliberately rejected: root is out
+  of the threat model (see above), and never bricking a machine beats
+  fighting root. `uninstall.sh` and `frostbited cleanup` tear down
+  enforcement during an active block without complaint.
 
 ## License
 

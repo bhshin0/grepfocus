@@ -8,6 +8,9 @@ The daily-driver hardening milestone (see `docs/plans/dailydriverhardening.md`)
 resolved most of these across Phase 1 (durability, commit `43fd859`) and
 Phase 2 (backlog lows). Status is tracked inline below.
 
+The *Bookmarks* section at the end collects deferred research notes — not
+review findings — so they don't have to be re-derived later.
+
 ## Daemon
 
 - **[FIXED — Phase 2] Gated config arms mutate before save without rollback** —
@@ -64,4 +67,59 @@ Phase 2 (backlog lows). Status is tracked inline below.
   markers `# frostbite-begin`/`# frostbite-end`, paths `/var/lib/frostbite`,
   `/etc/frostbite`. Rename cost grows with each new artifact; the daily-driver
   milestone added `frostbite.desktop`, `hosts.orig`, and `upgrade.sh`. Revisit
-  before publishing beyond the author's machine.
+  before publishing beyond the author's machine. *Update 2026-07-06:* "Timely"
+  is dead as a candidate; see *Bookmarks → Rename* below for current research.
+
+## Bookmarks (deferred work)
+
+Research notes only — nothing below is scheduled or implemented. Each entry
+records findings so the legwork doesn't have to be redone when the item is
+picked up.
+
+- **[DEFERRED] Licensing / paywall (v1 ships free)** — app-side integration
+  spec from the frostbite-web audit. Token format:
+  `base64url(JSON claims) + "." + base64url(raw 64-byte Ed25519 signature)`;
+  the signature is computed over the ASCII bytes of the FIRST base64url
+  segment (JWT-style), NOT the decoded JSON; both segments are base64URL
+  no-pad. Claims (field names frozen): `license_id`, `email`, `tier`
+  (`"premium"`), `kind` (`"perpetual"` | `"trial"`), `features` (string
+  array: `app_blocking`, `schedules`, `tamper_protection`,
+  `unlimited_blocks`), `issued_at`, `expires_at` (unix seconds, or null =
+  perpetual), `max_devices`. Public key: the raw 32 bytes from
+  frostbite-web's `pnpm gen-keypair` (`PUBLIC_KEY_BASE64URL`), embedded in
+  `crates/core`; the keypair is a one-time ceremony — rotation invalidates
+  every sold key. Verification and feature gating must live daemon-side
+  (the GUI is unprivileged and spoofable). Needs: `ed25519-dalek` v2 in
+  crates/core, a `SetLicense` IPC arm plus license fields in `Status`,
+  `license_token` in persisted `State` (re-verified on load), a GUI license
+  tab, and a committed JS<->Rust known-answer test vector (one encoding
+  mismatch = every real key rejected). Open decisions recorded: mid-block
+  trial expiry policy (akrasia says finish the block, paywall says stop);
+  clock-rollback high-water mark; gating map free = hosts blocking + manual
+  blocks + 1 saved block / premium = app_blocking + schedules +
+  tamper_protection + unlimited_blocks (per frostbite-web
+  `lib/features.ts`).
+- **[DEFERRED] Packaging** — `.rpm` first. Use `sysusers.d`/`tmpfiles.d`
+  for the group and runtime/state dirs; declare runtime deps (webkit2gtk4.1,
+  libappindicator/ayatana); `%preun` can run `frostbited cleanup` verbatim.
+  `tauri.conf.json`'s bundle section is currently disabled. The store
+  download page artifacts are all "coming soon" placeholders.
+- **[DEFERRED — decision pending] Rename** — research 2026-07-06.
+  "Frostbite": medium-high trademark risk (EA's Frostbite engine, Class 9
+  overlap); fine at low visibility, but don't build paid brand equity on it.
+  "Timely" (the 2026-07-04 candidate): effectively taken — timely.com
+  productivity SaaS plus the well-known `timely` crate — dead. "Frostlock":
+  researched CLEAR (crates.io free, no product collisions, .com looks open —
+  verify at a registrar before committing). "Hoarfrost": clear backup
+  (spelling friction). A rename touches: crate/binary names, systemd unit,
+  socket path `/run/frostbite`, unix group, hosts markers, nft table name,
+  `/var` + `/etc` dirs, `.desktop`/icon, Tauri identifier.
+- **[DEFERRED] GNOME tray invisibility** — stock GNOME ships no
+  StatusNotifier host, so the tray icon never appears; combined with
+  close-to-tray the app becomes invisible after its first close
+  (single-instance relaunch recovers it). Needs a fallback: detect tray
+  availability, or offer a minimize-vs-quit choice.
+- **[DEFERRED] First-run error copy** — the GUI surfaces the raw connect
+  errno when the daemon is down or the user isn't in the `frostbite` group.
+  Needs actionable guidance instead (install/start the daemon; add yourself
+  to the group and re-login).
