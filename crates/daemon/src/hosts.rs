@@ -77,6 +77,23 @@ pub fn clear_block() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether the live `/etc/hosts` still contains a managed block region. Used
+/// by `enforce::sync` to detect drift — with chattr protection degraded, the
+/// file can be rewritten externally. An unreadable file reads as "absent" so
+/// the caller re-applies (and that path surfaces the real error).
+pub fn block_present() -> bool {
+    fs::read_to_string(HOSTS)
+        .map(|s| contains_managed(&s))
+        .unwrap_or(false)
+}
+
+/// Whether `s` contains a managed-region begin marker. Matches after
+/// `trim_start`, mirroring `strip_managed`.
+fn contains_managed(s: &str) -> bool {
+    s.lines()
+        .any(|line| line.trim_start().starts_with(HOSTS_BEGIN))
+}
+
 fn render_block(domains: &[String]) -> String {
     let mut out = String::from("\n");
     for d in domains {
@@ -254,6 +271,29 @@ mod tests {
         let input = format!("{}\n0.0.0.0 reddit.com\n{}\n", HOSTS_BEGIN, HOSTS_END);
         let stripped = strip_managed(&input);
         assert!(stripped.trim().is_empty());
+    }
+
+    #[test]
+    fn contains_managed_detects_marker() {
+        let input = format!(
+            "127.0.0.1 localhost\n{}\n0.0.0.0 reddit.com\n{}\n",
+            HOSTS_BEGIN, HOSTS_END
+        );
+        assert!(contains_managed(&input));
+    }
+
+    #[test]
+    fn contains_managed_absent_without_marker() {
+        assert!(!contains_managed("127.0.0.1 localhost\n::1 localhost\n"));
+        assert!(!contains_managed(""));
+    }
+
+    #[test]
+    fn contains_managed_detects_indented_marker() {
+        // Same trim_start tolerance as strip_managed: a hand-indented begin
+        // marker still counts as an active region.
+        let input = format!("127.0.0.1 localhost\n\t  {}\n0.0.0.0 x.com\n", HOSTS_BEGIN);
+        assert!(contains_managed(&input));
     }
 
     #[test]

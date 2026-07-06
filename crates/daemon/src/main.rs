@@ -36,9 +36,10 @@ pub struct Daemon {
     /// only: a daemon restart relocks the settings. `0` means locked.
     pub unlocked_until: Mutex<u64>,
     /// Serializes enforcement writes and memoizes the domain union that was
-    /// last applied successfully. `None` means unknown/dirty — the next
-    /// `enforce::sync` re-applies unconditionally. See `enforce::sync`.
-    pub applied: Mutex<Option<Vec<String>>>,
+    /// last applied successfully, plus when it was last verified live.
+    /// `None` means unknown/dirty — the next `enforce::sync` re-applies
+    /// unconditionally. See `enforce::sync`.
+    pub applied: Mutex<Option<enforce::Applied>>,
 }
 
 fn main() -> anyhow::Result<()> {

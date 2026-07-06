@@ -98,6 +98,19 @@ pub fn apply() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether the DoH block table currently exists in the live ruleset. Used by
+/// `enforce::sync` to detect drift — a firewalld/ufw reload can flush the
+/// whole ruleset and take our table with it. A spawn failure reads as
+/// "absent": the caller re-applies, and *that* path surfaces the real error.
+pub fn table_exists() -> bool {
+    Command::new(NFT)
+        .args(["list", "table", "inet", TABLE])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Remove the table if present. Idempotent — silent on absence.
 pub fn clear() -> anyhow::Result<()> {
     let out = Command::new(NFT)
