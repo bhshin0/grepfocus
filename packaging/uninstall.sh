@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Frostbite uninstaller.
+#
+# Tears down enforcement FIRST (via `frostbited cleanup`, or an inline
+# fallback if the binary is already gone), then removes:
+#   /usr/local/bin/frostbited and /usr/local/bin/frostbite-gui
+#   /etc/systemd/system/frostbited.service
+#   the invoking user's launcher, icon, and autostart files
+#   /run/frostbite
+# Every step tolerates absence, so running this twice is safe. Run as root.
+#
+# Usage: sudo ./packaging/uninstall.sh [--purge]
+#   --purge   also delete /var/lib/frostbite (saved blocks, password),
+#             /etc/frostbite (secret), and the frostbite group
+
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+    echo "This script must be run as root (try: sudo $0)" >&2
+    exit 1
+fi
+
+PURGE=0
+for arg in "$@"; do
+    case "$arg" in
+        --purge) PURGE=1 ;;
+        *)
+            echo "Unknown flag: $arg" >&2
+            echo "Usage: sudo $0 [--purge]" >&2
+            exit 2
+            ;;
+    esac
+done
+
+# Interactive with no flag given: ask. Non-interactive defaults to keep, so
+# scripted uninstalls never destroy saved data by surprise.
+if [[ $# -eq 0 && -t 0 ]]; then
+    read -r -p "Also delete saved blocks, password, and secret? [y/N] " answer || answer=""
+    case "$answer" in
+        [yY]|[yY][eE][sS]) PURGE=1 ;;
+    esac
+fi
+
+echo "==> Stopping and disabling frostbited"
+systemctl disable --now frostbited 2>/dev/null || true
+
+echo "==> Stopping the GUI (if running)"
+pkill -x frostbite-gui || true
+
+# Tear down enforcement while the binary still exists — the daemon's own
+# cleanup path handles the immutable bit, hosts strip/restore, atomic-write
+# orphans, the nftables table, and persisted active blocks. Removing the
+# binary first would strand a chattr +i /etc/hosts: that is the brick.
+if [[ -x /usr/local/bin/frostbited ]]; then
+    echo "==> Tearing down enforcement (frostbited cleanup)"
+    CLEANUP_ARGS=()
+    if [[ $PURGE -eq 1 ]]; then
+        CLEANUP_ARGS+=(--purge)
+    fi
+    if ! /usr/local/bin/frostbited cleanup "${CLEANUP_ARGS[@]}"; then
+        echo "cleanup failed — leaving binaries in place so you can retry" >&2
+        exit 1
+    fi
+else
+    # Broken/partial install: no binary to delegate to. Inline the minimal
+    # teardown of the artifacts that block traffic on their own.
+    echo "==> frostbited binary missing — inline enforcement teardown"
+    chattr -i /etc/hosts 2>/dev/null || true
+    if [[ -f /etc/hosts ]]; then
+        sed -i '/# frostbite-begin/,/# frostbite-end/d' /etc/hosts \
+            || { echo "failed to strip the managed region from /etc/hosts" >&2; exit 1; }
+    fi
+    rm -f /etc/hosts.frostbite.tmp
+    nft delete table inet frostbite_doh 2>/dev/null || true
+    if [[ $PURGE -eq 1 ]]; then
+        rm -rf /var/lib/frostbite /etc/frostbite
+    fi
+fi
+
+echo "==> Removing binaries"
+rm -f /usr/local/bin/frostbited /usr/local/bin/frostbite-gui
+
+echo "==> Removing systemd unit"
+rm -f /etc/systemd/system/frostbited.service
+systemctl daemon-reload
+
+echo "==> Removing launcher, icon, and autostart entry"
+INVOKING_USER="${SUDO_USER:-$USER}"
+USER_HOME="$(getent passwd "$INVOKING_USER" | cut -d: -f6 || true)"
+if [[ -n "$USER_HOME" ]]; then
+    rm -f "$USER_HOME/.local/share/applications/frostbite.desktop" \
+        "$USER_HOME/.config/autostart/frostbite.desktop" \
+        "$USER_HOME/.local/share/icons/hicolor/64x64/apps/frostbite.png"
+    # Best-effort cache refresh so the stale entry disappears promptly.
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        sudo -u "$INVOKING_USER" gtk-update-icon-cache -f -t \
+            "$USER_HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        sudo -u "$INVOKING_USER" update-desktop-database \
+            "$USER_HOME/.local/share/applications" >/dev/null 2>&1 || true
+    fi
+fi
+echo "    (launcher files under other users' homes, if any, need manual removal)"
+
+echo "==> Removing runtime directory"
+rm -rf /run/frostbite
+
+if [[ $PURGE -eq 1 ]]; then
+    echo "==> Removing frostbite group"
+    groupdel frostbite 2>/dev/null || true
+fi
+
+cat <<EOF
+
+==> Uninstall complete.
+
+Removed: enforcement (/etc/hosts region, nftables table), binaries,
+systemd unit, launcher files for $INVOKING_USER, /run/frostbite.
+EOF
+if [[ $PURGE -eq 1 ]]; then
+    echo "Purged: /var/lib/frostbite, /etc/frostbite, and the frostbite group."
+else
+    cat <<EOF
+Kept: /var/lib/frostbite (saved blocks, password) and /etc/frostbite
+(secret) — a reinstall picks them up. Re-run with --purge to delete them.
+EOF
+fi

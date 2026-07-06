@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Frostbite dev installer.
 #
-# Builds the daemon in release mode and installs:
+# Builds the UI, daemon, and GUI in release mode and installs:
 #   /usr/local/bin/frostbited
+#   /usr/local/bin/frostbite-gui
 #   /etc/systemd/system/frostbited.service
+#   ~/.local/share/applications/frostbite.desktop   (app-grid launcher)
+#   ~/.local/share/icons/hicolor/64x64/apps/frostbite.png
+#   ~/.config/autostart/frostbite.desktop           (start GUI + tray at login)
 # Creates the `frostbite` group, runtime/state directories, and enables the
 # systemd unit. Run as root.
 #
@@ -19,10 +23,26 @@ fi
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-echo "==> Building frostbited (release)"
-# Build as the invoking user so the cargo cache lives in their home dir.
+# Build as the invoking user so the cargo cache and node_modules live in
+# their home dir instead of root's.
 INVOKING_USER="${SUDO_USER:-$USER}"
-sudo -u "$INVOKING_USER" -H bash -c 'source "$HOME/.cargo/env"; cargo build --release -p frostbited'
+
+echo "==> Checking prerequisites"
+if ! sudo -u "$INVOKING_USER" -H bash -lc 'command -v pnpm' >/dev/null 2>&1; then
+    echo "pnpm not found on $INVOKING_USER's PATH — the UI build needs it." >&2
+    echo "Install it first (https://pnpm.io/installation), then re-run." >&2
+    exit 1
+fi
+
+# Order matters: the Tauri build embeds ui/dist at compile time, and a plain
+# `cargo build` does not run tauri.conf.json's beforeBuildCommand, so the UI
+# must be built BEFORE cargo.
+echo "==> Building UI (embedded into the GUI at compile time)"
+sudo -u "$INVOKING_USER" -H bash -lc \
+    'pnpm --dir crates/gui/ui install && pnpm --dir crates/gui/ui build'
+
+echo "==> Building release binaries"
+sudo -u "$INVOKING_USER" -H bash -c 'source "$HOME/.cargo/env"; cargo build --release'
 
 echo "==> Creating frostbite group (if missing)"
 if ! getent group frostbite >/dev/null; then
@@ -32,8 +52,9 @@ fi
 echo "==> Adding $INVOKING_USER to frostbite group"
 usermod -aG frostbite "$INVOKING_USER" || true
 
-echo "==> Installing binary"
+echo "==> Installing binaries"
 install -m 0755 target/release/frostbited /usr/local/bin/frostbited
+install -m 0755 target/release/frostbite-gui /usr/local/bin/frostbite-gui
 
 echo "==> Installing systemd unit"
 install -m 0644 packaging/systemd/frostbited.service /etc/systemd/system/frostbited.service
@@ -47,6 +68,26 @@ echo "==> Enabling and starting frostbited"
 systemctl daemon-reload
 systemctl enable --now frostbited
 
+echo "==> Installing launcher, icon, and autostart entry for $INVOKING_USER"
+USER_HOME="$(getent passwd "$INVOKING_USER" | cut -d: -f6)"
+APP_DIR="$USER_HOME/.local/share/applications"
+ICON_DIR="$USER_HOME/.local/share/icons/hicolor/64x64/apps"
+AUTOSTART_DIR="$USER_HOME/.config/autostart"
+# `sudo -u ... install` so the files are owned by the user, not root.
+sudo -u "$INVOKING_USER" install -d "$APP_DIR" "$ICON_DIR" "$AUTOSTART_DIR"
+sudo -u "$INVOKING_USER" install -m 0644 packaging/frostbite.desktop "$APP_DIR/frostbite.desktop"
+sudo -u "$INVOKING_USER" install -m 0644 crates/gui/icons/icon.png "$ICON_DIR/frostbite.png"
+sudo -u "$INVOKING_USER" install -m 0644 packaging/frostbite.desktop "$AUTOSTART_DIR/frostbite.desktop"
+
+# Best-effort cache refresh so the launcher icon/entry show up promptly.
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    sudo -u "$INVOKING_USER" gtk-update-icon-cache -f -t \
+        "$USER_HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    sudo -u "$INVOKING_USER" update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
+fi
+
 cat <<EOF
 
 ==> Install complete.
@@ -56,11 +97,8 @@ Next steps:
      takes effect — needed to talk to /run/frostbite/sock.
   2. Check the daemon is running:   systemctl status frostbited
   3. Tail the logs:                  journalctl -u frostbited -f
-  4. The GUI (when built) talks to:  /run/frostbite/sock
+  4. Launch 'Frostbite' from your app grid, or run: /usr/local/bin/frostbite-gui
 
 To uninstall:
-  sudo systemctl disable --now frostbited
-  sudo rm /usr/local/bin/frostbited /etc/systemd/system/frostbited.service
-  sudo rm -rf /etc/frostbite /var/lib/frostbite /run/frostbite
-  sudo groupdel frostbite
+  sudo ./packaging/uninstall.sh [--purge]
 EOF
