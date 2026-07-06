@@ -22,7 +22,7 @@ use crate::paths::{HOSTS, HOSTS_BEGIN, HOSTS_END, HOSTS_ORIG};
 
 /// Standard mode for `/etc/hosts`: world-readable so the libc resolver works
 /// for non-root processes.
-const HOSTS_MODE: u32 = 0o644;
+pub(crate) const HOSTS_MODE: u32 = 0o644;
 /// Recovery copy is root-only.
 const HOSTS_ORIG_MODE: u32 = 0o600;
 
@@ -92,7 +92,7 @@ fn render_block(domains: &[String]) -> String {
     out
 }
 
-fn strip_managed(s: &str) -> String {
+pub(crate) fn strip_managed(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut inside = false;
     for line in s.lines() {
@@ -116,7 +116,7 @@ fn strip_managed(s: &str) -> String {
 /// rename over the target. Mirrors `state::save_in`. `mode` is the final file
 /// mode (0644 for /etc/hosts so the resolver can read it, 0600 for the
 /// root-only recovery copy).
-fn write_atomic(path: &str, content: &str, mode: u32) -> anyhow::Result<()> {
+pub(crate) fn write_atomic(path: &str, content: &str, mode: u32) -> anyhow::Result<()> {
     use std::io::Write;
     let tmp = format!("{}.frostbite.tmp", path);
     {
@@ -163,7 +163,7 @@ fn fsync_parent_dir(path: &std::path::Path) {
 
 /// Set or clear the immutable bit by shelling out to `chattr`.
 /// We rely on coreutils being installed (it always is on a Linux system).
-fn chattr_immutable(path: &str, set: bool) -> anyhow::Result<()> {
+pub(crate) fn chattr_immutable(path: &str, set: bool) -> anyhow::Result<()> {
     let flag = if set { "+i" } else { "-i" };
     let out = Command::new("/usr/bin/chattr")
         .args([flag, path])

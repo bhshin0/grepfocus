@@ -3,6 +3,9 @@
 //! Runs as root via systemd. Owns the persisted block state, edits
 //! /etc/hosts (with chattr +i during active blocks), and SIGKILLs blocked
 //! processes. Talks to the GUI over a Unix socket at /run/frostbite/sock.
+//!
+//! Also ships the offline recovery path: `frostbited cleanup` tears down all
+//! enforcement without needing a working daemon (see `cleanup`).
 
 use std::sync::Arc;
 
@@ -11,6 +14,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 
 mod auth;
+mod cleanup;
 mod enforce;
 mod hosts;
 mod ipc;
@@ -37,8 +41,8 @@ pub struct Daemon {
     pub applied: Mutex<Option<Vec<String>>>,
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Initialize tracing before dispatching so subcommands log too.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -46,6 +50,44 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        None => run_daemon(),
+        Some("cleanup") => {
+            let mut opts = cleanup::Opts {
+                purge: false,
+                force: false,
+            };
+            for arg in args {
+                match arg.as_str() {
+                    "--purge" => opts.purge = true,
+                    "--force" => opts.force = true,
+                    other => usage(&format!("unknown cleanup flag: {}", other)),
+                }
+            }
+            cleanup::run(opts)
+        }
+        Some(other) => usage(&format!("unknown subcommand: {}", other)),
+    }
+}
+
+/// Print an error plus usage to stderr and exit nonzero.
+fn usage(err: &str) -> ! {
+    eprintln!("error: {}", err);
+    eprintln!(
+        "usage: frostbited                        run the daemon (root; normally via systemd)"
+    );
+    eprintln!("       frostbited cleanup [--force] [--purge]");
+    eprintln!(
+        "                                          tear down all enforcement (daemon stopped)"
+    );
+    eprintln!("         --force  skip the running-daemon check");
+    eprintln!("         --purge  also delete /var/lib/frostbite and /etc/frostbite");
+    std::process::exit(2);
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+async fn run_daemon() -> anyhow::Result<()> {
     if !nix::unistd::Uid::effective().is_root() {
         anyhow::bail!("frostbited must run as root");
     }
