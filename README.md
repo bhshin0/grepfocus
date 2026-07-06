@@ -164,9 +164,13 @@ that Cold Turkey beats either.
   realistic goal is friction high enough to defeat in-the-moment akrasia.
 - **Live USB.** Anyone with physical access can boot a USB and edit the
   disk. Out of scope.
-- **Firefox DoH (DNS-over-HTTPS).** Browsers configured to use DoH bypass
-  `/etc/hosts`. v0.2 plans to add an `nftables` rule blocking outbound DNS
-  to known DoH endpoints.
+- **Custom DoH/DoT endpoints.** An `nftables` table drops DoH (TCP 443)
+  and DNS-over-TLS (TCP/UDP 853) to known public resolver IPs, so stock
+  Firefox/Chrome DoH can't bypass `/etc/hosts` — but unlisted or
+  self-hosted endpoints are allowed by design. Flip side: a system
+  resolver doing DoT to a listed IP (e.g. systemd-resolved with
+  `DNSOverTLS=yes` pointed at `1.1.1.1`) loses DNS during active blocks;
+  point it at an unlisted resolver or plain DNS.
 - **VPNs over IP literals.** If the user knows the IP address of a blocked
   site and types it directly, hosts-file blocking won't catch them.
 - **Uninstalling the package** while a block is active is currently allowed.

@@ -1,16 +1,22 @@
 //! DoH (DNS-over-HTTPS) endpoint blocking via `nft`.
 //!
-//! We install a small `inet` table that drops TCP 443 traffic to known
-//! public DoH resolver IPs and all traffic on port 853 (DNS-over-TLS).
-//! This closes the bypass where browsers — chiefly Firefox — skip
-//! `/etc/hosts` by resolving names directly via Cloudflare/Mozilla over
-//! HTTPS.
+//! We install a small `inet` table that drops TCP 443 (DoH) and TCP/UDP
+//! 853 (DNS-over-TLS) traffic to known public DoH resolver IPs. This
+//! closes the bypass where browsers — chiefly Firefox — skip `/etc/hosts`
+//! by resolving names directly via Cloudflare/Mozilla over HTTPS.
 //!
 //! Trade-offs (documented, not fixed):
 //! - Doesn't catch DoH providers we don't list (custom endpoints,
 //!   self-hosted resolvers, etc.).
 //! - Breaks any legitimate non-DNS use of the listed IPs on port 443
 //!   during active blocks (e.g. Cloudflare WARP, 1.1.1.1 marketing site).
+//! - DoT to unlisted/custom endpoints is allowed by design — the same
+//!   line we draw for custom DoH. An unscoped 853 drop would kill ALL
+//!   DNS for a system resolver (e.g. systemd-resolved) doing DoT to a
+//!   private or custom endpoint: an effective network brick.
+//! - A system resolver doing DoT to a *listed* public IP (e.g.
+//!   `1.1.1.1:853`) still loses DNS during active blocks. The README
+//!   documents it.
 //! - A determined user can configure their browser to use a different
 //!   DoH endpoint. Same friction-vs-adversary line we already drew.
 //!
@@ -28,9 +34,9 @@ const NFT: &str = "/usr/sbin/nft";
 const TABLE: &str = "frostbite_doh";
 
 /// IPv4 addresses of well-known public DoH resolvers, plus NextDNS anycast
-/// ranges. Only TCP 443 to these is dropped — port 53 is intentionally
-/// left alone so the OS resolver (and our `/etc/hosts` override) still
-/// work.
+/// ranges. Only TCP 443 and TCP/UDP 853 to these are dropped — port 53 is
+/// intentionally left alone so the OS resolver (and our `/etc/hosts`
+/// override) still work.
 const DOH_V4: &[&str] = &[
     // Cloudflare 1.1.1.1
     "1.1.1.1",
@@ -142,9 +148,13 @@ fn build_ruleset() -> String {
         ip daddr {{ {v4} }} tcp dport 443 drop
         ip6 daddr {{ {v6} }} tcp dport 443 drop
 
-        # Block all DNS-over-TLS (port 853 has no legitimate non-resolver use).
-        tcp dport 853 drop
-        udp dport 853 drop
+        # Block DNS-over-TLS to the same known resolver IPs. Never drop
+        # 853 globally: a system resolver doing DoT to a private/custom
+        # endpoint would lose ALL DNS during blocks.
+        ip daddr {{ {v4} }} tcp dport 853 drop
+        ip daddr {{ {v4} }} udp dport 853 drop
+        ip6 daddr {{ {v6} }} tcp dport 853 drop
+        ip6 daddr {{ {v6} }} udp dport 853 drop
     }}
 }}
 "#
@@ -164,5 +174,35 @@ mod tests {
         assert!(r.contains("tcp dport 443 drop"));
         assert!(r.contains("tcp dport 853 drop"));
         assert!(r.contains("udp dport 853 drop"));
+        // Both families, both protocols: 2x 443 rules, 4x 853 rules.
+        assert_eq!(r.lines().filter(|l| l.contains("dport 443")).count(), 2);
+        assert_eq!(r.lines().filter(|l| l.contains("dport 853")).count(), 4);
+    }
+
+    /// Every 853 drop must be daddr-scoped. A global drop kills ALL DNS
+    /// for anyone whose system resolver speaks DoT to a custom endpoint.
+    #[test]
+    fn dot_drops_are_scoped_to_known_resolvers() {
+        let r = build_ruleset();
+        for line in r.lines().filter(|l| l.contains("dport 853")) {
+            assert!(line.contains("daddr"), "unscoped DoT drop: {line}");
+        }
+    }
+
+    /// Plain DNS (port 53) must never be touched — the OS resolver and our
+    /// `/etc/hosts` override depend on it. Compare whole tokens so the
+    /// "53" inside "853" doesn't false-positive.
+    #[test]
+    fn plain_dns_is_never_touched() {
+        let r = build_ruleset();
+        for line in r.lines() {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            for pair in tokens.windows(2) {
+                assert!(
+                    !(pair[0] == "dport" && pair[1] == "53"),
+                    "rule touches plain DNS: {line}"
+                );
+            }
+        }
     }
 }
