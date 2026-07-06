@@ -2,6 +2,14 @@
 //!
 //! The managed region is delimited by `HOSTS_BEGIN` / `HOSTS_END` markers.
 //! Any content outside that region is preserved verbatim.
+//!
+//! Degradation policy: the hosts CONTENT is the enforcement; the immutable
+//! bit is hardening on top. A `write_atomic` failure is fatal — it propagates,
+//! `enforce::sync` clears its memo, and the next 1s tick retries. A failed
+//! `chattr +i` (SELinux, or a filesystem without immutable-flag support) only
+//! logs a warning: the block is active, just not tamper-protected, and
+//! refusing to enforce at all would be strictly worse. `chattr -i` in the
+//! clear paths is likewise best-effort.
 
 use std::fs;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -19,7 +27,7 @@ const HOSTS_MODE: u32 = 0o644;
 const HOSTS_ORIG_MODE: u32 = 0o600;
 
 /// Apply the block: remove any existing managed region, append a fresh one
-/// with all blocked domains, then mark /etc/hosts immutable.
+/// with all blocked domains, then (best-effort) mark /etc/hosts immutable.
 pub fn apply_block(domains: &[String]) -> anyhow::Result<()> {
     chattr_immutable(HOSTS, false).ok(); // best-effort unlock if previously locked
     let original = fs::read_to_string(HOSTS).context("reading /etc/hosts")?;
@@ -40,7 +48,15 @@ pub fn apply_block(domains: &[String]) -> anyhow::Result<()> {
         )
     };
     write_atomic(HOSTS, &new, HOSTS_MODE)?;
-    chattr_immutable(HOSTS, true)?;
+    // The immutable bit is hardening, not enforcement (see module docs): the
+    // block is live once the write lands, so degrade gracefully here.
+    if let Err(e) = chattr_immutable(HOSTS, true) {
+        warn!(
+            ?e,
+            "chattr +i failed — hosts block is active but NOT tamper-protected \
+             (SELinux or the filesystem may forbid the immutable flag)"
+        );
+    }
     Ok(())
 }
 
@@ -189,6 +205,55 @@ mod tests {
         let r = render_block(&["www.example.com".to_string()]);
         assert!(r.contains("0.0.0.0 www.example.com"));
         assert!(!r.contains("www.www.example.com"));
+    }
+
+    #[test]
+    fn strip_unterminated_region_drops_to_eof() {
+        // A begin marker with no matching end marker: everything from the
+        // marker to EOF is treated as managed and dropped. Documents current
+        // behavior — a truncated region can never leak stale block entries.
+        let input = format!(
+            "127.0.0.1 localhost\n{}\n0.0.0.0 reddit.com\n0.0.0.0 news.ycombinator.com\n",
+            HOSTS_BEGIN
+        );
+        let stripped = strip_managed(&input);
+        assert_eq!(stripped, "127.0.0.1 localhost\n");
+    }
+
+    #[test]
+    fn strip_removes_multiple_regions() {
+        let input = format!(
+            "127.0.0.1 localhost\n{b}\n0.0.0.0 reddit.com\n{e}\n::1 localhost\n{b}\n0.0.0.0 x.com\n{e}\n# user comment\n",
+            b = HOSTS_BEGIN,
+            e = HOSTS_END
+        );
+        let stripped = strip_managed(&input);
+        assert!(!stripped.contains("reddit.com"));
+        assert!(!stripped.contains("x.com"));
+        assert!(stripped.contains("127.0.0.1 localhost"));
+        assert!(stripped.contains("::1 localhost"));
+        assert!(stripped.contains("# user comment"));
+    }
+
+    #[test]
+    fn strip_recognizes_indented_markers() {
+        // Markers are matched after trim_start, so a hand-indented region is
+        // still recognized and stripped.
+        let input = format!(
+            "127.0.0.1 localhost\n  {}\n0.0.0.0 reddit.com\n\t{}\n::1 localhost\n",
+            HOSTS_BEGIN, HOSTS_END
+        );
+        let stripped = strip_managed(&input);
+        assert!(!stripped.contains("reddit.com"));
+        assert!(stripped.contains("127.0.0.1 localhost"));
+        assert!(stripped.contains("::1 localhost"));
+    }
+
+    #[test]
+    fn strip_region_only_file_yields_empty() {
+        let input = format!("{}\n0.0.0.0 reddit.com\n{}\n", HOSTS_BEGIN, HOSTS_END);
+        let stripped = strip_managed(&input);
+        assert!(stripped.trim().is_empty());
     }
 
     #[test]
