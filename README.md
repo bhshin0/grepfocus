@@ -180,7 +180,9 @@ sudo ./packaging/uninstall.sh [--purge]
 # drops the nftables table, and clears persisted active blocks so a later
 # `systemctl start` won't re-apply them. Refuses to run while the daemon
 # is up (its 1s reconcile tick would re-apply enforcement right behind
-# it) unless you pass --force. --purge as above.
+# it) unless you pass --force. --purge deletes /var/lib/frostbite and
+# /etc/frostbite; binaries, unit, and the frostbite group are
+# uninstall.sh's job.
 sudo frostbited cleanup [--purge] [--force]
 ```
 
@@ -198,10 +200,12 @@ sudo rm -f /etc/hosts.frostbite.tmp
 `/etc/hosts` content (everything outside the marker region), refreshed
 before every managed edit. You normally never need it — the `sed` above
 removes the managed region and leaves the rest untouched. Copy it over
-`/etc/hosts` only if the file is mangled *beyond* the marker region:
+`/etc/hosts` only if the file is mangled *beyond* the marker region —
+with `install`, not `cp`, since the snapshot is 0600 and `/etc/hosts`
+must be world-readable for the resolver in non-root processes:
 
 ```bash
-sudo cp /var/lib/frostbite/hosts.orig /etc/hosts
+sudo install -m 644 /var/lib/frostbite/hosts.orig /etc/hosts
 ```
 
 ## Known limits
