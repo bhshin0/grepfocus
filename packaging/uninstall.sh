@@ -41,6 +41,34 @@ if [[ $# -eq 0 && -t 0 ]]; then
     esac
 fi
 
+# Minimal teardown of the artifacts that block traffic on their own. Used
+# when the binary is missing (broken/partial install) or when delegation to
+# `frostbited cleanup` fails or times out.
+inline_teardown() {
+    chattr -i /etc/hosts 2>/dev/null || true
+    if [[ -f /etc/hosts ]]; then
+        sed -i '/# frostbite-begin/,/# frostbite-end/d' /etc/hosts \
+            || { echo "failed to strip the managed region from /etc/hosts" >&2; exit 1; }
+    elif [[ -f /var/lib/frostbite/hosts.orig ]]; then
+        # /etc/hosts is gone entirely — restore the snapshot before a purge
+        # deletes the only copy. install, not cp: the mode matters, because
+        # the resolver in non-root processes needs 0644.
+        install -m 0644 /var/lib/frostbite/hosts.orig /etc/hosts
+    fi
+    rm -f /etc/hosts.frostbite.tmp /var/lib/frostbite/hosts.orig.frostbite.tmp
+    nft delete table inet frostbite_doh 2>/dev/null || true
+    if [[ $PURGE -eq 1 ]]; then
+        rm -rf /var/lib/frostbite /etc/frostbite
+    else
+        cat <<'EOF'
+Note: the state file is HMAC-signed, so this fallback cannot clear persisted
+active blocks. If you reinstall later, any block that was active will
+re-apply until it expires. Re-run with --purge (or run `frostbited cleanup`
+from the reinstall) to avoid that.
+EOF
+    fi
+}
+
 echo "==> Stopping and disabling frostbited"
 systemctl disable --now frostbited 2>/dev/null || true
 
@@ -57,32 +85,29 @@ if [[ -x /usr/local/bin/frostbited ]]; then
     if [[ $PURGE -eq 1 ]]; then
         CLEANUP_ARGS+=(--purge)
     fi
-    if ! /usr/local/bin/frostbited cleanup "${CLEANUP_ARGS[@]}"; then
-        echo "cleanup failed — leaving binaries in place so you can retry" >&2
-        exit 1
+    # Bound the delegation: a binary built before the cleanup subcommand
+    # existed ignores argv and boots the full daemon, serving forever. 30s
+    # caps that, and the fallback strips whatever it re-applied.
+    if ! timeout --kill-after=5 30 /usr/local/bin/frostbited cleanup "${CLEANUP_ARGS[@]}"; then
+        echo "frostbited cleanup failed or timed out (pre-cleanup binary?) — falling back to inline teardown" >&2
+        inline_teardown
     fi
 else
-    # Broken/partial install: no binary to delegate to. Inline the minimal
-    # teardown of the artifacts that block traffic on their own.
+    # Broken/partial install: no binary to delegate to.
     echo "==> frostbited binary missing — inline enforcement teardown"
-    chattr -i /etc/hosts 2>/dev/null || true
-    if [[ -f /etc/hosts ]]; then
-        sed -i '/# frostbite-begin/,/# frostbite-end/d' /etc/hosts \
-            || { echo "failed to strip the managed region from /etc/hosts" >&2; exit 1; }
-    fi
-    rm -f /etc/hosts.frostbite.tmp
-    nft delete table inet frostbite_doh 2>/dev/null || true
-    if [[ $PURGE -eq 1 ]]; then
-        rm -rf /var/lib/frostbite /etc/frostbite
-    fi
+    inline_teardown
 fi
 
 echo "==> Removing binaries"
 rm -f /usr/local/bin/frostbited /usr/local/bin/frostbite-gui
 
 echo "==> Removing systemd unit"
-rm -f /etc/systemd/system/frostbited.service
-systemctl daemon-reload
+# Remove the enablement symlink explicitly too: in a chroot (recovery
+# environment) the earlier `systemctl disable` is swallowed, and a bare
+# daemon-reload would die there under set -e, skipping every later step.
+rm -f /etc/systemd/system/frostbited.service \
+    /etc/systemd/system/multi-user.target.wants/frostbited.service
+systemctl daemon-reload 2>/dev/null || true
 
 echo "==> Removing launcher, icon, and autostart entry"
 INVOKING_USER="${SUDO_USER:-$USER}"

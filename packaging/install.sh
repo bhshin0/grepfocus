@@ -33,6 +33,11 @@ if ! sudo -u "$INVOKING_USER" -H bash -lc 'command -v pnpm' >/dev/null 2>&1; the
     echo "Install it first (https://pnpm.io/installation), then re-run." >&2
     exit 1
 fi
+if ! sudo -u "$INVOKING_USER" -H bash -lc 'command -v cargo || [ -f "$HOME/.cargo/env" ]' >/dev/null 2>&1; then
+    echo "cargo not found on $INVOKING_USER's PATH and no ~/.cargo/env — the daemon build needs it." >&2
+    echo "Install Rust via rustup (https://rustup.rs) first, then re-run." >&2
+    exit 1
+fi
 
 # Order matters: the Tauri build embeds ui/dist at compile time, and a plain
 # `cargo build` does not run tauri.conf.json's beforeBuildCommand, so the UI
@@ -42,7 +47,9 @@ sudo -u "$INVOKING_USER" -H bash -lc \
     'pnpm --dir crates/gui/ui install && pnpm --dir crates/gui/ui build'
 
 echo "==> Building release binaries"
-sudo -u "$INVOKING_USER" -H bash -c 'source "$HOME/.cargo/env"; cargo build --release'
+# Login shell so PATH-based toolchains (mise, asdf, profile) work; source
+# ~/.cargo/env only if rustup actually wrote one.
+sudo -u "$INVOKING_USER" -H bash -lc '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo build --release'
 
 echo "==> Creating frostbite group (if missing)"
 if ! getent group frostbite >/dev/null; then
@@ -66,7 +73,11 @@ install -d -m 0755 /run/frostbite
 
 echo "==> Enabling and starting frostbited"
 systemctl daemon-reload
-systemctl enable --now frostbited
+# restart, not `enable --now`: --now is a no-op for an already-active unit,
+# which would leave an old process running after a re-install. restart also
+# starts an inactive unit.
+systemctl enable frostbited
+systemctl restart frostbited
 
 echo "==> Installing launcher, icon, and autostart entry for $INVOKING_USER"
 USER_HOME="$(getent passwd "$INVOKING_USER" | cut -d: -f6)"
