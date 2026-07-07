@@ -23,6 +23,10 @@
 //! The table is named `frostbite_doh` and is independent of firewalld /
 //! any existing user firewall rules. Drop rules in any table take effect
 //! regardless of accept rules elsewhere.
+//!
+//! Every `nft` exec here is timeout-bounded (see `nft_command`): they all
+//! run synchronously under the daemon's `applied` mutex, so a hung nft
+//! would wedge the scheduler tick and Start/Break IPC forever.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -32,6 +36,13 @@ use tracing::{debug, warn};
 
 const NFT: &str = "/usr/sbin/nft";
 const TABLE: &str = "frostbite_doh";
+/// coreutils `timeout` — same "coreutils is always installed" assumption we
+/// already make for `chattr` in hosts.rs.
+const TIMEOUT_BIN: &str = "/usr/bin/timeout";
+/// Wall-clock bound for a single `nft` exec, in seconds. Generous for a
+/// command that normally completes in milliseconds, but tight enough that a
+/// stuck nf_tables commit lock can't wedge the daemon indefinitely.
+const NFT_TIMEOUT_SECS: &str = "10";
 
 /// IPv4 addresses of well-known public DoH resolvers, plus NextDNS anycast
 /// ranges. Only TCP 443 and TCP/UDP 853 to these are dropped — port 53 is
@@ -70,14 +81,25 @@ const DOH_V6: &[&str] = &[
     "2a10:50c0::ad2:ff",
 ];
 
+/// Build an `nft` invocation bounded by coreutils `timeout` (SIGTERM at
+/// `NFT_TIMEOUT_SECS`, SIGKILL 2s later). A timed-out exec exits 124, which
+/// reads as a plain failure and flows through the existing drift/retry
+/// paths. Callers add their own stdio config (e.g. `apply`'s piped stdin).
+fn nft_command(args: &[&str]) -> Command {
+    let mut cmd = Command::new(TIMEOUT_BIN);
+    cmd.arg("--kill-after=2")
+        .arg(NFT_TIMEOUT_SECS)
+        .arg(NFT)
+        .args(args);
+    cmd
+}
+
 /// Install the table. Idempotent — removes any prior copy first.
 pub fn apply() -> anyhow::Result<()> {
     let _ = clear(); // ignore "table doesn't exist" failures
 
     let ruleset = build_ruleset();
-    let mut child = Command::new(NFT)
-        .arg("-f")
-        .arg("-")
+    let mut child = nft_command(&["-f", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -109,8 +131,7 @@ pub fn apply() -> anyhow::Result<()> {
 /// whole ruleset and take our table with it. A spawn failure reads as
 /// "absent": the caller re-applies, and *that* path surfaces the real error.
 pub fn table_exists() -> bool {
-    Command::new(NFT)
-        .args(["list", "table", "inet", TABLE])
+    nft_command(&["list", "table", "inet", TABLE])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -119,8 +140,7 @@ pub fn table_exists() -> bool {
 
 /// Remove the table if present. Idempotent — silent on absence.
 pub fn clear() -> anyhow::Result<()> {
-    let out = Command::new(NFT)
-        .args(["delete", "table", "inet", TABLE])
+    let out = nft_command(&["delete", "table", "inet", TABLE])
         .output()
         .context("spawning nft delete")?;
     if !out.status.success() {
@@ -190,18 +210,26 @@ mod tests {
     }
 
     /// Plain DNS (port 53) must never be touched — the OS resolver and our
-    /// `/etc/hosts` override depend on it. Compare whole tokens so the
-    /// "53" inside "853" doesn't false-positive.
+    /// `/etc/hosts` override depend on it. Check every token after a
+    /// `dport`/`sport`, so port-set syntax (`dport { 53, 853 }`) is caught
+    /// too; set punctuation is trimmed per token, which keeps "853" distinct
+    /// from "53" and avoids a false positive.
     #[test]
     fn plain_dns_is_never_touched() {
         let r = build_ruleset();
         for line in r.lines() {
             let tokens: Vec<&str> = line.split_whitespace().collect();
-            for pair in tokens.windows(2) {
-                assert!(
-                    !(pair[0] == "dport" && pair[1] == "53"),
-                    "rule touches plain DNS: {line}"
-                );
+            for (i, tok) in tokens.iter().enumerate() {
+                if *tok != "dport" && *tok != "sport" {
+                    continue;
+                }
+                for port in &tokens[i + 1..] {
+                    assert_ne!(
+                        port.trim_matches(['{', '}', ',']),
+                        "53",
+                        "rule touches plain DNS: {line}"
+                    );
+                }
             }
         }
     }
