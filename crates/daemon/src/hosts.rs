@@ -89,7 +89,7 @@ pub fn block_present() -> bool {
 
 /// Whether `s` contains a managed-region begin marker. Matches after
 /// `trim_start`, mirroring `strip_managed`.
-fn contains_managed(s: &str) -> bool {
+pub(crate) fn contains_managed(s: &str) -> bool {
     s.lines()
         .any(|line| line.trim_start().starts_with(HOSTS_BEGIN))
 }

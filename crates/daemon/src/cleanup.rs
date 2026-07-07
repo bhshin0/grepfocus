@@ -12,6 +12,8 @@
 use std::fs;
 use std::io;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::process::Command;
 
 use anyhow::Context;
 use tracing::debug;
@@ -28,7 +30,8 @@ pub struct Opts {
 }
 
 /// Per-step result, collected for the end-of-run summary.
-enum Outcome {
+#[derive(Debug)]
+pub(crate) enum Outcome {
     Done(String),
     Skipped(String),
     Failed(String),
@@ -37,11 +40,13 @@ enum Outcome {
 /// What `strip_or_restore` did to the hosts file.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum HostsOutcome {
-    /// Readable and already free of a managed region — nothing written.
+    /// Present and already free of a managed region — nothing written, so
+    /// the file's bytes (encoding, line endings, trailing-newline style)
+    /// stay exactly as they were.
     AlreadyClean,
-    /// Managed region removed from the readable hosts file.
+    /// Managed region removed from the existing hosts file.
     Stripped,
-    /// Hosts file missing/unreadable; recovery copy written in its place.
+    /// Hosts file missing; recovery copy written in its place.
     Restored,
     /// Hosts file and recovery copy both missing — nothing to restore from,
     /// but also no managed region left anywhere.
@@ -56,17 +61,47 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
     }
 
     // Refuse to fight a live daemon: its 1s reconcile tick would re-apply
-    // enforcement right behind us. A connect that succeeds means something
-    // holds the listener — even a hung daemon might wake up mid-cleanup — so
-    // refuse either way. A refused/missing socket (stale after kill -9, or
-    // never installed) means not running: proceed.
+    // enforcement right behind us. The socket probe alone can't be trusted:
+    // under systemd's Restart=always a kill -9'd daemon respawns about a
+    // second later and re-applies enforcement BEFORE binding its socket, so
+    // a probe against the stale socket reads "not running" while the respawn
+    // re-enforces behind us. So ask systemd first, then probe the socket.
+    // A connect that succeeds means something holds the listener — even a
+    // hung daemon might wake up mid-cleanup — so refuse either way. Only a
+    // refused/missing socket (stale after kill -9, or never installed)
+    // means not running; any other connect error is inconclusive, so bail.
     if !opts.force {
+        let unit_active = Command::new("systemctl")
+            .args(["is-active", "--quiet", "frostbited"])
+            .status()
+            .is_ok_and(|s| s.success());
+        if unit_active {
+            anyhow::bail!(
+                "frostbited unit is active — stop it first \
+                 (sudo systemctl stop frostbited) or pass --force"
+            );
+        }
+        // Spawn error or nonzero exit: not running, or no systemd (chroot) —
+        // fall through to the socket probe.
         match UnixStream::connect(paths::SOCK) {
             Ok(_) => anyhow::bail!(
                 "frostbited appears to be running — stop it first \
                  (sudo systemctl stop frostbited) or pass --force"
             ),
-            Err(e) => debug!(?e, "daemon socket not accepting — proceeding"),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                ) =>
+            {
+                debug!(?e, "daemon socket not accepting — proceeding");
+            }
+            Err(e) => anyhow::bail!(
+                "cannot tell whether frostbited is running (connecting to {}: {}) — \
+                 stop it first or pass --force",
+                paths::SOCK,
+                e
+            ),
         }
     }
 
@@ -138,55 +173,41 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
     ));
 
     // (f) Clear persisted active blocks so a later `systemctl start` doesn't
-    // re-apply them. Read the secret directly — cleanup must never create
-    // one (that's `state::load_or_create_secret`'s job, on daemon startup).
+    // re-apply them.
     steps.push((
         "state active blocks",
-        match fs::read(paths::SECRET_FILE) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                Outcome::Skipped("no HMAC secret — no trusted state to clear".into())
-            }
-            Err(e) => Outcome::Skipped(format!("reading secret failed ({e}) — skipping")),
-            Ok(key) => match state::load(&key) {
-                Err(e) => Outcome::Skipped(format!(
-                    "state missing or corrupt ({e:#}) — skipping; daemon startup fails open"
-                )),
-                Ok(st) if st.active.is_empty() => {
-                    Outcome::Skipped("no active blocks recorded".into())
-                }
-                Ok(mut st) => {
-                    let n = st.active.len();
-                    st.active.clear();
-                    match state::save(&st, &key) {
-                        Ok(()) => Outcome::Done(format!("cleared {n} active block(s)")),
-                        Err(e) => Outcome::Failed(format!("saving cleared state: {e:#}")),
-                    }
-                }
-            },
-        },
+        clear_active_blocks(Path::new(paths::STATE_DIR), Path::new(paths::SECRET_FILE)),
     ));
 
     // (g) --purge: delete the state and config dirs. Last, because earlier
-    // steps may write there (recovery copy refresh, state save).
+    // steps may write there (recovery copy refresh, state save). When the
+    // hosts strip failed, /etc/hosts may still contain the managed region and
+    // hosts.orig inside the state dir is the recovery copy needed to fix
+    // exactly that — purging would burn the safety net, so keep everything.
     if opts.purge {
-        steps.push(("purge dirs", {
-            let mut removed = Vec::new();
-            let mut failed = Vec::new();
-            for dir in [paths::STATE_DIR, paths::SECRET_DIR] {
-                match fs::remove_dir_all(dir) {
-                    Ok(()) => removed.push(dir),
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => failed.push(format!("{}: {}", dir, e)),
-                }
-            }
-            if !failed.is_empty() {
-                Outcome::Failed(failed.join("; "))
-            } else if removed.is_empty() {
-                Outcome::Skipped("already absent".into())
+        steps.push((
+            "purge dirs",
+            if hosts_strip_error.is_some() {
+                Outcome::Skipped("hosts strip failed — keeping state and recovery copy".into())
             } else {
-                Outcome::Done(format!("removed {}", removed.join(", ")))
-            }
-        }));
+                let mut removed = Vec::new();
+                let mut failed = Vec::new();
+                for dir in [paths::STATE_DIR, paths::SECRET_DIR] {
+                    match fs::remove_dir_all(dir) {
+                        Ok(()) => removed.push(dir),
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => failed.push(format!("{}: {}", dir, e)),
+                    }
+                }
+                if !failed.is_empty() {
+                    Outcome::Failed(failed.join("; "))
+                } else if removed.is_empty() {
+                    Outcome::Skipped("already absent".into())
+                } else {
+                    Outcome::Done(format!("removed {}", removed.join(", ")))
+                }
+            },
+        ));
     }
 
     println!("frostbite cleanup summary:");
@@ -207,24 +228,41 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
 }
 
 /// Remove the managed region from `hosts_path`, or, when `hosts_path` is
-/// missing/unreadable, restore it from the recovery copy at `orig_path`.
+/// missing, restore it from the recovery copy at `orig_path`.
 ///
-/// A readable hosts file always wins over the recovery copy: user edits made
-/// since the copy was taken must survive, so a readable file is only ever
-/// *stripped*, and a restore happens only when there is nothing to strip.
+/// A present hosts file always wins over the recovery copy: user edits made
+/// since the copy was taken must survive, so an existing file is only ever
+/// *stripped* — and only when a managed region is actually present, so a
+/// region-free file keeps its exact bytes (encoding, line endings,
+/// trailing-newline style). A restore happens only when the live file is
+/// confirmed *absent*; any other read error propagates rather than letting
+/// the stale copy overwrite a live file we merely failed to read.
 pub(crate) fn strip_or_restore(hosts_path: &str, orig_path: &str) -> anyhow::Result<HostsOutcome> {
-    let read_err = match fs::read_to_string(hosts_path) {
-        Ok(content) => {
-            let stripped = hosts::strip_managed(&content);
-            if stripped == content {
+    let read_err = match fs::read(hosts_path) {
+        Ok(bytes) => {
+            // Decode lossily: marker detection and stripping only care about
+            // the ASCII marker lines, and hosts files can legally carry
+            // non-UTF-8 bytes (e.g. latin-1 comments).
+            let content = String::from_utf8_lossy(&bytes);
+            if !hosts::contains_managed(&content) {
                 return Ok(HostsOutcome::AlreadyClean);
             }
+            // A region is present, so a rewrite is unavoidable anyway; only
+            // on this path can lossy replacement touch unrelated invalid
+            // bytes.
+            let stripped = hosts::strip_managed(&content);
             hosts::write_atomic(hosts_path, &stripped, hosts::HOSTS_MODE)
                 .with_context(|| format!("writing stripped {}", hosts_path))?;
             return Ok(HostsOutcome::Stripped);
         }
         Err(e) => e,
     };
+    if read_err.kind() != io::ErrorKind::NotFound {
+        return Err(anyhow::Error::new(read_err).context(format!(
+            "reading {} — refusing to restore over it",
+            hosts_path
+        )));
+    }
     match fs::read_to_string(orig_path) {
         Ok(orig) => {
             // Defensive: the recovery copy is written pre-stripped, but strip
@@ -234,15 +272,41 @@ pub(crate) fn strip_or_restore(hosts_path: &str, orig_path: &str) -> anyhow::Res
                 .with_context(|| format!("restoring {} from {}", hosts_path, orig_path))?;
             Ok(HostsOutcome::Restored)
         }
-        Err(orig_err)
-            if orig_err.kind() == io::ErrorKind::NotFound
-                && read_err.kind() == io::ErrorKind::NotFound =>
-        {
+        Err(orig_err) if orig_err.kind() == io::ErrorKind::NotFound => {
             Ok(HostsOutcome::MissingNoBackup)
         }
         Err(orig_err) => Err(anyhow::anyhow!(
-            "hosts file unusable ({read_err}) and recovery copy unusable ({orig_err})"
+            "hosts file missing ({read_err}) and recovery copy unusable ({orig_err})"
         )),
+    }
+}
+
+/// Step (f) of `run`: clear persisted active blocks so a later
+/// `systemctl start` doesn't re-apply them. Reads the secret directly —
+/// cleanup must never create one (that's `state::load_or_create_secret`'s
+/// job, on daemon startup). Everything short of a failed save is a skip:
+/// with no secret or no verifiable state there is nothing trusted to clear,
+/// and daemon startup fails open on corrupt state anyway.
+pub(crate) fn clear_active_blocks(state_dir: &Path, secret_path: &Path) -> Outcome {
+    match fs::read(secret_path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Outcome::Skipped("no HMAC secret — no trusted state to clear".into())
+        }
+        Err(e) => Outcome::Skipped(format!("reading secret failed ({e}) — skipping")),
+        Ok(key) => match state::load_in(state_dir, &key) {
+            Err(e) => Outcome::Skipped(format!(
+                "state missing or corrupt ({e:#}) — skipping; daemon startup fails open"
+            )),
+            Ok(st) if st.active.is_empty() => Outcome::Skipped("no active blocks recorded".into()),
+            Ok(mut st) => {
+                let n = st.active.len();
+                st.active.clear();
+                match state::save_in(state_dir, &st, &key) {
+                    Ok(()) => Outcome::Done(format!("cleared {n} active block(s)")),
+                    Err(e) => Outcome::Failed(format!("saving cleared state: {e:#}")),
+                }
+            }
+        },
     }
 }
 
@@ -363,9 +427,68 @@ mod tests {
     }
 
     #[test]
-    fn state_active_clear_round_trips() {
+    fn non_utf8_hosts_without_region_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts = dir.path().join("hosts");
+        let orig = dir.path().join("hosts.orig");
+        // Latin-1 comment: 0xe9 is not valid UTF-8.
+        let bytes: &[u8] = b"127.0.0.1 localhost # caf\xe9\n10.0.0.5 nas.local\n";
+        fs::write(&hosts, bytes).unwrap();
+        fs::write(&orig, "127.0.0.1 localhost\n").unwrap();
+        let out = strip_or_restore(hosts.to_str().unwrap(), orig.to_str().unwrap()).unwrap();
+        assert_eq!(out, HostsOutcome::AlreadyClean);
+        // Region-free: byte-for-byte untouched, never restored over.
+        assert_eq!(fs::read(&hosts).unwrap(), bytes);
+    }
+
+    #[test]
+    fn non_utf8_hosts_with_region_is_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts = dir.path().join("hosts");
+        let orig = dir.path().join("hosts.orig");
+        let mut bytes = b"10.0.0.5 nas.local # caf\xe9\n".to_vec();
+        bytes.extend_from_slice(hosts_with_region().as_bytes());
+        fs::write(&hosts, &bytes).unwrap();
+        let out = strip_or_restore(hosts.to_str().unwrap(), orig.to_str().unwrap()).unwrap();
+        assert_eq!(out, HostsOutcome::Stripped);
+        let after = fs::read_to_string(&hosts).unwrap();
+        assert!(!after.contains("reddit.com"));
+        // User lines survive, including the (lossily decoded) non-UTF-8 one.
+        assert!(after.contains("nas.local"));
+        assert!(after.contains("127.0.0.1 localhost"));
+        assert!(after.contains("# user comment"));
+    }
+
+    #[test]
+    fn region_free_no_trailing_newline_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts = dir.path().join("hosts");
+        let orig = dir.path().join("hosts.orig");
+        let bytes: &[u8] = b"127.0.0.1 localhost";
+        fs::write(&hosts, bytes).unwrap();
+        let out = strip_or_restore(hosts.to_str().unwrap(), orig.to_str().unwrap()).unwrap();
+        assert_eq!(out, HostsOutcome::AlreadyClean);
+        assert_eq!(fs::read(&hosts).unwrap(), bytes);
+    }
+
+    #[test]
+    fn region_free_crlf_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts = dir.path().join("hosts");
+        let orig = dir.path().join("hosts.orig");
+        let bytes: &[u8] = b"127.0.0.1 localhost\r\n::1 localhost\r\n";
+        fs::write(&hosts, bytes).unwrap();
+        let out = strip_or_restore(hosts.to_str().unwrap(), orig.to_str().unwrap()).unwrap();
+        assert_eq!(out, HostsOutcome::AlreadyClean);
+        assert_eq!(fs::read(&hosts).unwrap(), bytes);
+    }
+
+    #[test]
+    fn clear_active_blocks_clears_actives_and_keeps_config() {
         let dir = tempfile::tempdir().unwrap();
         let key = b"cleanup-active-clear-key-0123456789";
+        let secret = dir.path().join("secret");
+        fs::write(&secret, key).unwrap();
         let block = Block {
             id: 1,
             name: "reddit".into(),
@@ -386,15 +509,32 @@ mod tests {
             ..Default::default()
         };
         state::save_in(dir.path(), &st, key).unwrap();
-        // The exact sequence cleanup's step (f) performs: load, clear, save.
-        let mut loaded = state::load_in(dir.path(), key).unwrap();
-        assert_eq!(loaded.active.len(), 1);
-        loaded.active.clear();
-        state::save_in(dir.path(), &loaded, key).unwrap();
+        let out = clear_active_blocks(dir.path(), &secret);
+        assert!(matches!(out, Outcome::Done(_)), "{out:?}");
         let reloaded = state::load_in(dir.path(), key).unwrap();
         assert!(reloaded.active.is_empty());
         // Everything else survives — cleanup drops the actives, not the config.
         assert_eq!(reloaded.blocks.len(), 1);
         assert_eq!(reloaded.next_id, 2);
+    }
+
+    #[test]
+    fn clear_active_blocks_skips_without_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = clear_active_blocks(dir.path(), &dir.path().join("secret"));
+        assert!(matches!(out, Outcome::Skipped(_)), "{out:?}");
+        assert!(!dir.path().join("state.json").exists());
+    }
+
+    #[test]
+    fn clear_active_blocks_skips_corrupt_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        fs::write(&secret, b"cleanup-corrupt-state-key-01234567").unwrap();
+        fs::write(dir.path().join("state.json"), b"garbage").unwrap();
+        let out = clear_active_blocks(dir.path(), &secret);
+        assert!(matches!(out, Outcome::Skipped(_)), "{out:?}");
+        // The unverifiable file is left alone, not overwritten.
+        assert_eq!(fs::read(dir.path().join("state.json")).unwrap(), b"garbage");
     }
 }
