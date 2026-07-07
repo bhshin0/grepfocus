@@ -35,10 +35,22 @@ done
 # Interactive with no flag given: ask. Non-interactive defaults to keep, so
 # scripted uninstalls never destroy saved data by surprise.
 if [[ $# -eq 0 && -t 0 ]]; then
+    # Drain stale buffered keystrokes first: a leftover "y" queued during an
+    # earlier sudo prompt must not be able to answer a destructive question.
+    while read -r -t 0; do
+        read -r -t 1 _ || break
+    done
     read -r -p "Also delete saved blocks, password, and secret? [y/N] " answer || answer=""
     case "$answer" in
         [yY]|[yY][eE][sS]) PURGE=1 ;;
     esac
+fi
+
+# Echo the decision so a mis-answered prompt is visible before it acts.
+if [[ $PURGE -eq 1 ]]; then
+    echo "==> Will PURGE saved data (blocks, password, secret, group)"
+else
+    echo "==> Keeping saved data (re-run with --purge to delete it)"
 fi
 
 # Minimal teardown of the artifacts that block traffic on their own. Used
