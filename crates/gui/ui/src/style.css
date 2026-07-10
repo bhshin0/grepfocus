@@ -99,7 +99,7 @@ button[type="submit"], .start-btn {
 }
 
 .msg { color: var(--muted); font-size: 13px; min-height: 1.2em; }
-.msg.error { color: var(--danger); }
+.msg.error { color: var(--danger); white-space: pre-line; }
 
 .active-banner {
   background: var(--accent);
@@ -202,6 +202,7 @@ form label > input[type="checkbox"] { width: auto; margin-right: 6px; }
   border: 1px solid var(--border);
   background: var(--card);
   margin-bottom: 16px;
+  white-space: pre-line;
 }
 .lock-state.locked { border-color: var(--danger); color: var(--danger); }
 .lock-state.unlocked { border-color: var(--accent); color: var(--accent); }
@@ -231,6 +232,7 @@ dialog .row { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
   width: 70px;
   color: var(--fg);
 }
+.active-banner .break-left { white-space: pre-line; }
 .active-banner .break-btn {
   background: white;
   color: var(--accent);

@@ -217,7 +217,7 @@ async function refreshStatus() {
     statusEl.innerHTML = "";
     const p = document.createElement("p");
     p.className = "msg error";
-    p.textContent = `Failed to reach daemon: ${e}`;
+    p.textContent = String(e);
     statusEl.appendChild(p);
     stopCountdownTimer();
   }
@@ -606,7 +606,7 @@ async function refreshSettings() {
       pwSubmit.textContent = "Change password";
     }
   } catch (e) {
-    lockStateEl.textContent = `Failed to reach daemon: ${e}`;
+    lockStateEl.textContent = String(e);
     lockStateEl.className = "lock-state locked";
   }
 }
