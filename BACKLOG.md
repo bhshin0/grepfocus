@@ -56,19 +56,22 @@ review findings — so they don't have to be re-derived later.
 - **[FIXED — Phase 2] Stale tray tooltip while the daemon is down** —
   `crates/gui/src/main.rs` (status watcher `continue` on poll failure). The
   tooltip kept reporting the last-known "N active". On poll failure it now sets
-  "Frostbite — daemon unreachable" (without touching the notification
+  "GrepFocus — daemon unreachable" (without touching the notification
   baseline `prev`).
 
 ## Decisions
 
-- **frostbite → Timely rename: DEFERRED (2026-07-04).** Everything keeps its
-  current names: crates `frostbite-core`/`frostbited`/`frostbite-gui`, group
-  `frostbite`, socket `/run/frostbite/sock`, nft table `frostbite_doh`, hosts
-  markers `# frostbite-begin`/`# frostbite-end`, paths `/var/lib/frostbite`,
-  `/etc/frostbite`. Rename cost grows with each new artifact; the daily-driver
-  milestone added `frostbite.desktop`, `hosts.orig`, and `upgrade.sh`. Revisit
-  before publishing beyond the author's machine. *Update 2026-07-06:* "Timely"
-  is dead as a candidate; see *Bookmarks → Rename* below for current research.
+- **Rename to grepfocus: DONE (2026-07-10).** Deferred on 2026-07-04 (then
+  targeting "Timely") because rename cost grew with each new artifact;
+  executed 2026-07-10, before `.rpm` packaging could multiply the cost
+  further. Display name **GrepFocus**; binaries and paths all-lowercase.
+  Renamed: crates `grepfocus-core`/`grepfocusd`/`grepfocus-gui`, group
+  `grepfocus`, socket `/run/grepfocus/sock`, nft table `grepfocus_doh`,
+  hosts markers `# grepfocus-begin`/`# grepfocus-end`, paths
+  `/var/lib/grepfocus` (incl. `hosts.orig`) and `/etc/grepfocus`,
+  `grepfocus.desktop`, unit `grepfocusd.service`, GitHub repo
+  `bhshin0/grepfocus`. See *Bookmarks → Rename* below for the naming
+  research trail.
 
 ## Bookmarks (deferred work)
 
@@ -77,7 +80,8 @@ marked fixed inline. Each entry records findings so the legwork doesn't have
 to be redone when the item is picked up.
 
 - **[DEFERRED] Licensing / paywall (v1 ships free)** — app-side integration
-  spec from the frostbite-web audit. Token format:
+  spec from the frostbite-web audit (the external store repo; renaming it to
+  match grepfocus is future work). Token format:
   `base64url(JSON claims) + "." + base64url(raw 64-byte Ed25519 signature)`;
   the signature is computed over the ASCII bytes of the FIRST base64url
   segment (JWT-style), NOT the decoded JSON; both segments are base64URL
@@ -101,19 +105,22 @@ to be redone when the item is picked up.
   `lib/features.ts`).
 - **[DEFERRED] Packaging** — `.rpm` first. Use `sysusers.d`/`tmpfiles.d`
   for the group and runtime/state dirs; declare runtime deps (webkit2gtk4.1,
-  libappindicator/ayatana); `%preun` can run `frostbited cleanup` verbatim.
+  libappindicator/ayatana); `%preun` can run `grepfocusd cleanup` verbatim.
   `tauri.conf.json`'s bundle section is currently disabled. The store
   download page artifacts are all "coming soon" placeholders.
-- **[DEFERRED — decision pending] Rename** — research 2026-07-06.
-  "Frostbite": medium-high trademark risk (EA's Frostbite engine, Class 9
-  overlap); fine at low visibility, but don't build paid brand equity on it.
-  "Timely" (the 2026-07-04 candidate): effectively taken — timely.com
-  productivity SaaS plus the well-known `timely` crate — dead. "Frostlock":
-  researched CLEAR (crates.io free, no product collisions, .com looks open —
-  verify at a registrar before committing). "Hoarfrost": clear backup
-  (spelling friction). A rename touches: crate/binary names, systemd unit,
-  socket path `/run/frostbite`, unix group, hosts markers, nft table name,
-  `/var` + `/etc` dirs, `.desktop`/icon, Tauri identifier.
+- **[FIXED — renamed to grepfocus, 2026-07-10] Rename** — research
+  2026-07-06, resolved 2026-07-10: the project is now **grepfocus** (display
+  name **GrepFocus**), collision-checked clean — crates.io free, no product
+  conflicts (GuruFocus is unrelated finance software). Research kernel: the
+  original name carried medium-high trademark risk (EA's game engine of the
+  same name, Class 9 overlap) — fine at low visibility, but wrong to build
+  paid brand equity on. "Timely" (the 2026-07-04 candidate): effectively
+  taken — timely.com productivity SaaS plus the well-known `timely` crate —
+  dead. "Frostlock": the earlier researched-CLEAR candidate; "Hoarfrost":
+  clear backup (spelling friction); grepfocus won. The rename covered:
+  crate/binary names, systemd unit, socket path `/run/grepfocus`, unix
+  group, hosts markers, nft table name, `/var` + `/etc` dirs,
+  `.desktop`/icon, Tauri identifier, GitHub repo.
 - **[FIXED — UX polish] GNOME tray invisibility** — stock GNOME ships no
   StatusNotifier host, so the tray icon never appeared and close-to-tray made
   the app invisible after its first close. The GUI now probes for a host at
@@ -121,6 +128,6 @@ to be redone when the item is picked up.
   watcher re-shows a hidden window if the host vanishes.
 - **[FIXED — UX polish] First-run error copy** — the GUI surfaced the raw
   connect errno when the daemon was down or the user wasn't in the
-  `frostbite` group. Connect failures now say what to do instead
+  `grepfocus` group. Connect failures now say what to do instead
   (start/install the daemon; `usermod` + re-login), with the raw error kept
   as a trailing line.

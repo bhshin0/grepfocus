@@ -1,4 +1,4 @@
-# frostbite
+# GrepFocus
 
 A Cold Turkey-style website and application blocker for Linux.
 
@@ -7,7 +7,7 @@ A Cold Turkey-style website and application blocker for Linux.
 
 ## What it does
 
-When a block is active, frostbite:
+When a block is active, GrepFocus:
 
 - **Blocks websites** by writing entries to `/etc/hosts` that point each
   blocked domain (and its `www.` alias) to `0.0.0.0`, then sets `chattr +i`
@@ -24,7 +24,7 @@ When a block is active, frostbite:
 
 ```
 ┌──────────────────────┐    Unix socket    ┌─────────────────────────┐
-│  Tauri GUI (user)    │   /run/frostbite  │  frostbited (root)      │
+│  Tauri GUI (user)    │   /run/grepfocus  │  grepfocusd (root)      │
 │  - Block list editor │ ────────────────► │  - Owns block state     │
 │  - Status / timers   │ ◄──────────────── │  - Edits /etc/hosts     │
 └──────────────────────┘   length-prefix   │  - Kills blocked procs  │
@@ -32,19 +32,19 @@ When a block is active, frostbite:
                                            └─────────────────────────┘
 ```
 
-- `frostbited` runs as root via systemd, owns enforcement.
-- The GUI is unprivileged. Membership in the `frostbite` group authorizes a
-  user to talk to the daemon socket (`/run/frostbite/sock`, mode `0660`).
+- `grepfocusd` runs as root via systemd, owns enforcement.
+- The GUI is unprivileged. Membership in the `grepfocus` group authorizes a
+  user to talk to the daemon socket (`/run/grepfocus/sock`, mode `0660`).
 
 ## Repository layout
 
 ```
 crates/
   core/      shared types, IPC framing, HMAC helpers
-  daemon/    frostbited binary
+  daemon/    grepfocusd binary
   gui/       Tauri app (planned)
 packaging/
-  systemd/   frostbited.service unit
+  systemd/   grepfocusd.service unit
   install.sh dev installer
 ```
 
@@ -67,9 +67,9 @@ Build and install the full product — daemon + systemd unit, GUI binary,
 app-grid launcher, icon, and login autostart entry:
 
 ```bash
-git clone <repo> frostbite && cd frostbite
+git clone <repo> grepfocus && cd grepfocus
 sudo ./packaging/install.sh
-# log out and back in for `frostbite` group membership to take effect
+# log out and back in for `grepfocus` group membership to take effect
 ```
 
 To remove it later, use `sudo ./packaging/uninstall.sh` (see *Recovery*
@@ -78,13 +78,13 @@ below).
 Verify it's running:
 
 ```bash
-systemctl status frostbited
-journalctl -u frostbited -f
+systemctl status grepfocusd
+journalctl -u grepfocusd -f
 ```
 
 ## Running the GUI (dev mode)
 
-The Tauri app needs the daemon running and you in the `frostbite` group.
+The Tauri app needs the daemon running and you in the `grepfocus` group.
 
 ```bash
 # one-time: install JS deps
@@ -95,7 +95,7 @@ pnpm --dir crates/gui/ui install
 pnpm --dir crates/gui/ui build
 
 # run the GUI
-cargo run -p frostbite-gui
+cargo run -p grepfocus-gui
 ```
 
 For an iterative dev loop, install Tauri's CLI and use `tauri dev`:
@@ -124,7 +124,7 @@ Requirements: the `rustfmt` and `clippy` components
 (`rustup component add rustfmt clippy`), `pnpm`, and — for the workspace-wide
 clippy/test that include the GUI crate — the webkit2gtk-4.1 + gtk-3 dev libs.
 On a headless box without those, scope the Rust steps to
-`-p frostbite-core -p frostbited`.
+`-p grepfocus-core -p grepfocusd`.
 
 You can wire it up as a pre-commit hook if you like (not installed
 automatically):
@@ -162,7 +162,7 @@ or `{kind: "cmdline", contains}`.
 
 ## Recovery
 
-Frostbite must never brick a machine, so every enforcement artifact has a
+GrepFocus must never brick a machine, so every enforcement artifact has a
 supported teardown path — and a manual escape hatch for when the binaries
 are already gone.
 
@@ -170,9 +170,9 @@ Supported paths (both idempotent; running them twice is safe):
 
 ```bash
 # Full uninstall. Tears down enforcement FIRST, then removes the binaries,
-# systemd unit, launcher/autostart files, and /run/frostbite. --purge
+# systemd unit, launcher/autostart files, and /run/grepfocus. --purge
 # additionally deletes saved blocks, the password, the HMAC secret, and
-# the frostbite group.
+# the grepfocus group.
 sudo ./packaging/uninstall.sh [--purge]
 
 # Offline teardown without uninstalling: clears the immutable bit, strips
@@ -180,23 +180,23 @@ sudo ./packaging/uninstall.sh [--purge]
 # drops the nftables table, and clears persisted active blocks so a later
 # `systemctl start` won't re-apply them. Refuses to run while the daemon
 # is up (its 1s reconcile tick would re-apply enforcement right behind
-# it) unless you pass --force. --purge deletes /var/lib/frostbite and
-# /etc/frostbite; binaries, unit, and the frostbite group are
+# it) unless you pass --force. --purge deletes /var/lib/grepfocus and
+# /etc/grepfocus; binaries, unit, and the grepfocus group are
 # uninstall.sh's job.
-sudo frostbited cleanup [--purge] [--force]
+sudo grepfocusd cleanup [--purge] [--force]
 ```
 
-If the binaries are already gone, everything Frostbite enforces can be
+If the binaries are already gone, everything GrepFocus enforces can be
 undone by hand:
 
 ```bash
 sudo chattr -i /etc/hosts
-sudo sed -i '/# frostbite-begin/,/# frostbite-end/d' /etc/hosts
-sudo nft delete table inet frostbite_doh
-sudo rm -f /etc/hosts.frostbite.tmp
+sudo sed -i '/# grepfocus-begin/,/# grepfocus-end/d' /etc/hosts
+sudo nft delete table inet grepfocus_doh
+sudo rm -f /etc/hosts.grepfocus.tmp
 ```
 
-`/var/lib/frostbite/hosts.orig` is a root-only snapshot of the *unmanaged*
+`/var/lib/grepfocus/hosts.orig` is a root-only snapshot of the *unmanaged*
 `/etc/hosts` content (everything outside the marker region), refreshed
 before every managed edit. You normally never need it — the `sed` above
 removes the managed region and leaves the rest untouched. Copy it over
@@ -205,7 +205,7 @@ with `install`, not `cp`, since the snapshot is 0600 and `/etc/hosts`
 must be world-readable for the resolver in non-root processes:
 
 ```bash
-sudo install -m 644 /var/lib/frostbite/hosts.orig /etc/hosts
+sudo install -m 644 /var/lib/grepfocus/hosts.orig /etc/hosts
 ```
 
 ## Known limits
@@ -237,7 +237,7 @@ that Cold Turkey beats either.
 - **Uninstalling works even mid-block — by design.** A Cold Turkey-style
   uninstall lockout was considered and deliberately rejected: root is out
   of the threat model (see above), and never bricking a machine beats
-  fighting root. `uninstall.sh` and `frostbited cleanup` tear down
+  fighting root. `uninstall.sh` and `grepfocusd cleanup` tear down
   enforcement during an active block without complaint.
 - **No tray icon on stock GNOME.** GNOME ships no StatusNotifier host, so
   the tray icon needs an extension such as "AppIndicator and
@@ -246,7 +246,7 @@ that Cold Turkey beats either.
   closing to keep getting block start/end notifications. With one, closing
   hides to the tray; if the tray host
   vanishes while the window is hidden, the window reappears within ~5
-  seconds. Launching Frostbite again always surfaces the existing instance.
+  seconds. Launching GrepFocus again always surfaces the existing instance.
 
 ## License
 
