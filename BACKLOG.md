@@ -72,9 +72,9 @@ review findings — so they don't have to be re-derived later.
 
 ## Bookmarks (deferred work)
 
-Research notes only — nothing below is scheduled or implemented. Each entry
-records findings so the legwork doesn't have to be redone when the item is
-picked up.
+Research notes only — nothing below is scheduled or implemented unless
+marked fixed inline. Each entry records findings so the legwork doesn't have
+to be redone when the item is picked up.
 
 - **[DEFERRED] Licensing / paywall (v1 ships free)** — app-side integration
   spec from the frostbite-web audit. Token format:
@@ -114,12 +114,13 @@ picked up.
   (spelling friction). A rename touches: crate/binary names, systemd unit,
   socket path `/run/frostbite`, unix group, hosts markers, nft table name,
   `/var` + `/etc` dirs, `.desktop`/icon, Tauri identifier.
-- **[DEFERRED] GNOME tray invisibility** — stock GNOME ships no
-  StatusNotifier host, so the tray icon never appears; combined with
-  close-to-tray the app becomes invisible after its first close
-  (single-instance relaunch recovers it). Needs a fallback: detect tray
-  availability, or offer a minimize-vs-quit choice.
-- **[DEFERRED] First-run error copy** — the GUI surfaces the raw connect
-  errno when the daemon is down or the user isn't in the `frostbite` group.
-  Needs actionable guidance instead (install/start the daemon; add yourself
-  to the group and re-login).
+- **[FIXED — UX polish] GNOME tray invisibility** — stock GNOME ships no
+  StatusNotifier host, so the tray icon never appeared and close-to-tray made
+  the app invisible after its first close. The GUI now probes for a host at
+  close time (quit when none, hide to tray when present), and the status
+  watcher re-shows a hidden window if the host vanishes.
+- **[FIXED — UX polish] First-run error copy** — the GUI surfaced the raw
+  connect errno when the daemon was down or the user wasn't in the
+  `frostbite` group. Connect failures now say what to do instead
+  (start/install the daemon; `usermod` + re-login), with the raw error kept
+  as a trailing line.

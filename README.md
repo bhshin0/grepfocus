@@ -134,7 +134,7 @@ ln -s ../../scripts/check.sh .git/hooks/pre-commit
 ```
 
 To rebuild and redeploy onto the local machine in one step (installs the
-daemon/GUI binaries, restarts the service, and installs the launcher + tray
+daemon/GUI binaries, restarts the service, and installs the launcher + login
 autostart entry), use the upgrade loop:
 
 ```bash
@@ -239,6 +239,14 @@ that Cold Turkey beats either.
   of the threat model (see above), and never bricking a machine beats
   fighting root. `uninstall.sh` and `frostbited cleanup` tear down
   enforcement during an active block without complaint.
+- **No tray icon on stock GNOME.** GNOME ships no StatusNotifier host, so
+  the tray icon needs an extension such as "AppIndicator and
+  KStatusNotifierItem Support". Without one, closing the window quits the
+  app — enforcement is daemon-side and unaffected, and a notification tells
+  you it closed; minimize instead of closing to keep getting block start/end
+  notifications. With one, closing hides to the tray; if the tray host
+  vanishes while the window is hidden, the window reappears within ~5
+  seconds. Launching Frostbite again always surfaces the existing instance.
 
 ## License
 
