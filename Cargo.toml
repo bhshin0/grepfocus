@@ -10,7 +10,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "LicenseRef-PolyForm-Shield-1.0.0"
-repository = "https://github.com/scada/frostbite"
+repository = "https://github.com/bhshin0/grepfocus"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

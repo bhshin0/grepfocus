@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Frostbite dev installer.
+# GrepFocus dev installer.
 #
 # Builds the UI, daemon, and GUI in release mode and installs:
-#   /usr/local/bin/frostbited
-#   /usr/local/bin/frostbite-gui
-#   /etc/systemd/system/frostbited.service
-#   ~/.local/share/applications/frostbite.desktop   (app-grid launcher)
-#   ~/.local/share/icons/hicolor/64x64/apps/frostbite.png
-#   ~/.config/autostart/frostbite.desktop           (start GUI + tray at login)
-# Creates the `frostbite` group, runtime/state directories, and enables the
+#   /usr/local/bin/grepfocusd
+#   /usr/local/bin/grepfocus-gui
+#   /etc/systemd/system/grepfocusd.service
+#   ~/.local/share/applications/grepfocus.desktop   (app-grid launcher)
+#   ~/.local/share/icons/hicolor/64x64/apps/grepfocus.png
+#   ~/.config/autostart/grepfocus.desktop           (start GUI + tray at login)
+# Creates the `grepfocus` group, runtime/state directories, and enables the
 # systemd unit. Run as root.
 #
 # Usage: sudo ./packaging/install.sh
@@ -51,33 +51,33 @@ echo "==> Building release binaries"
 # ~/.cargo/env only if rustup actually wrote one.
 sudo -u "$INVOKING_USER" -H bash -lc '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"; cargo build --release'
 
-echo "==> Creating frostbite group (if missing)"
-if ! getent group frostbite >/dev/null; then
-    groupadd --system frostbite
+echo "==> Creating grepfocus group (if missing)"
+if ! getent group grepfocus >/dev/null; then
+    groupadd --system grepfocus
 fi
 
-echo "==> Adding $INVOKING_USER to frostbite group"
-usermod -aG frostbite "$INVOKING_USER" || true
+echo "==> Adding $INVOKING_USER to grepfocus group"
+usermod -aG grepfocus "$INVOKING_USER" || true
 
 echo "==> Installing binaries"
-install -m 0755 target/release/frostbited /usr/local/bin/frostbited
-install -m 0755 target/release/frostbite-gui /usr/local/bin/frostbite-gui
+install -m 0755 target/release/grepfocusd /usr/local/bin/grepfocusd
+install -m 0755 target/release/grepfocus-gui /usr/local/bin/grepfocus-gui
 
 echo "==> Installing systemd unit"
-install -m 0644 packaging/systemd/frostbited.service /etc/systemd/system/frostbited.service
+install -m 0644 packaging/systemd/grepfocusd.service /etc/systemd/system/grepfocusd.service
 
 echo "==> Creating runtime directories"
-install -d -m 0700 /etc/frostbite
-install -d -m 0700 /var/lib/frostbite
-install -d -m 0755 /run/frostbite
+install -d -m 0700 /etc/grepfocus
+install -d -m 0700 /var/lib/grepfocus
+install -d -m 0755 /run/grepfocus
 
-echo "==> Enabling and starting frostbited"
+echo "==> Enabling and starting grepfocusd"
 systemctl daemon-reload
 # restart, not `enable --now`: --now is a no-op for an already-active unit,
 # which would leave an old process running after a re-install. restart also
 # starts an inactive unit.
-systemctl enable frostbited
-systemctl restart frostbited
+systemctl enable grepfocusd
+systemctl restart grepfocusd
 
 echo "==> Installing launcher, icon, and autostart entry for $INVOKING_USER"
 USER_HOME="$(getent passwd "$INVOKING_USER" | cut -d: -f6)"
@@ -86,9 +86,9 @@ ICON_DIR="$USER_HOME/.local/share/icons/hicolor/64x64/apps"
 AUTOSTART_DIR="$USER_HOME/.config/autostart"
 # `sudo -u ... install` so the files are owned by the user, not root.
 sudo -u "$INVOKING_USER" install -d "$APP_DIR" "$ICON_DIR" "$AUTOSTART_DIR"
-sudo -u "$INVOKING_USER" install -m 0644 packaging/frostbite.desktop "$APP_DIR/frostbite.desktop"
-sudo -u "$INVOKING_USER" install -m 0644 crates/gui/icons/icon.png "$ICON_DIR/frostbite.png"
-sudo -u "$INVOKING_USER" install -m 0644 packaging/frostbite.desktop "$AUTOSTART_DIR/frostbite.desktop"
+sudo -u "$INVOKING_USER" install -m 0644 packaging/grepfocus.desktop "$APP_DIR/grepfocus.desktop"
+sudo -u "$INVOKING_USER" install -m 0644 crates/gui/icons/icon.png "$ICON_DIR/grepfocus.png"
+sudo -u "$INVOKING_USER" install -m 0644 packaging/grepfocus.desktop "$AUTOSTART_DIR/grepfocus.desktop"
 
 # Best-effort cache refresh so the launcher icon/entry show up promptly.
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
@@ -104,11 +104,11 @@ cat <<EOF
 ==> Install complete.
 
 Next steps:
-  1. Log out and back in (or run 'newgrp frostbite') so your group membership
-     takes effect — needed to talk to /run/frostbite/sock.
-  2. Check the daemon is running:   systemctl status frostbited
-  3. Tail the logs:                  journalctl -u frostbited -f
-  4. Launch 'Frostbite' from your app grid, or run: /usr/local/bin/frostbite-gui
+  1. Log out and back in (or run 'newgrp grepfocus') so your group membership
+     takes effect — needed to talk to /run/grepfocus/sock.
+  2. Check the daemon is running:   systemctl status grepfocusd
+  3. Tail the logs:                  journalctl -u grepfocusd -f
+  4. Launch 'GrepFocus' from your app grid, or run: /usr/local/bin/grepfocus-gui
 
 To uninstall:
   sudo ./packaging/uninstall.sh [--purge]

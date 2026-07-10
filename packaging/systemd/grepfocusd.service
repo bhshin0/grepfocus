@@ -1,6 +1,6 @@
 [Unit]
-Description=Frostbite blocker daemon
-Documentation=https://github.com/scada/frostbite
+Description=GrepFocus blocker daemon
+Documentation=https://github.com/bhshin0/grepfocus
 After=network-pre.target
 DefaultDependencies=no
 # Stronger restart resilience: keep restarting even if it crashes a lot.
@@ -8,11 +8,11 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/frostbited
+ExecStart=/usr/local/bin/grepfocusd
 Restart=always
 RestartSec=1
 
-# The daemon must edit /etc/hosts and /var/lib/frostbite, so we cannot use
+# The daemon must edit /etc/hosts and /var/lib/grepfocus, so we cannot use
 # ProtectSystem=strict. We still apply the hardening that's compatible with
 # our needs.
 NoNewPrivileges=no
@@ -26,7 +26,7 @@ LockPersonality=yes
 RestrictRealtime=yes
 SystemCallArchitectures=native
 
-# Logs go to journal. Use `journalctl -u frostbited` to read them.
+# Logs go to journal. Use `journalctl -u grepfocusd` to read them.
 StandardOutput=journal
 StandardError=journal
 Environment=RUST_LOG=info

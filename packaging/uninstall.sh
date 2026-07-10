@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Frostbite uninstaller.
+# GrepFocus uninstaller.
 #
-# Tears down enforcement FIRST (via `frostbited cleanup`, or an inline
+# Tears down enforcement FIRST (via `grepfocusd cleanup`, or an inline
 # fallback if the binary is already gone), then removes:
-#   /usr/local/bin/frostbited and /usr/local/bin/frostbite-gui
-#   /etc/systemd/system/frostbited.service
+#   /usr/local/bin/grepfocusd and /usr/local/bin/grepfocus-gui
+#   /etc/systemd/system/grepfocusd.service
 #   the invoking user's launcher, icon, and autostart files
-#   /run/frostbite
+#   /run/grepfocus
 # Every step tolerates absence, so running this twice is safe. Run as root.
 #
 # Usage: sudo ./packaging/uninstall.sh [--purge]
-#   --purge   also delete /var/lib/frostbite (saved blocks, password),
-#             /etc/frostbite (secret), and the frostbite group
+#   --purge   also delete /var/lib/grepfocus (saved blocks, password),
+#             /etc/grepfocus (secret), and the grepfocus group
 
 set -euo pipefail
 
@@ -55,44 +55,44 @@ fi
 
 # Minimal teardown of the artifacts that block traffic on their own. Used
 # when the binary is missing (broken/partial install) or when delegation to
-# `frostbited cleanup` fails or times out.
+# `grepfocusd cleanup` fails or times out.
 inline_teardown() {
     chattr -i /etc/hosts 2>/dev/null || true
     if [[ -f /etc/hosts ]]; then
-        sed -i '/# frostbite-begin/,/# frostbite-end/d' /etc/hosts \
+        sed -i '/# grepfocus-begin/,/# grepfocus-end/d' /etc/hosts \
             || { echo "failed to strip the managed region from /etc/hosts" >&2; exit 1; }
-    elif [[ -f /var/lib/frostbite/hosts.orig ]]; then
+    elif [[ -f /var/lib/grepfocus/hosts.orig ]]; then
         # /etc/hosts is gone entirely — restore the snapshot before a purge
         # deletes the only copy. install, not cp: the mode matters, because
         # the resolver in non-root processes needs 0644.
-        install -m 0644 /var/lib/frostbite/hosts.orig /etc/hosts
+        install -m 0644 /var/lib/grepfocus/hosts.orig /etc/hosts
     fi
-    rm -f /etc/hosts.frostbite.tmp /var/lib/frostbite/hosts.orig.frostbite.tmp
-    nft delete table inet frostbite_doh 2>/dev/null || true
+    rm -f /etc/hosts.grepfocus.tmp /var/lib/grepfocus/hosts.orig.grepfocus.tmp
+    nft delete table inet grepfocus_doh 2>/dev/null || true
     if [[ $PURGE -eq 1 ]]; then
-        rm -rf /var/lib/frostbite /etc/frostbite
+        rm -rf /var/lib/grepfocus /etc/grepfocus
     else
         cat <<'EOF'
 Note: the state file is HMAC-signed, so this fallback cannot clear persisted
 active blocks. If you reinstall later, any block that was active will
-re-apply until it expires. Re-run with --purge (or run `frostbited cleanup`
+re-apply until it expires. Re-run with --purge (or run `grepfocusd cleanup`
 from the reinstall) to avoid that.
 EOF
     fi
 }
 
-echo "==> Stopping and disabling frostbited"
-systemctl disable --now frostbited 2>/dev/null || true
+echo "==> Stopping and disabling grepfocusd"
+systemctl disable --now grepfocusd 2>/dev/null || true
 
 echo "==> Stopping the GUI (if running)"
-pkill -x frostbite-gui || true
+pkill -x grepfocus-gui || true
 
 # Tear down enforcement while the binary still exists — the daemon's own
 # cleanup path handles the immutable bit, hosts strip/restore, atomic-write
 # orphans, the nftables table, and persisted active blocks. Removing the
 # binary first would strand a chattr +i /etc/hosts: that is the brick.
-if [[ -x /usr/local/bin/frostbited ]]; then
-    echo "==> Tearing down enforcement (frostbited cleanup)"
+if [[ -x /usr/local/bin/grepfocusd ]]; then
+    echo "==> Tearing down enforcement (grepfocusd cleanup)"
     CLEANUP_ARGS=()
     if [[ $PURGE -eq 1 ]]; then
         CLEANUP_ARGS+=(--purge)
@@ -100,34 +100,34 @@ if [[ -x /usr/local/bin/frostbited ]]; then
     # Bound the delegation: a binary built before the cleanup subcommand
     # existed ignores argv and boots the full daemon, serving forever. 30s
     # caps that, and the fallback strips whatever it re-applied.
-    if ! timeout --kill-after=5 30 /usr/local/bin/frostbited cleanup "${CLEANUP_ARGS[@]}"; then
-        echo "frostbited cleanup failed or timed out (pre-cleanup binary?) — falling back to inline teardown" >&2
+    if ! timeout --kill-after=5 30 /usr/local/bin/grepfocusd cleanup "${CLEANUP_ARGS[@]}"; then
+        echo "grepfocusd cleanup failed or timed out (pre-cleanup binary?) — falling back to inline teardown" >&2
         inline_teardown
     fi
 else
     # Broken/partial install: no binary to delegate to.
-    echo "==> frostbited binary missing — inline enforcement teardown"
+    echo "==> grepfocusd binary missing — inline enforcement teardown"
     inline_teardown
 fi
 
 echo "==> Removing binaries"
-rm -f /usr/local/bin/frostbited /usr/local/bin/frostbite-gui
+rm -f /usr/local/bin/grepfocusd /usr/local/bin/grepfocus-gui
 
 echo "==> Removing systemd unit"
 # Remove the enablement symlink explicitly too: in a chroot (recovery
 # environment) the earlier `systemctl disable` is swallowed, and a bare
 # daemon-reload would die there under set -e, skipping every later step.
-rm -f /etc/systemd/system/frostbited.service \
-    /etc/systemd/system/multi-user.target.wants/frostbited.service
+rm -f /etc/systemd/system/grepfocusd.service \
+    /etc/systemd/system/multi-user.target.wants/grepfocusd.service
 systemctl daemon-reload 2>/dev/null || true
 
 echo "==> Removing launcher, icon, and autostart entry"
 INVOKING_USER="${SUDO_USER:-$USER}"
 USER_HOME="$(getent passwd "$INVOKING_USER" | cut -d: -f6 || true)"
 if [[ -n "$USER_HOME" ]]; then
-    rm -f "$USER_HOME/.local/share/applications/frostbite.desktop" \
-        "$USER_HOME/.config/autostart/frostbite.desktop" \
-        "$USER_HOME/.local/share/icons/hicolor/64x64/apps/frostbite.png"
+    rm -f "$USER_HOME/.local/share/applications/grepfocus.desktop" \
+        "$USER_HOME/.config/autostart/grepfocus.desktop" \
+        "$USER_HOME/.local/share/icons/hicolor/64x64/apps/grepfocus.png"
     # Best-effort cache refresh so the stale entry disappears promptly.
     if command -v gtk-update-icon-cache >/dev/null 2>&1; then
         sudo -u "$INVOKING_USER" gtk-update-icon-cache -f -t \
@@ -141,11 +141,11 @@ fi
 echo "    (launcher files under other users' homes, if any, need manual removal)"
 
 echo "==> Removing runtime directory"
-rm -rf /run/frostbite
+rm -rf /run/grepfocus
 
 if [[ $PURGE -eq 1 ]]; then
-    echo "==> Removing frostbite group"
-    groupdel frostbite 2>/dev/null || true
+    echo "==> Removing grepfocus group"
+    groupdel grepfocus 2>/dev/null || true
 fi
 
 cat <<EOF
@@ -153,13 +153,13 @@ cat <<EOF
 ==> Uninstall complete.
 
 Removed: enforcement (/etc/hosts region, nftables table), binaries,
-systemd unit, launcher files for $INVOKING_USER, /run/frostbite.
+systemd unit, launcher files for $INVOKING_USER, /run/grepfocus.
 EOF
 if [[ $PURGE -eq 1 ]]; then
-    echo "Purged: /var/lib/frostbite, /etc/frostbite, and the frostbite group."
+    echo "Purged: /var/lib/grepfocus, /etc/grepfocus, and the grepfocus group."
 else
     cat <<EOF
-Kept: /var/lib/frostbite (saved blocks, password) and /etc/frostbite
+Kept: /var/lib/grepfocus (saved blocks, password) and /etc/grepfocus
 (secret) — a reinstall picks them up. Re-run with --purge to delete them.
 EOF
 fi

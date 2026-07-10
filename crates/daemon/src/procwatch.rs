@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use frostbite_core::{now_unix, AppMatcher};
+use grepfocus_core::{now_unix, AppMatcher};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use procfs::process::all_processes;

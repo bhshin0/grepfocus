@@ -129,13 +129,18 @@ pub(crate) fn strip_managed(s: &str) -> String {
     out
 }
 
+/// Suffix of the scratch file `write_atomic` creates next to its target.
+/// `cleanup` uses it to find and remove orphans left by an interrupted
+/// write; the on-disk convention is pinned by a test there.
+pub(crate) const TMP_SUFFIX: &str = ".grepfocus.tmp";
+
 /// Write `content` to `path` durably: write a sibling tmp file, fsync it, then
 /// rename over the target. Mirrors `state::save_in`. `mode` is the final file
 /// mode (0644 for /etc/hosts so the resolver can read it, 0600 for the
 /// root-only recovery copy).
 pub(crate) fn write_atomic(path: &str, content: &str, mode: u32) -> anyhow::Result<()> {
     use std::io::Write;
-    let tmp = format!("{}.frostbite.tmp", path);
+    let tmp = format!("{}{}", path, TMP_SUFFIX);
     {
         let mut f = fs::OpenOptions::new()
             .write(true)

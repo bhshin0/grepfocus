@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Frostbite pre-flight checks — run before committing.
+# GrepFocus pre-flight checks — run before committing.
 #
 # Runs, in order: formatting check, clippy (warnings are errors), the full test
 # suite, and the UI type-check/build. Any failure stops the run (set -e).
@@ -9,7 +9,7 @@
 #   - pnpm (for the UI build)
 #   - the GUI crate compiles only where webkit2gtk-4.1 + gtk-3 dev libs are
 #     present; on a headless box, scope the Rust steps to
-#     `-p frostbite-core -p frostbited` by hand.
+#     `-p grepfocus-core -p grepfocusd` by hand.
 #
 # Optional: use as a pre-commit hook (not installed automatically):
 #   ln -s ../../scripts/check.sh .git/hooks/pre-commit

@@ -1,7 +1,7 @@
-//! Persistent state: HMAC-signed JSON in /var/lib/frostbite/state.json.
+//! Persistent state: HMAC-signed JSON in /var/lib/grepfocus/state.json.
 //!
 //! The HMAC defends against hand-edits while the daemon is stopped. The key
-//! lives in /etc/frostbite/secret (mode 0600). If the state file is missing
+//! lives in /etc/grepfocus/secret (mode 0600). If the state file is missing
 //! or fails verification, the daemon starts fresh and clears any leftover
 //! hosts-file block.
 
@@ -11,7 +11,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{anyhow, Context};
-use frostbite_core::{hmac_sig, State};
+use grepfocus_core::{hmac_sig, State};
 use rand::RngCore;
 
 use crate::paths;
@@ -133,7 +133,7 @@ pub fn save_in(dir: &Path, state: &State, key: &[u8]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frostbite_core::Block;
+    use grepfocus_core::Block;
 
     fn sample_state() -> State {
         State {

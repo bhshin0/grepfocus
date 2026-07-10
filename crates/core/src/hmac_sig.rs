@@ -1,7 +1,7 @@
 //! HMAC-SHA256 over arbitrary bytes, with constant-time verify.
 //!
 //! Used to detect hand-edits to the persisted state file. The key lives in
-//! /etc/frostbite/secret (mode 0600, root) and is generated once at install.
+//! /etc/grepfocus/secret (mode 0600, root) and is generated once at install.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;

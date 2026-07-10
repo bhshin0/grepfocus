@@ -20,7 +20,7 @@
 //! - A determined user can configure their browser to use a different
 //!   DoH endpoint. Same friction-vs-adversary line we already drew.
 //!
-//! The table is named `frostbite_doh` and is independent of firewalld /
+//! The table is named `grepfocus_doh` and is independent of firewalld /
 //! any existing user firewall rules. Drop rules in any table take effect
 //! regardless of accept rules elsewhere.
 //!
@@ -35,7 +35,7 @@ use anyhow::{anyhow, Context};
 use tracing::{debug, warn};
 
 const NFT: &str = "/usr/sbin/nft";
-const TABLE: &str = "frostbite_doh";
+const TABLE: &str = "grepfocus_doh";
 /// coreutils `timeout` — same "coreutils is always installed" assumption we
 /// already make for `chattr` in hosts.rs.
 const TIMEOUT_BIN: &str = "/usr/bin/timeout";

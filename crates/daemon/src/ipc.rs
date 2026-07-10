@@ -1,13 +1,13 @@
 //! Unix-socket JSON-RPC server for the GUI/CLI.
 //!
-//! Socket lives at /run/frostbite/sock with mode 0660 and group `frostbite`.
+//! Socket lives at /run/grepfocus/sock with mode 0660 and group `grepfocus`.
 //! Membership in that group is what authorizes a user to manage blocks.
 
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use anyhow::Context;
-use frostbite_core::{
+use grepfocus_core::{
     now_unix, ActiveBlock, AllowanceLedger, Originator, Request, Response, Schedule, State,
 };
 use nix::unistd::Group;
@@ -18,6 +18,9 @@ use crate::{auth, enforce, paths, scheduler, state, Daemon};
 
 /// How long an `Unlock` keeps configuration changes permitted.
 const UNLOCK_SECS: u64 = 300;
+
+/// Group whose members are authorized to talk to the socket.
+pub(crate) const GROUP: &str = "grepfocus";
 
 pub async fn serve(daemon: Arc<Daemon>) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(paths::SOCK);
@@ -45,10 +48,10 @@ pub async fn serve(daemon: Arc<Daemon>) -> anyhow::Result<()> {
 
 fn apply_socket_perms(path: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::chown;
-    let gid = match Group::from_name("frostbite")? {
+    let gid = match Group::from_name(GROUP)? {
         Some(g) => Some(g.gid.as_raw()),
         None => {
-            warn!("group `frostbite` not found — socket will be root-only");
+            warn!("group `{GROUP}` not found — socket will be root-only");
             None
         }
     };
@@ -59,20 +62,20 @@ fn apply_socket_perms(path: &str) -> anyhow::Result<()> {
 
 async fn handle(mut stream: UnixStream, daemon: Arc<Daemon>) -> anyhow::Result<()> {
     loop {
-        let req: Request = match frostbite_core::wire::read_json(&mut stream).await {
+        let req: Request = match grepfocus_core::wire::read_json(&mut stream).await {
             Ok(r) => r,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e.into()),
         };
         let resp = dispatch(req, &daemon).await;
-        if let Err(e) = frostbite_core::wire::write_json(&mut stream, &resp).await {
+        if let Err(e) = grepfocus_core::wire::write_json(&mut stream, &resp).await {
             if e.kind() == std::io::ErrorKind::InvalidData {
                 // The response was too large (or unserializable) to frame.
                 // write_json serializes and size-checks before writing any
                 // bytes, so the stream is still intact — report a small error
                 // and keep the connection open instead of dropping it.
                 warn!(?e, "response could not be framed; sending error instead");
-                frostbite_core::wire::write_json(&mut stream, &err("response too large")).await?;
+                grepfocus_core::wire::write_json(&mut stream, &err("response too large")).await?;
             } else {
                 return Err(e.into());
             }
@@ -477,7 +480,7 @@ fn validate_schedule(s: &Schedule) -> Option<String> {
     if s.days == 0 {
         return Some("at least one weekday must be selected".into());
     }
-    if s.days & !frostbite_core::DAYS_ALL != 0 {
+    if s.days & !grepfocus_core::DAYS_ALL != 0 {
         return Some("days bitmask has unknown bits set".into());
     }
     if s.start_minute >= 1440 {

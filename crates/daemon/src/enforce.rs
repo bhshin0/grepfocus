@@ -9,7 +9,7 @@
 //!
 //! Enforcement can also drift underneath us without the domain union ever
 //! changing: a firewalld/ufw reload flushes the ruleset (wiping the
-//! `frostbite_doh` table), and with chattr degraded `/etc/hosts` can be
+//! `grepfocus_doh` table), and with chattr degraded `/etc/hosts` can be
 //! rewritten externally. So a memo hit isn't blindly trusted — while a domain
 //! block is active, `sync` re-probes the live system at most once per
 //! `REVERIFY_SECS`, verifying the two halves independently: hosts drift
@@ -19,7 +19,7 @@
 
 use std::collections::BTreeSet;
 
-use frostbite_core::{now_unix, ActiveBlock};
+use grepfocus_core::{now_unix, ActiveBlock};
 use tracing::{debug, info, warn};
 
 use crate::{hosts, nftables, Daemon};

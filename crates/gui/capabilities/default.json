@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default permissions for the Frostbite app window",
+  "description": "Default permissions for the GrepFocus app window",
   "windows": ["main"],
   "remote": {
     "urls": ["http://localhost:*"]

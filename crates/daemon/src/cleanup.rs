@@ -1,4 +1,4 @@
-//! `frostbited cleanup` — offline teardown of every enforcement artifact.
+//! `grepfocusd cleanup` — offline teardown of every enforcement artifact.
 //!
 //! Recovery path for a wedged or half-uninstalled system: clears the
 //! immutable bit, strips the managed `/etc/hosts` region (restoring from the
@@ -20,10 +20,10 @@ use tracing::debug;
 
 use crate::{hosts, nftables, paths, state};
 
-/// Options for `frostbited cleanup`, parsed in `main`.
+/// Options for `grepfocusd cleanup`, parsed in `main`.
 pub struct Opts {
-    /// Also delete the state dir (/var/lib/frostbite) and config dir
-    /// (/etc/frostbite) once everything else is torn down.
+    /// Also delete the state dir (/var/lib/grepfocus) and config dir
+    /// (/etc/grepfocus) once everything else is torn down.
     pub purge: bool,
     /// Skip the running-daemon socket check.
     pub force: bool,
@@ -57,7 +57,7 @@ pub(crate) enum HostsOutcome {
 /// hosts strip step failed (everything else is best-effort).
 pub fn run(opts: Opts) -> anyhow::Result<()> {
     if !nix::unistd::Uid::effective().is_root() {
-        anyhow::bail!("frostbited cleanup must run as root");
+        anyhow::bail!("grepfocusd cleanup must run as root");
     }
 
     // Refuse to fight a live daemon: its 1s reconcile tick would re-apply
@@ -72,21 +72,21 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
     // means not running; any other connect error is inconclusive, so bail.
     if !opts.force {
         let unit_active = Command::new("systemctl")
-            .args(["is-active", "--quiet", "frostbited"])
+            .args(["is-active", "--quiet", "grepfocusd"])
             .status()
             .is_ok_and(|s| s.success());
         if unit_active {
             anyhow::bail!(
-                "frostbited unit is active — stop it first \
-                 (sudo systemctl stop frostbited) or pass --force"
+                "grepfocusd unit is active — stop it first \
+                 (sudo systemctl stop grepfocusd) or pass --force"
             );
         }
         // Spawn error or nonzero exit: not running, or no systemd (chroot) —
         // fall through to the socket probe.
         match UnixStream::connect(paths::SOCK) {
             Ok(_) => anyhow::bail!(
-                "frostbited appears to be running — stop it first \
-                 (sudo systemctl stop frostbited) or pass --force"
+                "grepfocusd appears to be running — stop it first \
+                 (sudo systemctl stop grepfocusd) or pass --force"
             ),
             Err(e)
                 if matches!(
@@ -97,7 +97,7 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
                 debug!(?e, "daemon socket not accepting — proceeding");
             }
             Err(e) => anyhow::bail!(
-                "cannot tell whether frostbited is running (connecting to {}: {}) — \
+                "cannot tell whether grepfocusd is running (connecting to {}: {}) — \
                  stop it first or pass --force",
                 paths::SOCK,
                 e
@@ -210,7 +210,7 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
         ));
     }
 
-    println!("frostbite cleanup summary:");
+    println!("grepfocus cleanup summary:");
     for (name, outcome) in &steps {
         match outcome {
             Outcome::Done(d) => println!("  {name:<20} done    — {d}"),
@@ -311,11 +311,8 @@ pub(crate) fn clear_active_blocks(state_dir: &Path, secret_path: &Path) -> Outco
 }
 
 /// Path of the scratch file `hosts::write_atomic` uses when writing `path`.
-/// Keep in lock-step with that function's `"{path}.frostbite.tmp"` naming —
-/// if the convention changes there, it must change here too or cleanup will
-/// miss the orphans.
 fn write_atomic_tmp_path(path: &str) -> String {
-    format!("{}.frostbite.tmp", path)
+    format!("{}{}", path, hosts::TMP_SUFFIX)
 }
 
 /// Remove the stale atomic-write orphan for `path`, if present. Returns
@@ -333,7 +330,7 @@ pub(crate) fn remove_stale_tmp(path: &str) -> io::Result<bool> {
 mod tests {
     use super::*;
     use crate::paths::{HOSTS_BEGIN, HOSTS_END};
-    use frostbite_core::{ActiveBlock, Block, Originator, State};
+    use grepfocus_core::{ActiveBlock, Block, Originator, State};
     use std::os::unix::fs::PermissionsExt;
 
     fn hosts_with_region() -> String {
@@ -413,7 +410,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("hosts");
         let target_str = target.to_str().unwrap();
-        let tmp = dir.path().join("hosts.frostbite.tmp");
+        let tmp = dir.path().join("hosts.grepfocus.tmp");
         let bystander = dir.path().join("hosts.orig");
         fs::write(&target, "keep\n").unwrap();
         fs::write(&tmp, "orphan\n").unwrap();

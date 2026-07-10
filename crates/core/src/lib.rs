@@ -1,4 +1,4 @@
-//! Shared types and helpers for the frostbite daemon and clients.
+//! Shared types and helpers for the grepfocus daemon and clients.
 //!
 //! The wire protocol is length-prefixed JSON: a 4-byte big-endian u32 holding
 //! the byte length of the payload, followed by the JSON payload itself.

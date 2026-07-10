@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Frostbite
+Name=GrepFocus
 Comment=Website and app blocker
-Exec=/usr/local/bin/frostbite-gui
-Icon=frostbite
+Exec=/usr/local/bin/grepfocus-gui
+Icon=grepfocus
 Categories=Utility;
 Terminal=false
 StartupNotify=false

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
-use frostbite_core::{day_set, now_unix, ActiveBlock, Originator, Schedule, State};
+use grepfocus_core::{day_set, now_unix, ActiveBlock, Originator, Schedule, State};
 use tracing::{error, info, warn};
 
 use crate::{enforce, state, Daemon};
@@ -194,7 +194,7 @@ fn compute_window_end_unix(s: &Schedule, now: &DateTime<Local>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frostbite_core::{AllowanceLedger, Block, DAY_MON};
+    use grepfocus_core::{AllowanceLedger, Block, DAY_MON};
 
     fn s(start: u16, dur: u16, days: u8) -> Schedule {
         Schedule {

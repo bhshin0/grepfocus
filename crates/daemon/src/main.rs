@@ -1,10 +1,10 @@
-//! frostbited — privileged blocking daemon.
+//! grepfocusd — privileged blocking daemon.
 //!
 //! Runs as root via systemd. Owns the persisted block state, edits
 //! /etc/hosts (with chattr +i during active blocks), and SIGKILLs blocked
-//! processes. Talks to the GUI over a Unix socket at /run/frostbite/sock.
+//! processes. Talks to the GUI over a Unix socket at /run/grepfocus/sock.
 //!
-//! Also ships the offline recovery path: `frostbited cleanup` tears down all
+//! Also ships the offline recovery path: `grepfocusd cleanup` tears down all
 //! enforcement without needing a working daemon (see `cleanup`).
 
 use std::sync::Arc;
@@ -24,13 +24,13 @@ mod procwatch;
 mod scheduler;
 mod state;
 
-use frostbite_core::{now_unix, State};
+use grepfocus_core::{now_unix, State};
 
 /// Runtime context shared across all daemon tasks.
 pub struct Daemon {
     /// Persisted state — blocks, active blocks, schedules.
     pub state: Mutex<State>,
-    /// HMAC key loaded from /etc/frostbite/secret at startup.
+    /// HMAC key loaded from /etc/grepfocus/secret at startup.
     pub key: Vec<u8>,
     /// Unix time until which configuration changes are unlocked. In-memory
     /// only: a daemon restart relocks the settings. `0` means locked.
@@ -76,21 +76,21 @@ fn main() -> anyhow::Result<()> {
 fn usage(err: &str) -> ! {
     eprintln!("error: {}", err);
     eprintln!(
-        "usage: frostbited                        run the daemon (root; normally via systemd)"
+        "usage: grepfocusd                        run the daemon (root; normally via systemd)"
     );
-    eprintln!("       frostbited cleanup [--force] [--purge]");
+    eprintln!("       grepfocusd cleanup [--force] [--purge]");
     eprintln!(
         "                                          tear down all enforcement (daemon stopped)"
     );
     eprintln!("         --force  skip the running-daemon check");
-    eprintln!("         --purge  also delete /var/lib/frostbite and /etc/frostbite");
+    eprintln!("         --purge  also delete /var/lib/grepfocus and /etc/grepfocus");
     std::process::exit(2);
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn run_daemon() -> anyhow::Result<()> {
     if !nix::unistd::Uid::effective().is_root() {
-        anyhow::bail!("frostbited must run as root");
+        anyhow::bail!("grepfocusd must run as root");
     }
 
     paths::ensure_dirs().context("creating runtime/state directories")?;

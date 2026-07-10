@@ -7,15 +7,15 @@ use std::path::Path;
 pub const HOSTS: &str = "/etc/hosts";
 /// Recovery copy of the unmanaged `/etc/hosts` content, written before every
 /// managed-region edit so the real hosts file can be restored by hand.
-pub const HOSTS_ORIG: &str = "/var/lib/frostbite/hosts.orig";
-pub const STATE_DIR: &str = "/var/lib/frostbite";
-pub const SECRET_DIR: &str = "/etc/frostbite";
-pub const SECRET_FILE: &str = "/etc/frostbite/secret";
-pub const RUN_DIR: &str = "/run/frostbite";
-pub const SOCK: &str = "/run/frostbite/sock";
+pub const HOSTS_ORIG: &str = "/var/lib/grepfocus/hosts.orig";
+pub const STATE_DIR: &str = "/var/lib/grepfocus";
+pub const SECRET_DIR: &str = "/etc/grepfocus";
+pub const SECRET_FILE: &str = "/etc/grepfocus/secret";
+pub const RUN_DIR: &str = "/run/grepfocus";
+pub const SOCK: &str = "/run/grepfocus/sock";
 
-pub const HOSTS_BEGIN: &str = "# frostbite-begin (managed — do not edit)";
-pub const HOSTS_END: &str = "# frostbite-end";
+pub const HOSTS_BEGIN: &str = "# grepfocus-begin (managed — do not edit)";
+pub const HOSTS_END: &str = "# grepfocus-end";
 
 /// Create directories the daemon writes to. Idempotent.
 /// The install script sets ownership/group; here we just ensure they exist

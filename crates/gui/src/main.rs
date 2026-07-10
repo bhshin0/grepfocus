@@ -7,7 +7,7 @@ mod tray;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use frostbite_core::{ActiveBlock, AllowanceLedger, Block, Request, Response, Schedule};
+use grepfocus_core::{ActiveBlock, AllowanceLedger, Block, Request, Response, Schedule};
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
@@ -184,8 +184,8 @@ fn spawn_status_watcher(app: AppHandle) {
                     // instead of leaving the stale "N active" text, but do NOT
                     // touch `prev`: keeping the notification baseline avoids a
                     // spurious burst of "block started/ended" when it recovers.
-                    if let Some(tray) = app.tray_by_id("frostbite-tray") {
-                        let _ = tray.set_tooltip(Some("Frostbite — daemon unreachable"));
+                    if let Some(tray) = app.tray_by_id("grepfocus-tray") {
+                        let _ = tray.set_tooltip(Some("GrepFocus — daemon unreachable"));
                     }
                     continue;
                 }
@@ -195,11 +195,11 @@ fn spawn_status_watcher(app: AppHandle) {
                 .map(|a| (a.block.id, a.block.name.clone()))
                 .collect();
 
-            if let Some(tray) = app.tray_by_id("frostbite-tray") {
+            if let Some(tray) = app.tray_by_id("grepfocus-tray") {
                 let tip = if cur.is_empty() {
-                    "Frostbite — no active blocks".to_string()
+                    "GrepFocus — no active blocks".to_string()
                 } else {
-                    format!("Frostbite — {} active", cur.len())
+                    format!("GrepFocus — {} active", cur.len())
                 };
                 let _ = tray.set_tooltip(Some(&tip));
             }
@@ -264,20 +264,20 @@ fn main() {
                 .parse()
                 .unwrap();
             let _win = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
-                .title("Frostbite")
+                .title("GrepFocus")
                 .inner_size(900.0, 640.0)
                 .min_inner_size(600.0, 480.0)
                 .build()?;
 
             let menu = MenuBuilder::new(app)
-                .text("show", "Show Frostbite")
+                .text("show", "Show GrepFocus")
                 .separator()
                 .text("quit", "Quit")
                 .build()?;
 
-            TrayIconBuilder::with_id("frostbite-tray")
+            TrayIconBuilder::with_id("grepfocus-tray")
                 .icon(app.default_window_icon().expect("bundled icon").clone())
-                .tooltip("Frostbite — no active blocks")
+                .tooltip("GrepFocus — no active blocks")
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => {

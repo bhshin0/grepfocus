@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Frostbite dev upgrade loop — the one command to run after every change.
+# GrepFocus dev upgrade loop — the one command to run after every change.
 #
 # Rebuilds the UI, daemon, and GUI, then redeploys:
-#   /usr/local/bin/frostbited          (+ restart the frostbited service)
-#   /usr/local/bin/frostbite-gui
-#   ~/.local/share/applications/frostbite.desktop   (app-grid launcher)
-#   ~/.local/share/icons/hicolor/64x64/apps/frostbite.png
-#   ~/.config/autostart/frostbite.desktop           (start GUI + tray at login)
+#   /usr/local/bin/grepfocusd          (+ restart the grepfocusd service)
+#   /usr/local/bin/grepfocus-gui
+#   ~/.local/share/applications/grepfocus.desktop   (app-grid launcher)
+#   ~/.local/share/icons/hicolor/64x64/apps/grepfocus.png
+#   ~/.config/autostart/grepfocus.desktop           (start GUI + tray at login)
 #
 # Run as your normal user (NOT root). It uses sudo only for the system steps;
 # your sudo may prompt for a fingerprint/password there.
@@ -34,20 +34,20 @@ echo "==> Building release binaries"
 cargo build --release
 
 echo "==> Installing daemon and restarting service (sudo)"
-sudo install -m0755 target/release/frostbited /usr/local/bin/frostbited
-sudo systemctl restart frostbited
+sudo install -m0755 target/release/grepfocusd /usr/local/bin/grepfocusd
+sudo systemctl restart grepfocusd
 
 echo "==> Installing GUI binary (sudo)"
-sudo install -m0755 target/release/frostbite-gui /usr/local/bin/frostbite-gui
+sudo install -m0755 target/release/grepfocus-gui /usr/local/bin/grepfocus-gui
 
 echo "==> Installing launcher, icon, and autostart entry (no sudo needed)"
 APP_DIR="$HOME/.local/share/applications"
 ICON_DIR="$HOME/.local/share/icons/hicolor/64x64/apps"
 AUTOSTART_DIR="$HOME/.config/autostart"
 install -d "$APP_DIR" "$ICON_DIR" "$AUTOSTART_DIR"
-install -m0644 packaging/frostbite.desktop "$APP_DIR/frostbite.desktop"
-install -m0644 crates/gui/icons/icon.png "$ICON_DIR/frostbite.png"
-install -m0644 packaging/frostbite.desktop "$AUTOSTART_DIR/frostbite.desktop"
+install -m0644 packaging/grepfocus.desktop "$APP_DIR/grepfocus.desktop"
+install -m0644 crates/gui/icons/icon.png "$ICON_DIR/grepfocus.png"
+install -m0644 packaging/grepfocus.desktop "$AUTOSTART_DIR/grepfocus.desktop"
 
 # Best-effort cache refresh so the launcher icon/entry show up promptly.
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
@@ -59,5 +59,5 @@ fi
 
 echo
 echo "==> Upgrade complete."
-echo "    Daemon:  $(systemctl is-active frostbited 2>/dev/null || echo unknown)"
-echo "    Launch 'Frostbite' from your app grid, or run: /usr/local/bin/frostbite-gui"
+echo "    Daemon:  $(systemctl is-active grepfocusd 2>/dev/null || echo unknown)"
+echo "    Launch 'GrepFocus' from your app grid, or run: /usr/local/bin/grepfocus-gui"
