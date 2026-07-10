@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod client;
+mod tray;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -149,8 +150,9 @@ fn notify(app: &AppHandle, title: &str, body: &str) {
 
 /// Background task: poll the daemon every 5s, keep the tray tooltip in sync,
 /// and fire a notification whenever a block starts or ends. Runs for the life
-/// of the process (the window hides to tray rather than closing), so
-/// notifications keep flowing even with no window open.
+/// of the process (when a tray host is present, the window hides to tray
+/// rather than closing), so notifications keep flowing even with no window
+/// open. Also re-shows a hidden window if its tray host vanishes.
 fn spawn_status_watcher(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         // id -> block name. `None` until the first successful poll so we
@@ -159,6 +161,22 @@ fn spawn_status_watcher(app: AppHandle) {
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         loop {
             ticker.tick().await;
+
+            // Hidden-window rescue: a hidden window never gets a close event,
+            // so a tray that vanishes underneath it (extension disabled
+            // mid-session) would strand the app without this.
+            if let Some(window) = app.get_webview_window("main") {
+                if matches!(window.is_visible(), Ok(false)) {
+                    let present =
+                        tauri::async_runtime::spawn_blocking(tray::status_notifier_host_present)
+                            .await
+                            .unwrap_or(false);
+                    if !present {
+                        let _ = window.show();
+                    }
+                }
+            }
+
             let active = match client::call(Request::GetStatus {}).await {
                 Ok(Response::Status { active, .. }) => active,
                 _ => {
@@ -223,11 +241,24 @@ fn main() {
         .plugin(tauri_plugin_localhost::Builder::new(port).build())
         .plugin(tauri_plugin_notification::init())
         .on_window_event(|window, event| {
-            // Closing the window hides it to the tray instead of quitting, so
-            // the status watcher (and thus notifications) keeps running.
             if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+                // Hide to tray only when a tray can actually bring us back.
+                // NB: if the frontend ever adds a JS tauri://close-requested
+                // listener, tauri auto-prevents close and this branch stops
+                // mattering — don't.
+                if tray::status_notifier_host_present() {
+                    api.prevent_close();
+                    let _ = window.hide();
+                } else {
+                    // Quit path: surface the tradeoff at the moment it bites —
+                    // notifications work on stock GNOME even though the tray
+                    // doesn't.
+                    notify(
+                        window.app_handle(),
+                        "Frostbite closed",
+                        "No block start/end notifications until you reopen it.",
+                    );
+                }
             }
         })
         .setup(move |app| {
