@@ -249,16 +249,14 @@ fn main() {
                 if tray::status_notifier_host_present() {
                     api.prevent_close();
                     let _ = window.hide();
-                } else {
-                    // Quit path: surface the tradeoff at the moment it bites —
-                    // notifications work on stock GNOME even though the tray
-                    // doesn't.
-                    notify(
-                        window.app_handle(),
-                        "Frostbite closed",
-                        "No block start/end notifications until you reopen it.",
-                    );
                 }
+                // else: allow the close; the app exits with its last window.
+                // No goodbye notification — it was tried and removed: the
+                // plugin delivers on a spawned task that process exit races
+                // and loses, a blocking send can stall the main thread for
+                // the D-Bus method timeout (the window freezes mid-close),
+                // and GNOME suppresses the banner anyway (focused-app
+                // heuristic, source teardown on exit).
             }
         })
         .setup(move |app| {
