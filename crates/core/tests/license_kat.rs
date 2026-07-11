@@ -290,18 +290,43 @@ fn single_char_mutation_sweep_never_verifies() {
     assert!(checked >= 20, "swept only {checked} positions");
 }
 
-// [9] Safe-by-default: the embedded key const is still empty, so the
-// public wrapper rejects even a genuinely valid token.
+// [9] The embedded production key rejects tokens signed by other keys: a
+// token signed by the KAT test key must fail signature verification against
+// it — proving the const holds a real, specific key rather than accepting
+// anything.
 #[test]
 fn embedded_key_rejects_test_tokens() {
-    // The production key is embedded now, so a token signed by the KAT test
-    // key must fail signature verification against it — proving the const
-    // holds a real, different key rather than accepting anything.
     let fx = fixture();
     assert_eq!(
         verify_token(token(&fx, "valid_perpetual"), 0),
         Err(LicenseError::BadSignature)
     );
+}
+
+// [11] The production-key vector: minted by the VAULTED private key (see the
+// fixture's note), so it proves the embedded public key and the store's
+// signing key are actually a pair. Its expires_at is 2000-01-01: past that
+// instant it must fail with exactly Expired (signature valid!), and AT the
+// boundary the frozen `expires_at == now is still valid` rule makes it fully
+// verify — a genuine happy path under the production key from a token that
+// is useless as a license.
+#[test]
+fn production_key_vector_verifies_and_expires() {
+    let fx = fixture();
+    let tok = token(&fx, "prod_expired");
+    const EXPIRES: i64 = 946_684_800; // 2000-01-01T00:00:00Z, fixed literal
+
+    // At the expiry boundary: valid, full claims round-trip.
+    let claims = verify_token(tok, EXPIRES).expect("boundary must verify under the prod key");
+    assert_eq!(claims.license_id, "GF-KAT-PROD-EXPIRED-0001");
+    assert_eq!(claims.kind, "trial");
+    assert_eq!(claims.expires_at, Some(EXPIRES));
+    assert_eq!(claims.features, grepfocus_core::license::features::ALL);
+
+    // One second later — and at any modern clock — Expired, never
+    // BadSignature: the signature itself must keep verifying.
+    assert_eq!(verify_token(tok, EXPIRES + 1), Err(LicenseError::Expired));
+    assert_eq!(verify_token(tok, 1_752_192_000), Err(LicenseError::Expired));
 }
 
 // [10] Forward compatibility: a token whose payload carries an extra,
