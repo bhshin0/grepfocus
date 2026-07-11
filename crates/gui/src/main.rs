@@ -148,6 +148,26 @@ fn notify(app: &AppHandle, title: &str, body: &str) {
     let _ = app.notification().builder().title(title).body(body).show();
 }
 
+/// Show + focus the main window. Every un-hide path must go through here:
+/// tao 0.35's Wayland client-side decorations go stale across hide()/show() —
+/// the titlebar buttons render but ignore clicks until something forces a
+/// re-layout (tauri#11856, root cause tao#1046; fixed upstream, drop this
+/// when tauri ships it). Toggling `resizable` forces that re-layout without
+/// going through set_size, which is itself unreliable under Wayland CSD.
+/// WebviewWindow methods are thread-safe, so this is callable from the
+/// status watcher's async runtime thread too.
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        #[cfg(target_os = "linux")]
+        {
+            let _ = window.set_resizable(false);
+            let _ = window.set_resizable(true);
+        }
+        let _ = window.set_focus();
+    }
+}
+
 /// Background task: poll the daemon every 5s, keep the tray tooltip in sync,
 /// and fire a notification whenever a block starts or ends. Runs for the life
 /// of the process (when a tray host is present, the window hides to tray
@@ -172,7 +192,7 @@ fn spawn_status_watcher(app: AppHandle) {
                             .await
                             .unwrap_or(false);
                     if !present {
-                        let _ = window.show();
+                        show_main_window(&app);
                     }
                 }
             }
@@ -233,10 +253,7 @@ fn main() {
         // window (likely hidden in the tray) instead of spawning a duplicate
         // process with its own tray icon and notification stream.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.set_focus();
-            }
+            show_main_window(app);
         }))
         .plugin(tauri_plugin_localhost::Builder::new(port).build())
         .plugin(tauri_plugin_notification::init())
@@ -280,12 +297,7 @@ fn main() {
                 .tooltip("GrepFocus — no active blocks")
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => {
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
-                    }
+                    "show" => show_main_window(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -301,8 +313,7 @@ fn main() {
                             if w.is_visible().unwrap_or(false) {
                                 let _ = w.hide();
                             } else {
-                                let _ = w.show();
-                                let _ = w.set_focus();
+                                show_main_window(app);
                             }
                         }
                     }
