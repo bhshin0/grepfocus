@@ -36,13 +36,13 @@ use std::fmt;
 /// The embedded license public key: raw 32-byte Ed25519 key, base64url
 /// without padding.
 ///
-/// Filled in at the one-time keypair ceremony with the
+/// Set at the one-time keypair ceremony (2026-07-11) from the
 /// `PUBLIC_KEY_BASE64URL` value printed by
 /// `grepfocus-web/scripts/gen-keypair.ts` (the JWK `x` component of the
-/// signing key). While this is empty, every [`verify_token`] call fails with
-/// `Malformed("no public key embedded")` — safe-by-default: no token can
-/// appear valid before the real key ships.
-pub const LICENSE_PUBKEY_B64URL: &str = "";
+/// signing key). The private half lives only in the store's
+/// `LICENSE_SIGNING_KEY` env (vaulted). NEVER regenerate the keypair:
+/// rotating this key invalidates every license ever sold.
+pub const LICENSE_PUBKEY_B64URL: &str = "8BLf4ex1mRVufu-w311GuWZ0dQKvAk1KYVW8ro2827s";
 
 /// Claims carried inside a license token.
 ///
@@ -231,6 +231,16 @@ mod tests {
                 "pomodoro",
             ]
         );
+    }
+
+    #[test]
+    fn embedded_pubkey_is_a_valid_ed25519_key() {
+        let bytes: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(LICENSE_PUBKEY_B64URL)
+            .expect("embedded key must be base64url no-pad")
+            .try_into()
+            .expect("embedded key must be exactly 32 bytes");
+        VerifyingKey::from_bytes(&bytes).expect("embedded key must be a valid Ed25519 point");
     }
 
     #[test]

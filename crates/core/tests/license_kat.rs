@@ -293,11 +293,14 @@ fn single_char_mutation_sweep_never_verifies() {
 // [9] Safe-by-default: the embedded key const is still empty, so the
 // public wrapper rejects even a genuinely valid token.
 #[test]
-fn embedded_const_empty_means_everything_malformed() {
+fn embedded_key_rejects_test_tokens() {
+    // The production key is embedded now, so a token signed by the KAT test
+    // key must fail signature verification against it — proving the const
+    // holds a real, different key rather than accepting anything.
     let fx = fixture();
     assert_eq!(
         verify_token(token(&fx, "valid_perpetual"), 0),
-        Err(LicenseError::Malformed("no public key embedded"))
+        Err(LicenseError::BadSignature)
     );
 }
 
