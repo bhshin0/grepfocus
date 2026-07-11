@@ -133,7 +133,7 @@ pub fn save_in(dir: &Path, state: &State, key: &[u8]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grepfocus_core::Block;
+    use grepfocus_core::{Block, LockMode};
 
     fn sample_state() -> State {
         State {
@@ -146,6 +146,7 @@ mod tests {
                 domains: vec!["reddit.com".into()],
                 apps: vec![],
                 allowance_secs_per_day: 600,
+                lock: LockMode::Normal,
             }],
             license_token: Some("payload.signature".to_string()),
             high_water_unix: 1_752_192_000,

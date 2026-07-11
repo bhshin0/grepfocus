@@ -222,7 +222,7 @@ mod tests {
 
     // ── enforced_matchers() ─────────────────────────────────────────────────
 
-    use grepfocus_core::{Block, Originator};
+    use grepfocus_core::{Block, LockMode, Originator};
 
     fn active(apps_enforced: bool, break_until_unix: Option<u64>) -> ActiveBlock {
         ActiveBlock {
@@ -234,12 +234,14 @@ mod tests {
                     name: "steam".into(),
                 }],
                 allowance_secs_per_day: 0,
+                lock: LockMode::Normal,
             },
             started_at_unix: 0,
             ends_at_unix: u64::MAX,
             originator: Originator::Manual,
             break_until_unix,
             apps_enforced,
+            lock: LockMode::Normal,
         }
     }
 

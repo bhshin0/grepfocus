@@ -45,6 +45,11 @@ pub struct Daemon {
     /// unlicensed or the stored token failed verification. Derived and
     /// in-memory only — rebuilt at startup and on `SetLicense`.
     pub license: Mutex<Option<LicenseClaims>>,
+    /// Pending break challenges for `ChallengeBreaks` blocks: block_id → the
+    /// exact string the daemon issued via `GetBreakChallenge`. In-memory
+    /// only, deliberately: a daemon restart invalidating a pending challenge
+    /// fails safe — the user just requests a new one.
+    pub break_challenges: Mutex<std::collections::HashMap<u64, String>>,
 }
 
 /// Wall-clock "now" (unix seconds) for license checks, clamped so a rewound
@@ -198,6 +203,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         unlocked_until: Mutex::new(0),
         applied: Mutex::new(None),
         license: Mutex::new(license),
+        break_challenges: Mutex::new(std::collections::HashMap::new()),
     });
 
     // Re-apply the union of all still-active blocks before accepting clients.

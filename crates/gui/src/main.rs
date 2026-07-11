@@ -125,7 +125,15 @@ async fn unlock(password: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn take_break(block_id: u64, secs: u64) -> Result<(), String> {
-    match client::call(Request::TakeBreak { block_id, secs }).await? {
+    // No challenge yet: the lock-mode GUI (challenge prompt, unlock flow) is
+    // a separate follow-up. Normal-mode breaks need none.
+    match client::call(Request::TakeBreak {
+        block_id,
+        secs,
+        challenge: None,
+    })
+    .await?
+    {
         Response::Ok {} => Ok(()),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),

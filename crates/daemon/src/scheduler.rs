@@ -11,7 +11,7 @@
 //! After mutating, persist the new state and (if anything changed)
 //! recompute the hosts file outside the lock.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,6 +82,11 @@ async fn tick(daemon: &Arc<Daemon>, skipped_fires: &mut HashSet<(u64, u64)>) {
                 error!(?e, "scheduler save failed");
             }
         }
+
+        let mut pending = daemon.break_challenges.lock().await;
+        if !pending.is_empty() {
+            prune_break_challenges(&mut pending, &st.active);
+        }
     }
 
     // Reconcile enforcement every tick: sync() is a no-op while the applied
@@ -89,6 +94,17 @@ async fn tick(daemon: &Arc<Daemon>, skipped_fires: &mut HashSet<(u64, u64)>) {
     if let Err(e) = enforce::sync(daemon).await {
         error!(?e, "scheduler enforce sync failed");
     }
+}
+
+/// Retire break challenges belonging to blocks that are no longer active.
+///
+/// Without this, a challenge issued during one activation would still verify
+/// during the NEXT one: you could request a challenge while calm, keep the
+/// string, and spend it in a moment of weakness — defeating the very friction
+/// challenge-locked breaks exist to impose. Also bounds the map at one entry
+/// per active block.
+fn prune_break_challenges(pending: &mut HashMap<u64, String>, active: &[ActiveBlock]) {
+    pending.retain(|block_id, _| active.iter().any(|a| a.block.id == *block_id));
 }
 
 /// Bring `st.active` into agreement with wall-clock expiry and the schedule
@@ -192,6 +208,11 @@ fn reconcile(
         };
         let ends_at_unix = compute_window_end_unix(s, now_local);
         st.active.push(ActiveBlock {
+            // Snapshotted at activation from the saved block, like
+            // apps_enforced below: a mid-block edit or license change must
+            // never soften a running block's break rules. No license check —
+            // the lock was licensed when it was SAVED.
+            lock: block.lock,
             block,
             started_at_unix: now_unix,
             ends_at_unix,
@@ -267,7 +288,7 @@ fn compute_window_end_unix(s: &Schedule, now: &DateTime<Local>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grepfocus_core::{AllowanceLedger, Block, DAY_MON};
+    use grepfocus_core::{AllowanceLedger, Block, LockMode, DAY_MON};
 
     fn s(start: u16, dur: u16, days: u8) -> Schedule {
         Schedule {
@@ -318,7 +339,27 @@ mod tests {
             domains: vec!["example.com".into()],
             apps: vec![],
             allowance_secs_per_day: 0,
+            lock: LockMode::Normal,
         }
+    }
+
+    #[test]
+    fn stale_break_challenges_are_retired_when_a_block_deactivates() {
+        // The replay this closes: request a challenge while calm, keep the
+        // string, spend it on the NEXT activation. Once the block is no
+        // longer active its challenge must be gone.
+        let mut pending = HashMap::from([
+            (1, "still-active-keeps-its-challenge".to_string()),
+            (2, "ended-block-must-lose-its-challenge".to_string()),
+        ]);
+        prune_break_challenges(&mut pending, &[manual_active(1, 9_999)]);
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key(&1));
+        assert!(!pending.contains_key(&2));
+
+        // Nothing active at all: the map empties.
+        prune_break_challenges(&mut pending, &[]);
+        assert!(pending.is_empty());
     }
 
     fn manual_active(block_id: u64, ends_at_unix: u64) -> ActiveBlock {
@@ -329,6 +370,7 @@ mod tests {
             originator: Originator::Manual,
             break_until_unix: None,
             apps_enforced: false,
+            lock: LockMode::Normal,
         }
     }
 
@@ -340,6 +382,7 @@ mod tests {
             originator: Originator::Schedule { schedule_id },
             break_until_unix: None,
             apps_enforced: false,
+            lock: LockMode::Normal,
         }
     }
 
@@ -672,6 +715,43 @@ mod tests {
         ));
         assert_eq!(st.active.len(), 1);
         assert!(st.active[0].apps_enforced);
+    }
+
+    #[test]
+    fn schedule_fire_snapshots_lock_from_the_saved_block() {
+        // A schedule-fired active carries the saved block's lock mode in its
+        // activation snapshot — the field TakeBreak enforcement reads.
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let mut st = State::default();
+        let mut b = block(0);
+        b.lock = LockMode::ChallengeBreaks;
+        st.blocks.push(b);
+        st.schedules.push(s(540, 60, DAY_MON));
+        assert!(reconcile(
+            &mut st,
+            now,
+            &now_l,
+            day_of(&now_l),
+            &all_gates(),
+            &mut HashSet::new()
+        ));
+        assert_eq!(st.active.len(), 1);
+        assert_eq!(st.active[0].lock, LockMode::ChallengeBreaks);
+
+        // And a Normal block snapshots Normal.
+        let mut st = State::default();
+        st.blocks.push(block(0));
+        st.schedules.push(s(540, 60, DAY_MON));
+        assert!(reconcile(
+            &mut st,
+            now,
+            &now_l,
+            day_of(&now_l),
+            &all_gates(),
+            &mut HashSet::new()
+        ));
+        assert_eq!(st.active[0].lock, LockMode::Normal);
     }
 
     #[test]

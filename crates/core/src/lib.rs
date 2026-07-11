@@ -21,6 +21,34 @@ pub struct Block {
     /// this block while it is active. `0` disables breaks for the block.
     #[serde(default)]
     pub allowance_secs_per_day: u64,
+    /// How taking a break is locked down while this block is active.
+    /// Non-`Normal` modes are premium, gated when the block is saved.
+    /// Defaults to `Normal` for records written before this field existed.
+    #[serde(default)]
+    pub lock: LockMode,
+}
+
+/// How taking a break on an active block is locked down.
+///
+/// This only concerns blocks that HAVE a break allowance: "no breaks at all"
+/// is already free — `Block::allowance_secs_per_day == 0` makes every break
+/// request fail and hides the break row in the GUI entirely — so there is
+/// deliberately no redundant `NoBreaks` variant here. Do not re-add one.
+///
+/// Every non-`Normal` mode is a premium feature
+/// (`license::features::LOCK_MODES`), enforced when the block is SAVED, not
+/// when it runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockMode {
+    /// Breaks work as configured (subject to the daily allowance). The only
+    /// mode the free tier can save.
+    #[default]
+    Normal,
+    /// A break requires the settings password (an active unlock window).
+    PasswordBreaks,
+    /// A break requires retyping a random challenge string the daemon issues.
+    ChallengeBreaks,
 }
 
 /// How to identify a process to kill.
@@ -65,6 +93,14 @@ pub struct ActiveBlock {
     /// don't enforce apps.
     #[serde(default)]
     pub apps_enforced: bool,
+    /// The block's break lock mode, SNAPSHOTTED at activation from the saved
+    /// block — exactly like `apps_enforced`. A mid-block edit or license
+    /// change must never soften a running block's break rules; snapshotting
+    /// can only ever make a running block *stricter than the current
+    /// config*, which is the safe direction. Defaults to `Normal` for old
+    /// records written before this field existed.
+    #[serde(default)]
+    pub lock: LockMode,
 }
 
 fn default_originator() -> Originator {
@@ -174,6 +210,19 @@ pub enum Request {
     TakeBreak {
         block_id: u64,
         secs: u64,
+        /// Response to the challenge issued by `GetBreakChallenge`. Required
+        /// (and verified) only when the active block's lock mode is
+        /// `ChallengeBreaks`. Serde default so frames from clients that
+        /// predate this field still deserialize.
+        #[serde(default)]
+        challenge: Option<String>,
+    },
+    /// Issue a fresh break challenge for an active `ChallengeBreaks` block.
+    /// The daemon stores the string it returns and `TakeBreak` must echo it
+    /// back — the daemon issues and verifies, so the correct answer never
+    /// originates in the (spoofable) GUI.
+    GetBreakChallenge {
+        block_id: u64,
     },
     AddSchedule {
         schedule: Schedule,
@@ -257,6 +306,10 @@ pub enum Response {
     },
     Schedules {
         schedules: Vec<Schedule>,
+    },
+    /// The challenge string issued for a `GetBreakChallenge` request.
+    BreakChallenge {
+        text: String,
     },
     Error {
         message: String,
@@ -346,5 +399,95 @@ mod tests {
 
         let json = serde_json::to_string(&Request::SetLicense { token: None }).unwrap();
         assert!(json.contains(r#""method":"set_license""#), "got {json}");
+    }
+
+    // ── lock modes (B2.a) ───────────────────────────────────────────────────
+
+    // Old client → new daemon: a TakeBreak frame WITHOUT `challenge` (what
+    // every pre-lock-modes GUI/CLI emits) must still deserialize.
+    #[test]
+    fn take_break_without_challenge_still_deserializes() {
+        let req: Request =
+            serde_json::from_str(r#"{"method":"take_break","block_id":3,"secs":60}"#).unwrap();
+        assert!(matches!(
+            req,
+            Request::TakeBreak {
+                block_id: 3,
+                secs: 60,
+                challenge: None,
+            }
+        ));
+
+        let req: Request = serde_json::from_str(
+            r#"{"method":"take_break","block_id":3,"secs":60,"challenge":"Abc23"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            req,
+            Request::TakeBreak { challenge: Some(ref c), .. } if c == "Abc23"
+        ));
+    }
+
+    // Pin the wire names of the new frames: "get_break_challenge" under the
+    // "method" tag and "break_challenge" under the "result" tag.
+    #[test]
+    fn break_challenge_wire_tags_round_trip() {
+        let req: Request =
+            serde_json::from_str(r#"{"method":"get_break_challenge","block_id":7}"#).unwrap();
+        assert!(matches!(req, Request::GetBreakChallenge { block_id: 7 }));
+        let json = serde_json::to_string(&Request::GetBreakChallenge { block_id: 7 }).unwrap();
+        assert!(
+            json.contains(r#""method":"get_break_challenge""#),
+            "got {json}"
+        );
+
+        let json = serde_json::to_string(&Response::BreakChallenge {
+            text: "Abc23".into(),
+        })
+        .unwrap();
+        assert!(json.contains(r#""result":"break_challenge""#), "got {json}");
+        let resp: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            resp,
+            Response::BreakChallenge { ref text } if text == "Abc23"
+        ));
+    }
+
+    // Pin LockMode's snake_case wire values.
+    #[test]
+    fn lock_mode_serializes_snake_case() {
+        for (mode, wire) in [
+            (LockMode::Normal, r#""normal""#),
+            (LockMode::PasswordBreaks, r#""password_breaks""#),
+            (LockMode::ChallengeBreaks, r#""challenge_breaks""#),
+        ] {
+            assert_eq!(serde_json::to_string(&mode).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<LockMode>(wire).unwrap(), mode);
+        }
+    }
+
+    // Old state.json compat: Block and ActiveBlock records written before
+    // `lock` existed default to Normal.
+    #[test]
+    fn block_and_active_block_without_lock_default_to_normal() {
+        let block_json = r#"{
+            "id": 1,
+            "name": "reddit",
+            "domains": ["reddit.com"],
+            "apps": [],
+            "allowance_secs_per_day": 600
+        }"#;
+        let b: Block = serde_json::from_str(block_json).unwrap();
+        assert_eq!(b.lock, LockMode::Normal);
+
+        let active_json = format!(
+            r#"{{
+                "block": {block_json},
+                "started_at_unix": 100,
+                "ends_at_unix": 200
+            }}"#
+        );
+        let a: ActiveBlock = serde_json::from_str(&active_json).unwrap();
+        assert_eq!(a.lock, LockMode::Normal);
     }
 }
