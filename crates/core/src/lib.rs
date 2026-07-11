@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod hmac_sig;
+pub mod license;
 pub mod wire;
 
 /// A named bundle of things to block.
