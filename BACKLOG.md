@@ -79,7 +79,12 @@ Research notes only — nothing below is scheduled or implemented unless
 marked fixed inline. Each entry records findings so the legwork doesn't have
 to be redone when the item is picked up.
 
-- **[DEFERRED] Licensing / paywall (v1 ships free)** — app-side integration
+- **[DONE — `premium` branch, 2026-07-11] Licensing / paywall** — implemented
+  and live-verified per `docs/plans/premium-licensing.md` (v1 on master still
+  ships free; the branch merges when the sell decision lands). The research
+  notes below are kept for reference; the keypair ceremony is DONE (key
+  vaulted; the first key was rotated after a transcript leak — never put the
+  signing key on a command line). Original bookmark: app-side integration
   spec from the frostbite-web audit (the external store repo; renaming it to
   match grepfocus is future work). Token format:
   `base64url(JSON claims) + "." + base64url(raw 64-byte Ed25519 signature)`;
