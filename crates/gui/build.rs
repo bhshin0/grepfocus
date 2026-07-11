@@ -11,6 +11,7 @@ fn main() {
             "update_schedule",
             "delete_schedule",
             "set_password",
+            "set_license",
             "unlock",
             "take_break",
         ]));

@@ -55,6 +55,12 @@ struct StatusOut {
     password_set: bool,
     unlocked: bool,
     allowance_used: Vec<AllowanceLedger>,
+    license_present: bool,
+    license_valid: bool,
+    license_kind: Option<String>,
+    license_email: Option<String>,
+    license_expires_at: Option<i64>,
+    licensed_features: Vec<String>,
 }
 
 #[tauri::command]
@@ -66,14 +72,24 @@ async fn get_status() -> Result<StatusOut, String> {
             password_set,
             unlocked,
             allowance_used,
-            // license_* fields land in the GUI in the next milestone (B1.5).
-            ..
+            license_present,
+            license_valid,
+            license_kind,
+            license_email,
+            license_expires_at,
+            licensed_features,
         } => Ok(StatusOut {
             active,
             now_unix,
             password_set,
             unlocked,
             allowance_used,
+            license_present,
+            license_valid,
+            license_kind,
+            license_email,
+            license_expires_at,
+            licensed_features,
         }),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),
@@ -83,6 +99,15 @@ async fn get_status() -> Result<StatusOut, String> {
 #[tauri::command]
 async fn set_password(old: Option<String>, new: Option<String>) -> Result<(), String> {
     match client::call(Request::SetPassword { old, new }).await? {
+        Response::Ok {} => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+#[tauri::command]
+async fn set_license(token: Option<String>) -> Result<(), String> {
+    match client::call(Request::SetLicense { token }).await? {
         Response::Ok {} => Ok(()),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),
@@ -336,6 +361,7 @@ fn main() {
             update_schedule,
             delete_schedule,
             set_password,
+            set_license,
             unlock,
             take_break,
         ])

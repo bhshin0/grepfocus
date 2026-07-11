@@ -35,6 +35,12 @@ interface Status {
   password_set: boolean;
   unlocked: boolean;
   allowance_used: AllowanceLedger[];
+  license_present: boolean;
+  license_valid: boolean;
+  license_kind: string | null;
+  license_email: string | null;
+  license_expires_at: number | null;
+  licensed_features: string[];
 }
 
 interface Schedule {
@@ -61,6 +67,7 @@ tabs.forEach((btn) => {
     if (target === "status") refreshStatus();
     if (target === "schedules") refreshSchedules();
     if (target === "settings") refreshSettings();
+    if (target === "license") refreshLicense();
   });
 });
 
@@ -656,6 +663,140 @@ pwClear.addEventListener("click", async () => {
   } catch (e) {
     pwMsg.classList.add("error");
     pwMsg.textContent = String(e);
+  }
+});
+
+// ─── License ────────────────────────────────────────────────────────────────
+
+const licenseStateEl = document.querySelector<HTMLDivElement>("#license-state")!;
+const licenseForm = document.querySelector<HTMLFormElement>("#license-form")!;
+const licenseMsg = document.querySelector<HTMLParagraphElement>("#license-msg")!;
+const licenseRemove = document.querySelector<HTMLButtonElement>("#license-remove")!;
+const licenseTokenInput = licenseForm.querySelector<HTMLTextAreaElement>('textarea[name="token"]')!;
+
+/// Human labels for the feature keys in license tokens (core's
+/// `license::features`). Unknown keys render as-is so newer licenses stay
+/// legible in older builds.
+const FEATURE_LABEL: Record<string, string> = {
+  app_blocking: "App blocking",
+  schedules: "Recurring schedules",
+  tamper_protection: "Tamper protection",
+  unlimited_blocks: "Unlimited blocks",
+  lock_modes: "Lock modes",
+  usage_stats: "Usage statistics",
+  pomodoro: "Pomodoro timer",
+};
+
+function featureList(heading: string, keys: string[]): HTMLElement {
+  const wrap = document.createElement("div");
+  const label = document.createElement("div");
+  label.className = "feature-heading";
+  label.textContent = heading;
+  wrap.appendChild(label);
+  const ul = document.createElement("ul");
+  ul.className = "feature-list";
+  for (const k of keys) {
+    const li = document.createElement("li");
+    li.textContent = FEATURE_LABEL[k] ?? k;
+    ul.appendChild(li);
+  }
+  wrap.appendChild(ul);
+  return wrap;
+}
+
+function fmtDate(unixSecs: number): string {
+  return new Date(unixSecs * 1000).toLocaleDateString();
+}
+
+function renderLicenseState(s: Status) {
+  licenseStateEl.innerHTML = "";
+  const line = document.createElement("div");
+
+  if (!s.license_present) {
+    licenseStateEl.className = "lock-state";
+    line.textContent = "Free tier — no license installed.";
+    licenseStateEl.appendChild(line);
+    licenseStateEl.appendChild(featureList("A license unlocks:", Object.keys(FEATURE_LABEL)));
+    return;
+  }
+
+  if (s.license_valid) {
+    licenseStateEl.className = "lock-state unlocked";
+    if (s.license_kind === "trial") {
+      line.textContent =
+        s.license_expires_at != null ? `Trial — expires ${fmtDate(s.license_expires_at)}` : "Trial";
+    } else {
+      line.textContent = `Premium (${s.license_kind ?? "unknown kind"})`;
+    }
+    licenseStateEl.appendChild(line);
+    if (s.license_email) {
+      const email = document.createElement("div");
+      email.textContent = `Licensed to ${s.license_email}`;
+      licenseStateEl.appendChild(email);
+    }
+    if (s.licensed_features.length > 0) {
+      licenseStateEl.appendChild(featureList("Unlocked features:", s.licensed_features));
+    }
+    return;
+  }
+
+  // A token is stored but no longer verifies.
+  licenseStateEl.className = "lock-state locked";
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (s.license_expires_at != null && s.license_expires_at < nowSec) {
+    line.textContent = `Trial expired ${fmtDate(s.license_expires_at)}. The app has returned to the free tier — saved config is untouched.`;
+  } else {
+    line.textContent = "A license is stored but failed verification.";
+  }
+  licenseStateEl.appendChild(line);
+}
+
+async function refreshLicense() {
+  try {
+    const s = await invoke<Status>("get_status");
+    renderLicenseState(s);
+    licenseRemove.hidden = !s.license_present;
+  } catch (e) {
+    licenseStateEl.textContent = String(e);
+    licenseStateEl.className = "lock-state locked";
+  }
+}
+
+licenseForm.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  licenseMsg.classList.remove("error");
+  licenseMsg.textContent = "";
+  const token = licenseTokenInput.value.trim();
+  if (!token) {
+    licenseMsg.classList.add("error");
+    licenseMsg.textContent = "paste a license key first";
+    return;
+  }
+  if (!(await ensureUnlocked())) return;
+  try {
+    await invoke("set_license", { token });
+    licenseMsg.textContent = "license activated";
+    licenseTokenInput.value = "";
+    refreshLicense();
+    refreshStatus();
+  } catch (e) {
+    licenseMsg.classList.add("error");
+    licenseMsg.textContent = String(e);
+  }
+});
+
+licenseRemove.addEventListener("click", async () => {
+  licenseMsg.classList.remove("error");
+  licenseMsg.textContent = "";
+  if (!(await ensureUnlocked())) return;
+  try {
+    await invoke("set_license", { token: null });
+    licenseMsg.textContent = "license removed";
+    refreshLicense();
+    refreshStatus();
+  } catch (e) {
+    licenseMsg.classList.add("error");
+    licenseMsg.textContent = String(e);
   }
 });
 

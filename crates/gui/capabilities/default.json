@@ -19,6 +19,7 @@
     "allow-update-schedule",
     "allow-delete-schedule",
     "allow-set-password",
+    "allow-set-license",
     "allow-unlock",
     "allow-take-break"
   ]

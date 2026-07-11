@@ -15,6 +15,7 @@
         <button data-tab="list">Block list</button>
         <button data-tab="schedules">Schedules</button>
         <button data-tab="settings">Settings</button>
+        <button data-tab="license">License</button>
       </nav>
     </header>
     <main>
@@ -104,6 +105,22 @@
           <button type="submit" id="password-submit">Set password</button>
           <button type="button" id="password-clear" class="ghost" hidden>Remove password</button>
           <p id="password-msg" class="msg"></p>
+        </form>
+      </section>
+
+      <section id="license" class="tab">
+        <h2>License</h2>
+        <p class="hint">License keys come from the GrepFocus store. The free tier keeps working without one — a license only adds premium features.</p>
+
+        <div id="license-state" class="lock-state"></div>
+
+        <form id="license-form">
+          <label>License key
+            <textarea name="token" rows="4" class="license-key" spellcheck="false" autocomplete="off" placeholder="paste your license key here"></textarea>
+          </label>
+          <button type="submit">Activate</button>
+          <button type="button" id="license-remove" class="ghost" hidden>Remove license</button>
+          <p id="license-msg" class="msg"></p>
         </form>
       </section>
     </main>
