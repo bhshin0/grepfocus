@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use grepfocus_core::{now_unix, AppMatcher};
+use grepfocus_core::{now_unix, ActiveBlock, AppMatcher};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use procfs::process::all_processes;
@@ -24,13 +24,7 @@ pub async fn run(daemon: Arc<Daemon>) {
             if st.active.is_empty() {
                 continue;
             }
-            let now = now_unix();
-            st.active
-                .iter()
-                // Skip blocks currently on a break — their apps run freely.
-                .filter(|a| a.break_until_unix.is_none_or(|t| t <= now))
-                .flat_map(|a| a.block.apps.iter().cloned())
-                .collect()
+            enforced_matchers(&st.active, now_unix())
         };
         if matchers.is_empty() {
             continue;
@@ -39,6 +33,22 @@ pub async fn run(daemon: Arc<Daemon>) {
         // stall the runtime.
         let _ = tokio::task::spawn_blocking(move || sweep(&matchers)).await;
     }
+}
+
+/// The app matchers to enforce right now: apps from active blocks that
+/// (a) snapshotted app enforcement at activation (`apps_enforced` — set from
+/// the license's `app_blocking` feature at that moment, so a mid-block
+/// license change in either direction never alters a running block) and
+/// (b) are not currently on a break. Pure, so the enforcement decision is
+/// unit-testable without a live `/proc`.
+fn enforced_matchers(active: &[ActiveBlock], now: u64) -> Vec<AppMatcher> {
+    active
+        .iter()
+        .filter(|a| a.apps_enforced)
+        // Skip blocks currently on a break — their apps run freely.
+        .filter(|a| a.break_until_unix.is_none_or(|t| t <= now))
+        .flat_map(|a| a.block.apps.iter().cloned())
+        .collect()
 }
 
 fn sweep(matchers: &[AppMatcher]) {
@@ -208,5 +218,55 @@ mod tests {
             Some("steam"),
             &[]
         ));
+    }
+
+    // ── enforced_matchers() ─────────────────────────────────────────────────
+
+    use grepfocus_core::{Block, Originator};
+
+    fn active(apps_enforced: bool, break_until_unix: Option<u64>) -> ActiveBlock {
+        ActiveBlock {
+            block: Block {
+                id: 1,
+                name: "games".into(),
+                domains: vec![],
+                apps: vec![AppMatcher::Basename {
+                    name: "steam".into(),
+                }],
+                allowance_secs_per_day: 0,
+            },
+            started_at_unix: 0,
+            ends_at_unix: u64::MAX,
+            originator: Originator::Manual,
+            break_until_unix,
+            apps_enforced,
+        }
+    }
+
+    #[test]
+    fn apps_enforced_snapshot_gates_matchers() {
+        // apps_enforced=false (free-tier activation, or a pre-gating record
+        // via the serde default): the block's apps are NOT enforced, even
+        // though the block itself carries matchers.
+        assert!(enforced_matchers(&[active(false, None)], 100).is_empty());
+        // apps_enforced=true: matchers flow through.
+        let m = enforced_matchers(&[active(true, None)], 100);
+        assert_eq!(
+            m,
+            vec![AppMatcher::Basename {
+                name: "steam".into()
+            }]
+        );
+        // Mixed: only the enforcing block contributes.
+        let m = enforced_matchers(&[active(false, None), active(true, None)], 100);
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn breaks_still_suspend_enforced_matchers() {
+        // On a break (break_until > now): suspended.
+        assert!(enforced_matchers(&[active(true, Some(200))], 100).is_empty());
+        // Break elapsed: enforcement resumes.
+        assert_eq!(enforced_matchers(&[active(true, Some(100))], 100).len(), 1);
     }
 }

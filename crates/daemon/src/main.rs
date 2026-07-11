@@ -55,6 +55,19 @@ pub fn effective_now(state: &State) -> i64 {
     (now_unix() as i64).max(state.high_water_unix as i64)
 }
 
+/// Whether the cached license grants premium feature `key` right now.
+///
+/// True iff claims exist, are unexpired against `effective_now(state)`, and
+/// list `key` in `features`. The expiry comparison follows the frozen
+/// boundary rule shared with the verifier and `license_status_fields`:
+/// `expires_at == now` is still valid; `None` means perpetual.
+pub fn has_feature(license: Option<&LicenseClaims>, state: &State, key: &str) -> bool {
+    license.is_some_and(|c| {
+        c.expires_at.is_none_or(|t| t >= effective_now(state))
+            && c.features.iter().any(|f| f == key)
+    })
+}
+
 fn main() -> anyhow::Result<()> {
     // Initialize tracing before dispatching so subcommands log too.
     tracing_subscriber::fmt()
@@ -230,5 +243,78 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(effective_now(&st), hw as i64);
+    }
+
+    // ── has_feature() ───────────────────────────────────────────────────────
+
+    use grepfocus_core::license::features;
+
+    /// Pins `effective_now` in these tests: a high-water mark of 2100-01-01
+    /// dominates the real clock for any plausible test run, making the
+    /// expiry comparisons deterministic.
+    const HW: u64 = 4_102_444_800;
+
+    fn st_at_hw() -> State {
+        State {
+            high_water_unix: HW,
+            ..Default::default()
+        }
+    }
+
+    fn claims(feature_keys: &[&str], expires_at: Option<i64>) -> LicenseClaims {
+        LicenseClaims {
+            license_id: "GF-TEST-0001".into(),
+            email: "kat@example.com".into(),
+            tier: "premium".into(),
+            kind: "trial".into(),
+            features: feature_keys.iter().map(|s| s.to_string()).collect(),
+            issued_at: 0,
+            expires_at,
+            max_devices: 3,
+        }
+    }
+
+    #[test]
+    fn has_feature_false_without_license() {
+        assert!(!has_feature(None, &st_at_hw(), features::SCHEDULES));
+    }
+
+    #[test]
+    fn has_feature_false_when_expired() {
+        let c = claims(&features::ALL, Some(HW as i64 - 1));
+        assert!(!has_feature(Some(&c), &st_at_hw(), features::SCHEDULES));
+    }
+
+    #[test]
+    fn has_feature_boundary_expiry_equal_to_now_is_still_valid() {
+        // Frozen boundary rule (matches the verifier and
+        // license_status_fields): expires_at == now grants.
+        let c = claims(&features::ALL, Some(HW as i64));
+        assert!(has_feature(Some(&c), &st_at_hw(), features::SCHEDULES));
+    }
+
+    #[test]
+    fn has_feature_false_when_key_not_granted() {
+        // Valid license, but the queried key is not in `features`.
+        let c = claims(&[features::SCHEDULES], None);
+        assert!(!has_feature(Some(&c), &st_at_hw(), features::APP_BLOCKING));
+    }
+
+    #[test]
+    fn has_feature_true_for_every_granted_key_on_valid_license() {
+        let c = claims(&features::ALL, None); // perpetual
+        for key in features::ALL {
+            assert!(has_feature(Some(&c), &st_at_hw(), key), "key {key}");
+        }
+    }
+
+    #[test]
+    fn has_feature_respects_clock_rollback_clamp() {
+        // The license expired at HW-1; even though the *system clock* is far
+        // before HW, effective_now clamps to the high-water mark, so a
+        // rewound clock cannot resurrect the feature.
+        let c = claims(&features::ALL, Some(HW as i64 - 1));
+        let st = st_at_hw(); // real clock << HW in any test run
+        assert!(!has_feature(Some(&c), &st, features::TAMPER_PROTECTION));
     }
 }

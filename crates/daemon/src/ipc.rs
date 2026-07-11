@@ -9,16 +9,26 @@ use std::sync::Arc;
 use anyhow::Context;
 use grepfocus_core::license::{self, LicenseClaims};
 use grepfocus_core::{
-    now_unix, ActiveBlock, AllowanceLedger, Originator, Request, Response, Schedule, State,
+    now_unix, ActiveBlock, AllowanceLedger, AppMatcher, Originator, Request, Response, Schedule,
+    State,
 };
 use nix::unistd::Group;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
 
-use crate::{auth, effective_now, enforce, paths, scheduler, state, Daemon};
+use crate::{auth, effective_now, enforce, has_feature, paths, scheduler, state, Daemon};
 
 /// How long an `Unlock` keeps configuration changes permitted.
 const UNLOCK_SECS: u64 = 300;
+
+// Verbatim premium-gate copy from the approved plan: actionable (says what to
+// do about it), no nagging. Do not reword without going back through the plan.
+const MSG_BLOCK_CAP: &str = "Saving more than one block is a premium feature. \
+     Enter a license key in Settings, or get one from the GrepFocus store.";
+const MSG_APP_BLOCKING: &str = "App blocking is a premium feature. \
+     Enter a license key in Settings, or get one from the GrepFocus store.";
+const MSG_SCHEDULES: &str = "Schedules are a premium feature. \
+     Enter a license key in Settings, or get one from the GrepFocus store.";
 
 /// Group whose members are authorized to talk to the socket.
 pub(crate) const GROUP: &str = "grepfocus";
@@ -134,6 +144,17 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             if let Some(resp) = gate_config(daemon, &st).await {
                 return resp;
             }
+            {
+                let lic = daemon.license.lock().await;
+                if let Some(msg) = gate_add_block(
+                    has_feature(lic.as_ref(), &st, license::features::UNLIMITED_BLOCKS),
+                    has_feature(lic.as_ref(), &st, license::features::APP_BLOCKING),
+                    st.blocks.len(),
+                    &block.apps,
+                ) {
+                    return err(msg);
+                }
+            }
             let prev_blocks = st.blocks.clone();
             let prev_next_id = st.next_id;
             block.id = st.next_id;
@@ -155,6 +176,22 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             }
             if st.active.iter().any(|a| a.block.id == block.id) {
                 return err("cannot edit a block while it is active");
+            }
+            // License gate for the app list, against the SAVED block (see
+            // update_needs_app_license for the grandfathering rationale:
+            // editing e.g. the domains of a premium-era block after a
+            // downgrade must not brick the block).
+            {
+                let saved = match st.blocks.iter().find(|b| b.id == block.id) {
+                    Some(b) => b,
+                    None => return err(format!("no block with id {}", block.id)),
+                };
+                if update_needs_app_license(&saved.apps, &block.apps) {
+                    let lic = daemon.license.lock().await;
+                    if !has_feature(lic.as_ref(), &st, license::features::APP_BLOCKING) {
+                        return err(MSG_APP_BLOCKING);
+                    }
+                }
             }
             let prev_blocks = st.blocks.clone();
             match st.blocks.iter_mut().find(|b| b.id == block.id) {
@@ -192,6 +229,9 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             Response::Ok {}
         }
 
+        // Deliberately UNGATED by license: saved blocks always stay startable,
+        // even after a downgrade (downgrade deletes nothing and blocks nothing
+        // the user already configured).
         Request::StartBlock { id, duration_secs } => {
             {
                 let mut st = daemon.state.lock().await;
@@ -202,6 +242,12 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                     Some(b) => b.clone(),
                     None => return err(format!("no block with id {id}")),
                 };
+                // Snapshot app enforcement at activation: a license change
+                // while the block runs — either direction — must not alter it.
+                let apps_enforced = {
+                    let lic = daemon.license.lock().await;
+                    has_feature(lic.as_ref(), &st, license::features::APP_BLOCKING)
+                };
                 let now = now_unix();
                 st.active.push(ActiveBlock {
                     block,
@@ -209,6 +255,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                     ends_at_unix: now.saturating_add(duration_secs),
                     originator: Originator::Manual,
                     break_until_unix: None,
+                    apps_enforced,
                 });
                 if let Err(e) = state::save(&st, &daemon.key) {
                     st.active.pop();
@@ -295,6 +342,12 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             if let Some(resp) = gate_config(daemon, &st).await {
                 return resp;
             }
+            {
+                let lic = daemon.license.lock().await;
+                if !has_feature(lic.as_ref(), &st, license::features::SCHEDULES) {
+                    return err(MSG_SCHEDULES);
+                }
+            }
             if !st.blocks.iter().any(|b| b.id == schedule.block_id) {
                 return err(format!("no block with id {}", schedule.block_id));
             }
@@ -327,6 +380,12 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             if let Some(resp) = gate_config(daemon, &st).await {
                 return resp;
             }
+            {
+                let lic = daemon.license.lock().await;
+                if !has_feature(lic.as_ref(), &st, license::features::SCHEDULES) {
+                    return err(MSG_SCHEDULES);
+                }
+            }
             if !st.blocks.iter().any(|b| b.id == schedule.block_id) {
                 return err(format!("no block with id {}", schedule.block_id));
             }
@@ -352,6 +411,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             Response::Ok {}
         }
 
+        // No license gate: removing configuration is always allowed.
         Request::DeleteSchedule { id } => {
             let mut st = daemon.state.lock().await;
             if let Some(resp) = gate_config(daemon, &st).await {
@@ -546,6 +606,43 @@ fn license_status_fields(
             _ => Vec::new(),
         },
     }
+}
+
+/// Premium gate for `AddBlock`. Pure so the free/licensed matrix is
+/// unit-testable without a live daemon (the happy path saves state, which
+/// needs the real state dir).
+///
+/// The 1-block cap counts SAVED blocks and gates only NEW adds — a downgrade
+/// deletes nothing and existing blocks stay startable, there is just no room
+/// for more. Saving app matchers additionally needs `app_blocking`. The cap
+/// error wins when both apply: it is the one the user must resolve first.
+fn gate_add_block(
+    unlimited: bool,
+    app_blocking: bool,
+    saved_blocks: usize,
+    new_apps: &[AppMatcher],
+) -> Option<&'static str> {
+    if !unlimited && saved_blocks >= 1 {
+        return Some(MSG_BLOCK_CAP);
+    }
+    if !app_blocking && !new_apps.is_empty() {
+        return Some(MSG_APP_BLOCKING);
+    }
+    None
+}
+
+/// Whether a block update's app list requires the `app_blocking` feature.
+///
+/// Grandfathering rule (a downgrade deletes nothing): after a license
+/// lapses, a premium-era block with saved app matchers must stay editable in
+/// every OTHER respect — rejecting an update that merely passes the saved
+/// apps through unchanged would brick the block the moment the user renames
+/// it or edits its domains. Clearing apps is likewise always allowed
+/// (removing configuration is free). Only INTRODUCING apps where none were
+/// saved, or CHANGING a saved list into a different non-empty one, is a
+/// premium action.
+fn update_needs_app_license(saved: &[AppMatcher], updated: &[AppMatcher]) -> bool {
+    !updated.is_empty() && updated != saved
 }
 
 /// Two schedules are "the same" if they drive the same block over the same
@@ -869,6 +966,226 @@ mod tests {
             ),
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    // ── license gates ───────────────────────────────────────────────────────
+    //
+    // Rejections return before `state::save`, so they are fully testable
+    // through `dispatch`. Accept paths would hit the real state dir, so their
+    // matrices live on the pure helpers (`gate_add_block`,
+    // `update_needs_app_license`) instead — except where a later,
+    // environment-independent error proves the gate was passed.
+
+    use grepfocus_core::{Block, DAY_MON};
+
+    fn blk(id: u64, apps: Vec<AppMatcher>) -> Block {
+        Block {
+            id,
+            name: format!("block-{id}"),
+            domains: vec!["example.com".into()],
+            apps,
+            allowance_secs_per_day: 0,
+        }
+    }
+
+    fn steam() -> AppMatcher {
+        AppMatcher::Basename {
+            name: "steam".into(),
+        }
+    }
+
+    fn discord() -> AppMatcher {
+        AppMatcher::Basename {
+            name: "discord".into(),
+        }
+    }
+
+    fn sched(block_id: u64) -> Schedule {
+        Schedule {
+            id: 0,
+            name: "mornings".into(),
+            block_id,
+            days: DAY_MON,
+            start_minute: 540,
+            duration_minutes: 60,
+            enabled: true,
+        }
+    }
+
+    fn err_msg(resp: Response) -> String {
+        match resp {
+            Response::Error { message } => message,
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// The response may be Ok, or an unrelated error (in tests, `save` fails
+    /// against the real state dir) — but it must not be a premium gate.
+    fn assert_not_premium_gated(resp: &Response) {
+        if let Response::Error { message } = resp {
+            assert!(
+                !message.contains("premium feature"),
+                "unexpected premium gate: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_add_block_matrix() {
+        let apps = vec![steam()];
+        // Free tier: the FIRST block is fine…
+        assert_eq!(gate_add_block(false, false, 0, &[]), None);
+        // …the second (and any later) add hits the cap, with the exact copy.
+        assert_eq!(gate_add_block(false, false, 1, &[]), Some(MSG_BLOCK_CAP));
+        assert_eq!(gate_add_block(false, false, 7, &[]), Some(MSG_BLOCK_CAP));
+        // Licensed: many adds fine, apps fine.
+        assert_eq!(gate_add_block(true, true, 100, &apps), None);
+        // Free tier: apps rejected even on the very first block.
+        assert_eq!(
+            gate_add_block(false, false, 0, &apps),
+            Some(MSG_APP_BLOCKING)
+        );
+        // Both violations at once: the cap error wins.
+        assert_eq!(gate_add_block(false, false, 1, &apps), Some(MSG_BLOCK_CAP));
+        // The two features gate independently.
+        assert_eq!(gate_add_block(false, true, 1, &apps), Some(MSG_BLOCK_CAP));
+        assert_eq!(
+            gate_add_block(true, false, 1, &apps),
+            Some(MSG_APP_BLOCKING)
+        );
+        assert_eq!(gate_add_block(true, false, 1, &[]), None);
+    }
+
+    #[test]
+    fn update_app_license_grandfather_matrix() {
+        let a = vec![steam()];
+        let b = vec![discord()];
+        let ab = vec![steam(), discord()];
+        // Keeping the identical saved list passes through.
+        assert!(!update_needs_app_license(&a, &a));
+        // Clearing is always allowed, as is staying empty.
+        assert!(!update_needs_app_license(&a, &[]));
+        assert!(!update_needs_app_license(&[], &[]));
+        // Introducing apps where none were saved needs the license.
+        assert!(update_needs_app_license(&[], &a));
+        // So does changing a saved list — including adding to or shrinking it.
+        assert!(update_needs_app_license(&a, &b));
+        assert!(update_needs_app_license(&a, &ab));
+        assert!(update_needs_app_license(&ab, &a));
+    }
+
+    #[tokio::test]
+    async fn add_block_second_free_add_rejected_with_exact_copy() {
+        let daemon = test_daemon();
+        daemon.state.lock().await.blocks.push(blk(1, vec![]));
+        let resp = dispatch(
+            Request::AddBlock {
+                block: blk(0, vec![]),
+            },
+            &daemon,
+        )
+        .await;
+        assert_eq!(err_msg(resp), MSG_BLOCK_CAP);
+        assert_eq!(daemon.state.lock().await.blocks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn add_block_with_apps_rejected_free_with_exact_copy() {
+        let daemon = test_daemon(); // zero saved blocks: the cap can't trip first
+        let resp = dispatch(
+            Request::AddBlock {
+                block: blk(0, vec![steam()]),
+            },
+            &daemon,
+        )
+        .await;
+        assert_eq!(err_msg(resp), MSG_APP_BLOCKING);
+        assert!(daemon.state.lock().await.blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_block_cannot_introduce_apps_free() {
+        let daemon = test_daemon();
+        daemon.state.lock().await.blocks.push(blk(1, vec![]));
+        let resp = dispatch(
+            Request::UpdateBlock {
+                block: blk(1, vec![steam()]),
+            },
+            &daemon,
+        )
+        .await;
+        assert_eq!(err_msg(resp), MSG_APP_BLOCKING);
+        assert!(daemon.state.lock().await.blocks[0].apps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_block_cannot_modify_apps_free() {
+        let daemon = test_daemon();
+        daemon.state.lock().await.blocks.push(blk(1, vec![steam()]));
+        let resp = dispatch(
+            Request::UpdateBlock {
+                block: blk(1, vec![discord()]),
+            },
+            &daemon,
+        )
+        .await;
+        assert_eq!(err_msg(resp), MSG_APP_BLOCKING);
+        assert_eq!(daemon.state.lock().await.blocks[0].apps, vec![steam()]);
+    }
+
+    #[tokio::test]
+    async fn update_block_grandfathered_apps_pass_through_ungated() {
+        // Free tier, premium-era block with apps: an update that keeps the
+        // apps verbatim (here: editing domains) must not hit the premium
+        // gate — that would brick the block after a downgrade.
+        let daemon = test_daemon();
+        daemon.state.lock().await.blocks.push(blk(1, vec![steam()]));
+        let mut update = blk(1, vec![steam()]);
+        update.domains = vec!["news.ycombinator.com".into()];
+        let resp = dispatch(Request::UpdateBlock { block: update }, &daemon).await;
+        assert_not_premium_gated(&resp);
+    }
+
+    #[tokio::test]
+    async fn update_block_clearing_apps_ungated() {
+        let daemon = test_daemon();
+        daemon.state.lock().await.blocks.push(blk(1, vec![steam()]));
+        let resp = dispatch(
+            Request::UpdateBlock {
+                block: blk(1, vec![]),
+            },
+            &daemon,
+        )
+        .await;
+        assert_not_premium_gated(&resp);
+    }
+
+    #[tokio::test]
+    async fn add_schedule_rejected_free_with_exact_copy() {
+        let daemon = test_daemon();
+        daemon.state.lock().await.blocks.push(blk(1, vec![]));
+        let resp = dispatch(Request::AddSchedule { schedule: sched(1) }, &daemon).await;
+        assert_eq!(err_msg(resp), MSG_SCHEDULES);
+        assert!(daemon.state.lock().await.schedules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_schedule_rejected_free_with_exact_copy() {
+        let daemon = test_daemon();
+        daemon.state.lock().await.blocks.push(blk(1, vec![]));
+        let resp = dispatch(Request::UpdateSchedule { schedule: sched(1) }, &daemon).await;
+        assert_eq!(err_msg(resp), MSG_SCHEDULES);
+    }
+
+    #[tokio::test]
+    async fn licensed_add_schedule_passes_the_gate() {
+        // With a valid license cached, AddSchedule gets past the premium gate
+        // and fails on the NEXT check (missing block) — an assertion that
+        // works without touching the real state dir.
+        let daemon = test_daemon();
+        *daemon.license.lock().await = Some(claims("perpetual", None));
+        let resp = dispatch(Request::AddSchedule { schedule: sched(5) }, &daemon).await;
+        assert_eq!(err_msg(resp), "no block with id 5");
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::process::Command;
 
 use anyhow::{anyhow, Context};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::paths::{HOSTS, HOSTS_BEGIN, HOSTS_END, HOSTS_ORIG};
 
@@ -27,8 +27,15 @@ pub(crate) const HOSTS_MODE: u32 = 0o644;
 const HOSTS_ORIG_MODE: u32 = 0o600;
 
 /// Apply the block: remove any existing managed region, append a fresh one
-/// with all blocked domains, then (best-effort) mark /etc/hosts immutable.
-pub fn apply_block(domains: &[String]) -> anyhow::Result<()> {
+/// with all blocked domains, then — when `tamper_protect` (the premium
+/// `tamper_protection` feature) is granted — mark /etc/hosts immutable.
+///
+/// The hosts CONTENT is free-tier enforcement; only the `chattr +i`
+/// hardening on top is license-gated. The pre-write `chattr -i` below stays
+/// unconditional regardless of license: it is the mechanical unlock needed
+/// to rewrite a possibly-still-locked file (e.g. locked by a previously
+/// licensed apply), not a license decision.
+pub fn apply_block(domains: &[String], tamper_protect: bool) -> anyhow::Result<()> {
     chattr_immutable(HOSTS, false).ok(); // best-effort unlock if previously locked
     let original = fs::read_to_string(HOSTS).context("reading /etc/hosts")?;
     let stripped = strip_managed(&original);
@@ -48,16 +55,49 @@ pub fn apply_block(domains: &[String]) -> anyhow::Result<()> {
         )
     };
     write_atomic(HOSTS, &new, HOSTS_MODE)?;
-    // The immutable bit is hardening, not enforcement (see module docs): the
-    // block is live once the write lands, so degrade gracefully here.
-    if let Err(e) = chattr_immutable(HOSTS, true) {
-        warn!(
-            ?e,
-            "chattr +i failed — hosts block is active but NOT tamper-protected \
-             (SELinux or the filesystem may forbid the immutable flag)"
-        );
+    match hardening_for(tamper_protect) {
+        // The immutable bit is hardening, not enforcement (see module docs):
+        // the block is live once the write lands, so degrade gracefully here.
+        Hardening::SetImmutable => {
+            if let Err(e) = chattr_immutable(HOSTS, true) {
+                warn!(
+                    ?e,
+                    "chattr +i failed — hosts block is active but NOT tamper-protected \
+                     (SELinux or the filesystem may forbid the immutable flag)"
+                );
+            }
+        }
+        // info! rather than debug!: apply_block runs only when the enforced
+        // union changes or drift was detected — a handful of times per block
+        // lifetime, never per tick — and the missing lock is the first thing
+        // support will ask about ("why isn't /etc/hosts immutable?").
+        Hardening::Skip => {
+            info!("hosts block active without tamper protection (premium feature)");
+        }
     }
     Ok(())
+}
+
+/// What `apply_block` does about the immutable bit after writing. Split out
+/// as data so the license gate on the premium hardening step is pinned by a
+/// unit test — the `chattr` side effect itself needs root, `/etc/hosts`, and
+/// an immutable-flag-capable filesystem, none of which tests have.
+#[derive(Debug, PartialEq, Eq)]
+enum Hardening {
+    /// Licensed for `tamper_protection`: set `chattr +i` (best-effort).
+    SetImmutable,
+    /// Unlicensed: leave the bit clear. The hosts content still enforces —
+    /// only the hardening layer is withheld, and never retroactively (the
+    /// unconditional pre-write `chattr -i` is mechanical, see `apply_block`).
+    Skip,
+}
+
+fn hardening_for(tamper_protect: bool) -> Hardening {
+    if tamper_protect {
+        Hardening::SetImmutable
+    } else {
+        Hardening::Skip
+    }
 }
 
 /// Remove the managed region and clear the immutable bit.
@@ -299,6 +339,15 @@ mod tests {
         // marker still counts as an active region.
         let input = format!("127.0.0.1 localhost\n\t  {}\n0.0.0.0 x.com\n", HOSTS_BEGIN);
         assert!(contains_managed(&input));
+    }
+
+    #[test]
+    fn tamper_license_gates_the_immutable_bit() {
+        // The one license-sensitive decision in this module: +i only with
+        // the tamper_protection feature; without it the write still happens
+        // (free-tier enforcement) and only the hardening step is skipped.
+        assert_eq!(hardening_for(true), Hardening::SetImmutable);
+        assert_eq!(hardening_for(false), Hardening::Skip);
     }
 
     #[test]

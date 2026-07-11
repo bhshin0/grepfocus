@@ -24,7 +24,7 @@ pub struct Block {
 }
 
 /// How to identify a process to kill.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AppMatcher {
     /// Match `/proc/<pid>/exe` resolved path exactly.
@@ -57,6 +57,14 @@ pub struct ActiveBlock {
     /// The block does not end — enforcement resumes when this passes.
     #[serde(default)]
     pub break_until_unix: Option<u64>,
+    /// Whether this block's app matchers are enforced (matching processes
+    /// killed). Snapshotted at activation from the license's `app_blocking`
+    /// feature, so a mid-block license change — in either direction — never
+    /// alters a running block's app enforcement. Defaults to `false`: old
+    /// records (written before this field existed) and free-tier activations
+    /// don't enforce apps.
+    #[serde(default)]
+    pub apps_enforced: bool,
 }
 
 fn default_originator() -> Originator {

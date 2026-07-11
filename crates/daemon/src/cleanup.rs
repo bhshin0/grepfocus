@@ -502,6 +502,7 @@ mod tests {
                 ends_at_unix: u64::MAX,
                 originator: Originator::Manual,
                 break_until_unix: None,
+                apps_enforced: false,
             }],
             ..Default::default()
         };

@@ -19,10 +19,11 @@
 
 use std::collections::BTreeSet;
 
+use grepfocus_core::license::features;
 use grepfocus_core::{now_unix, ActiveBlock};
 use tracing::{debug, info, warn};
 
-use crate::{hosts, nftables, Daemon};
+use crate::{has_feature, hosts, nftables, Daemon};
 
 /// How long a live-system verification stays fresh. While a domain block is
 /// active, a memo-hit `sync` older than this re-probes the nft table and the
@@ -62,9 +63,23 @@ pub struct Applied {
 pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
     let mut applied = daemon.applied.lock().await;
     let now = now_unix();
-    let domains = {
+    // `tamper_protect` (the premium chattr +i hardening) is read at apply
+    // time, alongside the union it will be applied with. It is deliberately
+    // NOT part of the memo: a license change alone never forces a rewrite of
+    // /etc/hosts — the immutable bit simply catches up on the next natural
+    // re-apply (union change or detected drift). That next apply is a fresh
+    // application of a new enforcement state, so taking the license as of
+    // that moment matches the "gate at activation time" rule; mid-block the
+    // bit can only be *added* this way (it is never proactively cleared for
+    // license reasons — the pre-write `chattr -i` is mechanical and the
+    // hosts content itself is free-tier).
+    let (domains, tamper_protect) = {
         let st = daemon.state.lock().await;
-        union_domains(&st.active, now)
+        let lic = daemon.license.lock().await;
+        (
+            union_domains(&st.active, now),
+            has_feature(lic.as_ref(), &st, features::TAMPER_PROTECTION),
+        )
     };
     if let Some(prev) = applied.as_mut() {
         if prev.domains == domains {
@@ -102,7 +117,7 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
             warn!("enforcement drift detected — re-applying");
         }
     }
-    match apply(&domains) {
+    match apply(&domains, tamper_protect) {
         Ok(nft_ok) => {
             *applied = Some(Applied {
                 domains,
@@ -154,13 +169,17 @@ fn union_domains(active: &[ActiveBlock], now: u64) -> Vec<String> {
 /// Apply a freshly computed union to `/etc/hosts` AND the nftables DoH
 /// block table. If empty, clears both; otherwise installs both.
 ///
+/// `tamper_protect` gates ONLY the trailing `chattr +i` inside
+/// `hosts::apply_block` — the hosts content and the nft DoH table are
+/// free-tier enforcement, the immutable bit is the premium hardening layer.
+///
 /// Returns whether the nft half succeeded, for the memo: a hosts failure is
 /// fatal (`Err`), an nft failure is degraded-but-enforced (`Ok(false)`) so
 /// the periodic probe keeps retrying the nft half.
 ///
 /// DoH blocking only matters when websites are being blocked — an
 /// app-only block (`domains: []`) doesn't need it.
-fn apply(domains: &[String]) -> anyhow::Result<bool> {
+fn apply(domains: &[String], tamper_protect: bool) -> anyhow::Result<bool> {
     if domains.is_empty() {
         hosts::clear_block()?;
         if let Err(e) = nftables::clear() {
@@ -170,7 +189,7 @@ fn apply(domains: &[String]) -> anyhow::Result<bool> {
         // and `needs_probe` never fires on an empty union anyway.
         Ok(true)
     } else {
-        hosts::apply_block(domains)?;
+        hosts::apply_block(domains, tamper_protect)?;
         if let Err(e) = nftables::apply() {
             // Hosts block is in place; DoH bypass is open. Log loudly but
             // don't unwind — partial enforcement is better than none.
