@@ -21,6 +21,7 @@
     "allow-set-password",
     "allow-set-license",
     "allow-unlock",
-    "allow-take-break"
+    "allow-take-break",
+    "allow-get-break-challenge"
   ]
 }

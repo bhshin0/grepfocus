@@ -123,18 +123,31 @@ async fn unlock(password: String) -> Result<(), String> {
     }
 }
 
+/// Take a break on an active block. `challenge` is the user's typed response
+/// for a `ChallengeBreaks` block and `None` for every other mode — the daemon
+/// decides whether one was required, and verifies it. The frontend omits the
+/// argument entirely for normal breaks (Tauri maps a missing arg to `None`).
 #[tauri::command]
-async fn take_break(block_id: u64, secs: u64) -> Result<(), String> {
-    // No challenge yet: the lock-mode GUI (challenge prompt, unlock flow) is
-    // a separate follow-up. Normal-mode breaks need none.
+async fn take_break(block_id: u64, secs: u64, challenge: Option<String>) -> Result<(), String> {
     match client::call(Request::TakeBreak {
         block_id,
         secs,
-        challenge: None,
+        challenge,
     })
     .await?
     {
         Response::Ok {} => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+/// Ask the daemon for a fresh break challenge. The daemon issues AND verifies
+/// the string (it never originates here), so this is a pure pass-through.
+#[tauri::command]
+async fn get_break_challenge(block_id: u64) -> Result<String, String> {
+    match client::call(Request::GetBreakChallenge { block_id }).await? {
+        Response::BreakChallenge { text } => Ok(text),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),
     }
@@ -372,6 +385,7 @@ fn main() {
             set_license,
             unlock,
             take_break,
+            get_break_challenge,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

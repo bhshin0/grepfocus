@@ -14,6 +14,7 @@ fn main() {
             "set_license",
             "unlock",
             "take_break",
+            "get_break_challenge",
         ]));
     tauri_build::try_build(attributes).expect("tauri-build failed");
 }

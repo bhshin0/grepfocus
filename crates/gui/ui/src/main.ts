@@ -5,12 +5,18 @@ type AppMatcher =
   | { kind: "basename"; name: string }
   | { kind: "cmdline"; contains: string };
 
+/// Mirrors core's `LockMode` (snake_case on the wire). How taking a break on
+/// this block is locked down; every mode but "normal" is premium, enforced by
+/// the daemon when the block is SAVED.
+type LockMode = "normal" | "password_breaks" | "challenge_breaks";
+
 interface Block {
   id: number;
   name: string;
   domains: string[];
   apps: AppMatcher[];
   allowance_secs_per_day: number;
+  lock: LockMode;
 }
 
 interface AllowanceLedger {
@@ -27,6 +33,10 @@ interface ActiveBlock {
   ends_at_unix: number;
   originator: Originator;
   break_until_unix: number | null;
+  /// The lock mode SNAPSHOTTED at activation — not `block.lock`, which is the
+  /// (editable) saved config. This is the one the daemon enforces, so it is
+  /// the one the break UI must branch on.
+  lock: LockMode;
 }
 
 interface Status {
@@ -63,6 +73,7 @@ tabs.forEach((btn) => {
     document.querySelectorAll<HTMLElement>("section.tab").forEach((s) => {
       s.classList.toggle("active", s.id === target);
     });
+    if (target === "new") refreshLockWarning();
     if (target === "list") refreshList();
     if (target === "status") refreshStatus();
     if (target === "schedules") refreshSchedules();
@@ -85,6 +96,33 @@ function parseAppLines(raw: string): AppMatcher[] {
 
 const newForm = document.querySelector<HTMLFormElement>("#new-block-form")!;
 const newMsg = document.querySelector<HTMLParagraphElement>("#new-block-msg")!;
+const lockSelect = newForm.querySelector<HTMLSelectElement>('select[name="lock"]')!;
+const lockWarn = document.querySelector<HTMLParagraphElement>("#lock-warn")!;
+
+/// Non-blocking warning for "password-locked breaks with no settings password":
+/// a lock with no key. The daemon accepts the SAVE (it only refuses the BREAK
+/// later, with "password-locked breaks need a settings password"), so this is
+/// deliberately advice, not validation — it never blocks submission.
+///
+/// The premium gate itself is NOT duplicated here: the daemon is the authority
+/// on what a license permits, and its refusal renders in #new-block-msg.
+async function refreshLockWarning() {
+  if (lockSelect.value !== "password_breaks") {
+    lockWarn.hidden = true;
+    return;
+  }
+  try {
+    const s = await invoke<Status>("get_status");
+    lockWarn.hidden = s.password_set;
+    lockWarn.textContent =
+      "No settings password is set — set one in Settings first, or this lock has no key and every break on this block will simply be refused.";
+  } catch {
+    // Status unreadable: say nothing rather than warn on a guess.
+    lockWarn.hidden = true;
+  }
+}
+lockSelect.addEventListener("change", refreshLockWarning);
+
 newForm.addEventListener("submit", async (ev) => {
   ev.preventDefault();
   newMsg.classList.remove("error");
@@ -99,6 +137,7 @@ newForm.addEventListener("submit", async (ev) => {
       .filter(Boolean),
     apps: parseAppLines(String(fd.get("apps") ?? "")),
     allowance_secs_per_day: Math.max(0, Math.floor(Number(fd.get("allowance_minutes") ?? 0))) * 60,
+    lock: String(fd.get("lock") ?? "normal") as LockMode,
   };
   if (!block.name) {
     newMsg.classList.add("error");
@@ -110,6 +149,7 @@ newForm.addEventListener("submit", async (ev) => {
     const id = await invoke<number>("add_block", { block });
     newMsg.textContent = `saved (id ${id})`;
     newForm.reset();
+    refreshLockWarning();
   } catch (e) {
     newMsg.classList.add("error");
     newMsg.textContent = String(e);
@@ -138,6 +178,16 @@ async function refreshList() {
   }
 }
 
+/// Lock-mode suffix for a block's one-line summary. Shown whenever the mode is
+/// premium, allowance or not: it is part of the saved config, and a block with
+/// a lock but no allowance (breaks disabled outright) is worth seeing as-is
+/// rather than silently hiding one half of it.
+const LOCK_NOTE: Record<LockMode, string> = {
+  normal: "",
+  password_breaks: " · password-locked breaks",
+  challenge_breaks: " · challenge-locked breaks",
+};
+
 function renderBlockCard(b: Block): HTMLLIElement {
   const li = document.createElement("li");
   li.className = "block-card";
@@ -159,7 +209,7 @@ function renderBlockCard(b: Block): HTMLLIElement {
   const allowanceNote =
     b.allowance_secs_per_day > 0 ? ` · break allowance ${Math.floor(b.allowance_secs_per_day / 60)} min/day` : "";
   li.querySelector(".meta")!.textContent =
-    `${b.domains.length} domain(s), ${b.apps.length} app(s)${allowanceNote} — ${[...b.domains, ...apps].join(", ") || "(empty)"}`;
+    `${b.domains.length} domain(s), ${b.apps.length} app(s)${allowanceNote}${LOCK_NOTE[b.lock]} — ${[...b.domains, ...apps].join(", ") || "(empty)"}`;
   const dur = li.querySelector<HTMLInputElement>(".duration")!;
   li.querySelector<HTMLButtonElement>(".start-btn")!.addEventListener("click", async () => {
     const minutes = Math.max(1, parseInt(dur.value, 10) || 30);
@@ -196,9 +246,19 @@ let breakRequestInFlight = false;
 
 /// True while re-rendering the status list would yank the DOM out from under
 /// the user: a take-break request is in flight (a re-render would produce a
-/// fresh, enabled button mid-request) or they are typing in a status input.
+/// fresh, enabled button mid-request), a break dialog is open, or they are
+/// typing in a status input.
+///
+/// The dialog checks are what make the locked break flows survive the 5s poll.
+/// Both flows suspend on a modal — the unlock dialog for `password_breaks`, the
+/// challenge dialog for `challenge_breaks` — and both hold a closure over the
+/// break row's button and error span. A poll landing mid-dialog would rebuild
+/// the row, detaching those elements: the request would still be sent, but its
+/// outcome would be written into an orphaned DOM node and the user would see
+/// nothing happen. So while either dialog is open, the list holds still.
 function statusInteractionBusy(): boolean {
   if (breakRequestInFlight) return true;
+  if (unlockDialog.open || challengeDialog.open) return true;
   const el = document.activeElement;
   return el instanceof HTMLInputElement && statusEl.contains(el);
 }
@@ -289,6 +349,23 @@ function renderActive(s: Status) {
         const btn = row.querySelector<HTMLButtonElement>(".break-btn")!;
         const input = row.querySelector<HTMLInputElement>(".break-min")!;
         const left = row.querySelector<HTMLSpanElement>(".break-left")!;
+
+        // Branch on the ACTIVE record's lock snapshot (`a.lock`), never on
+        // `a.block.lock`: the snapshot is what the daemon's break_gate
+        // enforces, and a mid-block edit must not soften a running block.
+        if (a.lock !== "normal") {
+          const badge = document.createElement("span");
+          badge.className = "break-lock";
+          badge.textContent =
+            a.lock === "password_breaks" ? "password required" : "challenge required";
+          // Before the button, so the cost of the break is visible before it
+          // is clicked rather than sprung on the user afterwards.
+          row.insertBefore(badge, btn);
+          if (a.lock === "challenge_breaks") {
+            btn.textContent = "Take a break…"; // ellipsis: a dialog follows
+          }
+        }
+
         if (remainingMin <= 0) {
           btn.disabled = true;
           input.disabled = true;
@@ -298,13 +375,34 @@ function renderActive(s: Status) {
         }
         btn.addEventListener("click", async () => {
           const minutes = Math.max(1, parseInt(input.value, 10) || 1);
+          const secs = minutes * 60;
+
+          // Challenge-locked: the whole exchange happens in the dialog, which
+          // sends its own take_break with the typed response.
+          if (a.lock === "challenge_breaks") {
+            void openChallengeDialog(a.block.id, secs);
+            return;
+          }
+
           btn.disabled = true;
+          // Held across the unlock dialog too, so the poll cannot rebuild this
+          // row while the user is typing their password into it.
           breakRequestInFlight = true;
           let ok = false;
           try {
-            await invoke("take_break", { blockId: a.block.id, secs: minutes * 60 });
+            // Password-locked: the daemon requires an ACTIVE unlock window and
+            // answers MSG_SETTINGS_LOCKED without one, so open the existing
+            // settings-unlock dialog first. Cancelling aborts silently — the
+            // user changed their mind, that is not an error.
+            if (a.lock === "password_breaks" && !(await ensureUnlocked())) {
+              btn.disabled = false;
+              return;
+            }
+            await invoke("take_break", { blockId: a.block.id, secs });
             ok = true;
           } catch (e) {
+            // Includes the daemon's own refusals — e.g. password-locked breaks
+            // on a block with no settings password set. Its verdict, verbatim.
             left.textContent = String(e);
             btn.disabled = false;
           } finally {
@@ -351,6 +449,120 @@ function tickCountdowns() {
 
   if (allDone) setTimeout(refreshStatus, 500);
 }
+
+// ─── Challenge-locked breaks ───────────────────────────────────────────────
+
+const challengeDialog = document.querySelector<HTMLDialogElement>("#challenge-dialog")!;
+const challengeForm = document.querySelector<HTMLFormElement>("#challenge-form")!;
+const challengeTextEl = document.querySelector<HTMLDivElement>("#challenge-text")!;
+const challengeInput = document.querySelector<HTMLInputElement>("#challenge-input")!;
+const challengeSubmit = document.querySelector<HTMLButtonElement>("#challenge-submit")!;
+const challengeNew = document.querySelector<HTMLButtonElement>("#challenge-new")!;
+const challengeCancel = document.querySelector<HTMLButtonElement>("#challenge-cancel")!;
+const challengeMsg = document.querySelector<HTMLParagraphElement>("#challenge-msg")!;
+
+/// The break the open dialog is negotiating. `null` when it is closed.
+let challengeCtx: { blockId: number; secs: number } | null = null;
+/// Length of the challenge currently displayed; 0 when none is loaded. Used
+/// ONLY to gate the Confirm button (see the input listener).
+let challengeLen = 0;
+
+/// The friction IS the typing. Copy-paste would hand it straight back, so the
+/// challenge text is unselectable (`user-select: none`, see style.css) and
+/// paste/drop into the response field is refused here.
+///
+/// Honest about what this is: friction, not security. A determined user can
+/// still read the challenge off the socket and script the reply — the same way
+/// they could just stop the daemon as root. Defeating a user who is actively
+/// engineering their way around their own commitment device is not the threat
+/// model; the akrasia of the moment is.
+for (const evName of ["paste", "drop"] as const) {
+  challengeInput.addEventListener(evName, (ev) => ev.preventDefault());
+}
+
+/// Fetch a fresh challenge from the daemon and display it. Each call replaces
+/// any previous one: the daemon only ever honours the most recently issued
+/// string, so the UI must never show a stale one.
+async function loadChallenge() {
+  if (!challengeCtx) return;
+  challengeSubmit.disabled = true;
+  challengeLen = 0;
+  challengeInput.value = "";
+  challengeTextEl.textContent = "";
+  challengeMsg.classList.remove("error");
+  challengeMsg.textContent = "requesting a challenge…";
+  try {
+    const text = await invoke<string>("get_break_challenge", { blockId: challengeCtx.blockId });
+    challengeTextEl.textContent = text;
+    challengeLen = text.length;
+    challengeMsg.textContent = "";
+    challengeInput.focus();
+  } catch (e) {
+    challengeMsg.classList.add("error");
+    challengeMsg.textContent = String(e);
+  }
+}
+
+async function openChallengeDialog(blockId: number, secs: number) {
+  challengeCtx = { blockId, secs };
+  challengeMsg.classList.remove("error");
+  challengeMsg.textContent = "";
+  challengeDialog.showModal();
+  await loadChallenge();
+}
+
+function closeChallengeDialog() {
+  if (challengeDialog.open) challengeDialog.close();
+  challengeCtx = null;
+  challengeLen = 0;
+  challengeInput.value = "";
+  challengeTextEl.textContent = "";
+}
+
+/// Length-only feedback: enough to catch a half-typed response, while the
+/// VERDICT stays with the daemon. It issued the string and it verifies it —
+/// checking correctness here would put the answer in the (spoofable) frontend
+/// and teach the user to trust a check that is not the one being enforced.
+challengeInput.addEventListener("input", () => {
+  challengeSubmit.disabled = challengeLen === 0 || challengeInput.value.trim().length !== challengeLen;
+});
+
+challengeForm.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  if (!challengeCtx) return;
+  const { blockId, secs } = challengeCtx;
+  challengeMsg.classList.remove("error");
+  challengeMsg.textContent = "";
+  challengeSubmit.disabled = true;
+  breakRequestInFlight = true;
+  let ok = false;
+  try {
+    await invoke("take_break", { blockId, secs, challenge: challengeInput.value });
+    ok = true;
+  } catch (e) {
+    // A mismatch lands here. The daemon does NOT retire a challenge it
+    // rejected — only a matched one is consumed — so the displayed string is
+    // still live and retyping it is a valid retry. "New challenge" is there
+    // for the user who would rather start over.
+    challengeMsg.classList.add("error");
+    challengeMsg.textContent = String(e);
+    challengeSubmit.disabled = false;
+  } finally {
+    breakRequestInFlight = false;
+  }
+  if (ok) {
+    closeChallengeDialog();
+    refreshStatus();
+  }
+});
+
+challengeNew.addEventListener("click", () => void loadChallenge());
+challengeCancel.addEventListener("click", closeChallengeDialog);
+// Esc-dismissal → cancel, same as the unlock dialog.
+challengeDialog.addEventListener("cancel", (ev) => {
+  ev.preventDefault();
+  closeChallengeDialog();
+});
 
 // ─── Schedules ─────────────────────────────────────────────────────────────
 
