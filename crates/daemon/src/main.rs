@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod auth;
 mod cleanup;
@@ -24,6 +24,7 @@ mod procwatch;
 mod scheduler;
 mod state;
 
+use grepfocus_core::license::LicenseClaims;
 use grepfocus_core::{now_unix, State};
 
 /// Runtime context shared across all daemon tasks.
@@ -40,6 +41,18 @@ pub struct Daemon {
     /// `None` means unknown/dirty — the next `enforce::sync` re-applies
     /// unconditionally. See `enforce::sync`.
     pub applied: Mutex<Option<enforce::Applied>>,
+    /// Claims from the verified `state.license_token`, or `None` when
+    /// unlicensed or the stored token failed verification. Derived and
+    /// in-memory only — rebuilt at startup and on `SetLicense`.
+    pub license: Mutex<Option<LicenseClaims>>,
+}
+
+/// Wall-clock "now" (unix seconds) for license checks, clamped so a rewound
+/// system clock can never travel back before the highest time this daemon has
+/// observed (`state.high_water_unix`, bumped by the scheduler tick). Without
+/// the clamp, setting the clock to 1999 would resurrect any expired trial.
+pub fn effective_now(state: &State) -> i64 {
+    (now_unix() as i64).max(state.high_water_unix as i64)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -118,9 +131,35 @@ async fn run_daemon() -> anyhow::Result<()> {
         }
     };
 
+    // Advance the clock-rollback high-water mark once at startup; the
+    // scheduler tick keeps it moving from here. If the stored mark is ahead
+    // of the system clock (rolled back while we were down), keep the mark.
+    let now = now_unix();
+    if now > initial.high_water_unix {
+        initial.high_water_unix = now;
+    }
+
+    // Verify any stored license token. Failure is never fatal and never
+    // strips the token from state: an expired/invalid token stays stored so
+    // GetStatus can report "present but invalid" — we just run unlicensed.
+    let license = match &initial.license_token {
+        None => None,
+        Some(token) => {
+            match grepfocus_core::license::verify_token(token, effective_now(&initial)) {
+                Ok(claims) => {
+                    info!(kind = %claims.kind, "stored license verified");
+                    Some(claims)
+                }
+                Err(err) => {
+                    warn!(%err, "stored license token failed verification — running unlicensed");
+                    None
+                }
+            }
+        }
+    };
+
     // Drop any active blocks that have already expired between shutdown and
     // startup. (They will simply never be re-applied.)
-    let now = now_unix();
     let before = initial.active.len();
     initial.active.retain(|a| a.ends_at_unix > now);
     let dropped = before - initial.active.len();
@@ -145,6 +184,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         key,
         unlocked_until: Mutex::new(0),
         applied: Mutex::new(None),
+        license: Mutex::new(license),
     });
 
     // Re-apply the union of all still-active blocks before accepting clients.
@@ -165,4 +205,30 @@ async fn run_daemon() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_now_follows_clock_when_high_water_is_behind() {
+        let st = State::default(); // high_water_unix == 0
+        let before = now_unix() as i64;
+        let eff = effective_now(&st);
+        let after = now_unix() as i64;
+        assert!((before..=after).contains(&eff));
+    }
+
+    #[test]
+    fn effective_now_clamps_to_high_water_on_clock_rollback() {
+        // A high-water mark ahead of the system clock is exactly what a
+        // rewound clock looks like: effective time must not travel back.
+        let hw = 4_102_444_800; // 2100-01-01, safely ahead of any test run
+        let st = State {
+            high_water_unix: hw,
+            ..Default::default()
+        };
+        assert_eq!(effective_now(&st), hw as i64);
+    }
 }

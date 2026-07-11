@@ -110,6 +110,17 @@ pub struct State {
     /// Break-allowance consumption per block per local day.
     #[serde(default)]
     pub allowance: Vec<AllowanceLedger>,
+    /// Signed license token exactly as issued by the store, or `None` when
+    /// unlicensed. Verified before being stored and again at startup; a token
+    /// that no longer verifies (e.g. an expired trial) is kept on disk so
+    /// status can report "present but invalid" rather than silently vanishing.
+    #[serde(default)]
+    pub license_token: Option<String>,
+    /// Highest unix time this daemon has ever observed — the clock-rollback
+    /// guard for license expiry (see the daemon's `effective_now`). Persisted
+    /// opportunistically whenever any other change saves.
+    #[serde(default)]
+    pub high_water_unix: u64,
 }
 
 fn deserialize_active<'de, D>(d: D) -> Result<Vec<ActiveBlock>, D::Error>

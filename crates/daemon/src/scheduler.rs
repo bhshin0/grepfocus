@@ -38,6 +38,16 @@ async fn tick(daemon: &Arc<Daemon>) {
 
     {
         let mut st = daemon.state.lock().await;
+        // Track the highest time ever observed (clock-rollback guard for
+        // license expiry — see `crate::effective_now`). Deliberately bumped
+        // in-memory only: an fsync every second is unacceptable disk churn,
+        // so the mark persists opportunistically whenever anything else
+        // saves. Accepted trade-off: after a crash the stored mark lags by
+        // however long the state went unsaved, so a rollback attacker gains
+        // at most that window.
+        if now_unix > st.high_water_unix {
+            st.high_water_unix = now_unix;
+        }
         if reconcile(&mut st, now_unix, &now_local, today) {
             if let Err(e) = state::save(&st, &daemon.key) {
                 error!(?e, "scheduler save failed");
