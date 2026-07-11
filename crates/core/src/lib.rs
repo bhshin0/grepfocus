@@ -184,6 +184,13 @@ pub enum Request {
         old: Option<String>,
         new: Option<String>,
     },
+    /// Install (`Some`) or clear (`None`) the license token. The token is
+    /// verified before being stored; an invalid token is rejected and
+    /// nothing changes. Subject to the same password/unlock gate as other
+    /// configuration changes.
+    SetLicense {
+        token: Option<String>,
+    },
     /// Open a time-limited unlock window so configuration changes are allowed.
     Unlock {
         password: String,
@@ -211,6 +218,31 @@ pub enum Response {
         /// client can show remaining allowance per block.
         #[serde(default)]
         allowance_used: Vec<AllowanceLedger>,
+        /// Whether a license token is stored — even one that is currently
+        /// invalid or expired (`license_present && !license_valid` is how
+        /// the GUI can tell "trial expired" from "never licensed").
+        #[serde(default)]
+        license_present: bool,
+        /// Whether the stored license verified and is unexpired as of this
+        /// status (expiry is re-checked at status time, so a trial that
+        /// lapses while the daemon runs flips to invalid without a restart).
+        #[serde(default)]
+        license_valid: bool,
+        /// License kind (currently "perpetual" or "trial") from the cached
+        /// claims, reported even when the license has expired.
+        #[serde(default)]
+        license_kind: Option<String>,
+        /// Purchaser email from the cached claims.
+        #[serde(default)]
+        license_email: Option<String>,
+        /// Unix seconds; `None` for perpetual licenses or when no claims are
+        /// cached. Reported even when expired so the GUI can show since when.
+        #[serde(default)]
+        license_expires_at: Option<i64>,
+        /// Feature keys the license grants (see `license::features`). Only
+        /// populated while the license is valid — this drives gating display.
+        #[serde(default)]
+        licensed_features: Vec<String>,
     },
     Added {
         id: u64,
@@ -244,4 +276,67 @@ pub const DAYS_ALL: u8 = 0b0111_1111;
 /// True if `days` includes weekday `n` (0=Sun..6=Sat).
 pub fn day_set(days: u8, n: u8) -> bool {
     n < 7 && (days & (1 << n)) != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Old daemon → new GUI: a Status frame WITHOUT the license fields (what
+    // a pre-license daemon emits) must still deserialize; the new fields
+    // fall back to their defaults.
+    #[test]
+    fn status_without_license_fields_still_deserializes() {
+        let old = r#"{
+            "result": "status",
+            "active": [],
+            "now_unix": 1752192000,
+            "password_set": true,
+            "unlocked": false,
+            "allowance_used": []
+        }"#;
+        let resp: Response = serde_json::from_str(old).unwrap();
+        match resp {
+            Response::Status {
+                now_unix,
+                password_set,
+                license_present,
+                license_valid,
+                license_kind,
+                license_email,
+                license_expires_at,
+                licensed_features,
+                ..
+            } => {
+                assert_eq!(now_unix, 1752192000);
+                assert!(password_set);
+                assert!(!license_present);
+                assert!(!license_valid);
+                assert_eq!(license_kind, None);
+                assert_eq!(license_email, None);
+                assert_eq!(license_expires_at, None);
+                assert!(licensed_features.is_empty());
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    // Pin the wire name: `#[serde(tag = "method", rename_all = "snake_case")]`
+    // must turn SetLicense into "set_license", for both install and clear.
+    #[test]
+    fn set_license_wire_tag_round_trips() {
+        let req: Request =
+            serde_json::from_str(r#"{"method":"set_license","token":"payload.sig"}"#).unwrap();
+        assert!(matches!(
+            req,
+            Request::SetLicense { token: Some(ref t) } if t == "payload.sig"
+        ));
+
+        let req: Request =
+            serde_json::from_str(r#"{"method":"set_license","token":null}"#).unwrap();
+        assert!(matches!(req, Request::SetLicense { token: None }));
+
+        let json = serde_json::to_string(&Request::SetLicense { token: None }).unwrap();
+        assert!(json.contains(r#""method":"set_license""#), "got {json}");
+    }
 }

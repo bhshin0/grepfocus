@@ -7,6 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use anyhow::Context;
+use grepfocus_core::license::{self, LicenseClaims};
 use grepfocus_core::{
     now_unix, ActiveBlock, AllowanceLedger, Originator, Request, Response, Schedule, State,
 };
@@ -14,7 +15,7 @@ use nix::unistd::Group;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{error, info, warn};
 
-use crate::{auth, enforce, paths, scheduler, state, Daemon};
+use crate::{auth, effective_now, enforce, paths, scheduler, state, Daemon};
 
 /// How long an `Unlock` keeps configuration changes permitted.
 const UNLOCK_SECS: u64 = 300;
@@ -106,12 +107,25 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 .filter(|l| l.day == today && active_ids.contains(&l.block_id))
                 .cloned()
                 .collect();
+            let cached = daemon.license.lock().await;
+            let lic = license_status_fields(
+                cached.as_ref(),
+                st.license_token.is_some(),
+                effective_now(&st),
+            );
+            drop(cached);
             Response::Status {
                 active: st.active.clone(),
                 now_unix: now,
                 password_set,
                 unlocked,
                 allowance_used,
+                license_present: lic.present,
+                license_valid: lic.valid,
+                license_kind: lic.kind,
+                license_email: lic.email,
+                license_expires_at: lic.expires_at,
+                licensed_features: lic.features,
             }
         }
 
@@ -442,6 +456,36 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             info!(cleared, "settings password updated");
             Response::Ok {}
         }
+
+        Request::SetLicense { token } => {
+            let mut st = daemon.state.lock().await;
+            // Gate FIRST, exactly like SetPassword: installing AND clearing a
+            // license obey the password/unlock discipline. Without this,
+            // clearing the license mid-block would be a self-service
+            // downgrade lever — drop back to the free tier to loosen the
+            // very limits the user password-locked themselves into.
+            if let Some(resp) = gate_config(daemon, &st).await {
+                return resp;
+            }
+            // Verify BEFORE storing: an unverifiable token is rejected
+            // outright and nothing changes.
+            let new_claims = match &token {
+                Some(t) => match license::verify_token(t, effective_now(&st)) {
+                    Ok(claims) => Some(claims),
+                    Err(e) => return err(e.to_string()),
+                },
+                None => None,
+            };
+            let installed = new_claims.is_some();
+            let prev = std::mem::replace(&mut st.license_token, token);
+            if let Err(e) = state::save(&st, &daemon.key) {
+                st.license_token = prev;
+                return err(format!("save failed: {e}"));
+            }
+            *daemon.license.lock().await = new_claims;
+            info!(installed, "license updated");
+            Response::Ok {}
+        }
     }
 }
 
@@ -461,6 +505,46 @@ async fn gate_config(daemon: &Arc<Daemon>, st: &State) -> Option<Response> {
 fn err(message: impl Into<String>) -> Response {
     Response::Error {
         message: message.into(),
+    }
+}
+
+/// The license-related fields of a `Status` response. Mirrors the
+/// `license_*` fields on `Response::Status`; kept as a named struct so the
+/// derivation below stays a pure, unit-testable function.
+struct LicenseStatus {
+    present: bool,
+    valid: bool,
+    kind: Option<String>,
+    email: Option<String>,
+    expires_at: Option<i64>,
+    features: Vec<String>,
+}
+
+/// Derive the license fields for a `Status` response from the daemon's
+/// cached claims (verified at startup or `SetLicense`).
+///
+/// Validity re-checks expiry against `now` (the caller passes
+/// `effective_now`), so a trial that lapses while the daemon is running
+/// reports invalid without a restart. `kind`/`email`/`expires_at` are
+/// reported whenever claims exist — even expired — so the GUI can render
+/// "trial expired" from `present && !valid` plus `expires_at`. `features`
+/// is only populated while valid: it drives gating display.
+fn license_status_fields(
+    claims: Option<&LicenseClaims>,
+    token_present: bool,
+    now: i64,
+) -> LicenseStatus {
+    let valid = claims.is_some_and(|c| c.expires_at.is_none_or(|t| t >= now));
+    LicenseStatus {
+        present: token_present,
+        valid,
+        kind: claims.map(|c| c.kind.clone()),
+        email: claims.map(|c| c.email.clone()),
+        expires_at: claims.and_then(|c| c.expires_at),
+        features: match claims {
+            Some(c) if valid => c.features.clone(),
+            _ => Vec::new(),
+        },
     }
 }
 
@@ -626,6 +710,165 @@ mod tests {
         record_break(&mut ledger, 7, 42, 30);
         assert_eq!(ledger.len(), 1);
         assert_eq!(ledger[0].used_secs, 90);
+    }
+
+    // ── license_status_fields() ─────────────────────────────────────────────
+
+    fn claims(kind: &str, expires_at: Option<i64>) -> LicenseClaims {
+        LicenseClaims {
+            license_id: "GF-TEST-0001".into(),
+            email: "kat@example.com".into(),
+            tier: "premium".into(),
+            kind: kind.into(),
+            features: license::features::ALL
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            issued_at: 1_752_192_000,
+            expires_at,
+            max_devices: 3,
+        }
+    }
+
+    #[test]
+    fn status_fields_unlicensed() {
+        let s = license_status_fields(None, false, 1_752_192_000);
+        assert!(!s.present);
+        assert!(!s.valid);
+        assert_eq!(s.kind, None);
+        assert_eq!(s.email, None);
+        assert_eq!(s.expires_at, None);
+        assert!(s.features.is_empty());
+    }
+
+    #[test]
+    fn status_fields_token_present_but_unverified() {
+        // A stored token that failed startup verification: present, but no
+        // cached claims → invalid with no metadata to report.
+        let s = license_status_fields(None, true, 1_752_192_000);
+        assert!(s.present);
+        assert!(!s.valid);
+        assert_eq!(s.kind, None);
+        assert!(s.features.is_empty());
+    }
+
+    #[test]
+    fn status_fields_valid_perpetual() {
+        let c = claims("perpetual", None);
+        // Perpetual: valid at any clock value.
+        for now in [i64::MIN, 0, 4_102_444_800, i64::MAX] {
+            let s = license_status_fields(Some(&c), true, now);
+            assert!(s.present);
+            assert!(s.valid);
+            assert_eq!(s.kind.as_deref(), Some("perpetual"));
+            assert_eq!(s.email.as_deref(), Some("kat@example.com"));
+            assert_eq!(s.expires_at, None);
+            assert_eq!(s.features, license::features::ALL);
+        }
+    }
+
+    #[test]
+    fn status_fields_valid_trial_before_expiry() {
+        let c = claims("trial", Some(2_000));
+        let s = license_status_fields(Some(&c), true, 1_000);
+        assert!(s.valid);
+        assert_eq!(s.kind.as_deref(), Some("trial"));
+        assert_eq!(s.expires_at, Some(2_000));
+        assert_eq!(s.features, license::features::ALL);
+        // Frozen boundary rule: expires_at == now is still valid.
+        assert!(license_status_fields(Some(&c), true, 2_000).valid);
+    }
+
+    #[test]
+    fn status_fields_trial_expired_at_status_time() {
+        // The claims verified fine when cached, but the trial has since
+        // lapsed: status must flip to invalid without a daemon restart,
+        // while still reporting present + kind + expires_at so the GUI can
+        // say "trial expired". Features are withheld — they drive gating.
+        let c = claims("trial", Some(2_000));
+        let s = license_status_fields(Some(&c), true, 2_001);
+        assert!(s.present);
+        assert!(!s.valid);
+        assert_eq!(s.kind.as_deref(), Some("trial"));
+        assert_eq!(s.email.as_deref(), Some("kat@example.com"));
+        assert_eq!(s.expires_at, Some(2_000));
+        assert!(s.features.is_empty());
+    }
+
+    // ── SetLicense dispatch arm ─────────────────────────────────────────────
+
+    fn test_daemon() -> Arc<Daemon> {
+        Arc::new(Daemon {
+            state: tokio::sync::Mutex::new(State::default()),
+            key: b"ipc-test-key-0123456789abcdef012".to_vec(),
+            unlocked_until: tokio::sync::Mutex::new(0),
+            applied: tokio::sync::Mutex::new(None),
+            license: tokio::sync::Mutex::new(None),
+        })
+    }
+
+    /// The KAT fixture minted by the real web-side signer (see
+    /// crates/core/tests/license_kat.rs for provenance/regeneration).
+    fn kat() -> serde_json::Value {
+        serde_json::from_str(include_str!("../../core/tests/fixtures/license_kat.json")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn set_license_verifies_before_storing() {
+        let daemon = test_daemon();
+        let fx = kat();
+        let token = fx["valid_perpetual"]["token"].as_str().unwrap();
+
+        // The token is genuine — it verifies under the KAT test key…
+        license::verify_token_with_key(fx["test_pubkey_b64url"].as_str().unwrap(), token, 0)
+            .expect("KAT token must verify under its own key");
+
+        // …but the arm verifies against the EMBEDDED production key (filled
+        // at the 2026-07-11 ceremony), so a token signed by the throwaway
+        // test key is rejected as BadSignature — proving the
+        // verify-before-store order: nothing may be persisted or cached on
+        // any verification failure. A happy-path arm test would need a token
+        // minted by the production private key, which is vaulted with the
+        // store and rightly unavailable here; the valid path is covered by
+        // the core KATs (verify_token_with_key) plus the pure
+        // license_status_fields tests above.
+        let resp = dispatch(
+            Request::SetLicense {
+                token: Some(token.to_string()),
+            },
+            &daemon,
+        )
+        .await;
+        match resp {
+            Response::Error { message } => {
+                assert_eq!(message, "license signature is invalid")
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert_eq!(
+            daemon.state.lock().await.license_token,
+            None,
+            "a rejected token must never be stored"
+        );
+        assert!(daemon.license.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_license_is_gated_by_the_settings_lock() {
+        // With a password set and no unlock window, SetLicense — including a
+        // CLEAR — must be refused before any verify/store work happens:
+        // clearing the license mid-block is a self-service downgrade lever.
+        let daemon = test_daemon();
+        daemon.state.lock().await.password_hash =
+            Some("$argon2id$v=19$m=19456,t=2,p=1$abc$def".to_string());
+        let resp = dispatch(Request::SetLicense { token: None }, &daemon).await;
+        match resp {
+            Response::Error { message } => assert!(
+                message.contains("locked"),
+                "expected the settings-lock error, got: {message}"
+            ),
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     #[test]

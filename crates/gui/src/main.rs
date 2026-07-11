@@ -66,6 +66,8 @@ async fn get_status() -> Result<StatusOut, String> {
             password_set,
             unlocked,
             allowance_used,
+            // license_* fields land in the GUI in the next milestone (B1.5).
+            ..
         } => Ok(StatusOut {
             active,
             now_unix,
