@@ -50,6 +50,12 @@ pub struct Daemon {
     /// only, deliberately: a daemon restart invalidating a pending challenge
     /// fails safe — the user just requests a new one.
     pub break_challenges: Mutex<std::collections::HashMap<u64, String>>,
+    /// Distinct app kills counted by procwatch since the last stats flush.
+    /// In-memory only — folded into today's `DayStat` opportunistically at the
+    /// next state save from the scheduler tick, exactly the `high_water_unix`
+    /// "accumulate in memory, persist when something else saves" pattern. No
+    /// fsync per kill; a crash loses at most the unflushed count.
+    pub app_kills_pending: std::sync::atomic::AtomicU64,
 }
 
 /// Wall-clock "now" (unix seconds) for license checks, clamped so a rewound
@@ -204,6 +210,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         applied: Mutex::new(None),
         license: Mutex::new(license),
         break_challenges: Mutex::new(std::collections::HashMap::new()),
+        app_kills_pending: std::sync::atomic::AtomicU64::new(0),
     });
 
     // Re-apply the union of all still-active blocks before accepting clients.

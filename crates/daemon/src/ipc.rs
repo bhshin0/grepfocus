@@ -31,6 +31,8 @@ const MSG_SCHEDULES: &str = "Schedules are a premium feature. \
      Enter a license key in Settings, or get one from the GrepFocus store.";
 const MSG_LOCK_MODES: &str = "Lock modes are a premium feature. \
      Enter a license key in Settings, or get one from the GrepFocus store.";
+const MSG_USAGE_STATS: &str = "Usage stats are a premium feature. \
+     Enter a license key in Settings, or get one from the GrepFocus store.";
 
 /// The settings-lock refusal, shared by `gate_config` and `break_gate`:
 /// password-locked breaks deliberately reuse the settings-unlock discipline
@@ -355,6 +357,19 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                         challenge.as_deref(),
                         pending.get(&block_id).map(String::as_str),
                     ) {
+                        // A refused break is a temptation the tool caught — a
+                        // strong akrasia signal worth recording. `msg` is a
+                        // 'static gate string (no borrow of `pending`), so we
+                        // can drop the lock and credit + persist here. Stats
+                        // bookkeeping must NEVER turn a correct refusal into an
+                        // error: if the save fails, log and still return the
+                        // refusal (the increment stays in memory and rides the
+                        // next save).
+                        drop(pending);
+                        st.stats.credit_break_refused(today);
+                        if let Err(e) = state::save(&st, &daemon.key) {
+                            warn!(?e, "failed to persist refused-break stat");
+                        }
                         return err(msg);
                     }
                     // A matched challenge is single-use: consume it so it can
@@ -386,6 +401,12 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                     a.break_until_unix = Some(now + grant);
                 }
                 record_break(&mut st.allowance, block_id, today, grant);
+                // Record the break in usage stats, riding this same save. Not
+                // rolled back if the save below fails: the phantom increment
+                // is bounded (per-day counters only, no enforcement effect)
+                // and a failed save is already a hard error surfaced to the
+                // user; keeping stats simple is worth that negligible skew.
+                st.stats.credit_break(today, grant);
 
                 if let Err(e) = state::save(&st, &daemon.key) {
                     for a in st.active.iter_mut().filter(|a| a.block.id == block_id) {
@@ -640,6 +661,33 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             *daemon.license.lock().await = new_claims;
             info!(installed, "license updated");
             Response::Ok {}
+        }
+
+        // Read the usage-stats payload. This is the ONLY gate — recording is
+        // always on, so a user who buys later still sees their prior history.
+        // Unlicensed callers get the feature message (the GUI hides the tab).
+        Request::GetUsageStats {} => {
+            let st = daemon.state.lock().await;
+            {
+                let lic = daemon.license.lock().await;
+                if !has_feature(lic.as_ref(), &st, license::features::USAGE_STATS) {
+                    return err(MSG_USAGE_STATS);
+                }
+            }
+            let today = scheduler::local_day();
+            let (current_streak, longest_streak) = st.stats.compute_streak(today);
+            // Last ~30 day rollups for the chart. `days` is sorted ascending,
+            // so the tail is the most recent window.
+            let start = st.stats.days.len().saturating_sub(30);
+            let days = st.stats.days[start..].to_vec();
+            Response::UsageStats {
+                totals: st.stats.totals.clone(),
+                // Already capped ~200 in storage — send the whole ring.
+                sessions: st.stats.sessions.clone(),
+                days,
+                current_streak,
+                longest_streak,
+            }
         }
     }
 }
@@ -1074,6 +1122,7 @@ mod tests {
             applied: tokio::sync::Mutex::new(None),
             license: tokio::sync::Mutex::new(None),
             break_challenges: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            app_kills_pending: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1900,5 +1949,79 @@ mod tests {
         // With nothing pending, even the just-used string is refused.
         let resp = dispatch(take_break(1, Some(&second)), &daemon).await;
         assert_eq!(err_msg(resp), MSG_BREAK_CHALLENGE_MISMATCH);
+    }
+
+    // ── usage stats (B2.b) ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_usage_stats_unlicensed_returns_feature_message() {
+        let daemon = test_daemon(); // no license cached
+        let resp = dispatch(Request::GetUsageStats {}, &daemon).await;
+        assert_eq!(err_msg(resp), MSG_USAGE_STATS);
+    }
+
+    #[tokio::test]
+    async fn get_usage_stats_licensed_returns_payload_with_computed_streak() {
+        let daemon = test_daemon();
+        *daemon.license.lock().await = Some(claims("perpetual", None));
+        {
+            let mut st = daemon.state.lock().await;
+            let today = scheduler::local_day();
+            // Two consecutive focused days ending today → current streak 2.
+            for day in [today - 1, today] {
+                st.stats.credit_session(
+                    grepfocus_core::FocusSession {
+                        block_id: 1,
+                        name: "reddit".into(),
+                        started_at_unix: 0,
+                        ended_at_unix: 0,
+                        origin: grepfocus_core::Origin::Manual,
+                        duration_secs: 300,
+                    },
+                    day,
+                );
+            }
+        }
+        let resp = dispatch(Request::GetUsageStats {}, &daemon).await;
+        match resp {
+            Response::UsageStats {
+                totals,
+                sessions,
+                days,
+                current_streak,
+                longest_streak,
+            } => {
+                assert_eq!(totals.sessions, 2);
+                assert_eq!(totals.focus_secs, 600);
+                assert_eq!(sessions.len(), 2);
+                assert_eq!(days.len(), 2);
+                assert_eq!(current_streak, 2);
+                assert_eq!(longest_streak, 2);
+            }
+            other => panic!("expected UsageStats, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_break_is_recorded_even_when_the_stat_save_fails() {
+        // PasswordBreaks with no password set → the break is refused. The
+        // refusal must be recorded (a temptation caught) AND the refusal
+        // message must still be returned — the save against the real state
+        // dir fails in tests, which must not change the outcome.
+        let daemon = test_daemon();
+        daemon
+            .state
+            .lock()
+            .await
+            .active
+            .push(active_with_lock(1, PasswordBreaks, 600));
+        let resp = dispatch(take_break(1, None), &daemon).await;
+        assert_eq!(err_msg(resp), MSG_BREAK_NEEDS_PASSWORD);
+        let st = daemon.state.lock().await;
+        assert_eq!(st.stats.totals.breaks_refused, 1);
+        assert_eq!(st.stats.days.len(), 1);
+        assert_eq!(st.stats.days[0].breaks_refused, 1);
+        // A refusal is never a break taken, and never opens one.
+        assert!(st.active[0].break_until_unix.is_none());
     }
 }

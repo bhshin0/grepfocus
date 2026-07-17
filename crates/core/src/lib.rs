@@ -133,6 +133,231 @@ pub struct Schedule {
     pub enabled: bool,
 }
 
+/// How a completed focus session was started. Mirrors [`Originator`]'s
+/// Manual/Schedule distinction, but WITHOUT the `schedule_id` payload: the
+/// stats record only needs to say "the user chose this" vs "a schedule fired
+/// it", never which schedule (that row may be long deleted by the time the
+/// history is read).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// Started by an explicit `start_block` IPC call.
+    #[default]
+    Manual,
+    /// Started by the recurring-schedule engine.
+    Schedule,
+}
+
+impl From<&Originator> for Origin {
+    fn from(o: &Originator) -> Self {
+        match o {
+            Originator::Manual => Origin::Manual,
+            Originator::Schedule { .. } => Origin::Schedule,
+        }
+    }
+}
+
+/// One completed focus block: recorded at END (the single choke point is the
+/// scheduler's reconcile drop — see the daemon), never at start. `duration_secs`
+/// is derived once, at record time, from `ended_at_unix - started_at_unix`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FocusSession {
+    pub block_id: u64,
+    pub name: String,
+    pub started_at_unix: u64,
+    pub ended_at_unix: u64,
+    pub origin: Origin,
+    pub duration_secs: u64,
+}
+
+/// Per-local-day rollup — the streak and per-day-chart source. `day` is
+/// `num_days_from_ce` in local time, the SAME unit as the allowance ledger's
+/// `day`, so both reset at local midnight together.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DayStat {
+    pub day: i64,
+    /// Summed completed-session duration credited to this day.
+    pub focus_secs: u64,
+    pub sessions_completed: u32,
+    pub breaks_taken: u32,
+    pub break_secs: u64,
+    pub breaks_refused: u32,
+    pub app_kills: u32,
+}
+
+/// Lifetime running counters — cheap, never pruned (unlike `days`/`sessions`,
+/// which are bounded by retention). Only the totals the GUI headlines carry a
+/// lifetime figure; per-day-only counters (breaks taken, break seconds) live
+/// solely on [`DayStat`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LifetimeTotals {
+    pub focus_secs: u64,
+    pub sessions: u64,
+    pub app_kills: u64,
+    pub breaks_refused: u64,
+}
+
+/// Bounded, self-pruning record of the user's focus habit. Lives inside
+/// [`State`] (integrity-protected by the same HMAC state file — no second
+/// file, no new migration surface) and is bounded by construction: every
+/// credit enforces the `sessions` ring cap and the `days` retention window,
+/// so the blob can never grow without limit.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct UsageStats {
+    /// Capped ring of completed focus sessions, newest last. Drop-oldest at
+    /// [`UsageStats::SESSIONS_CAP`].
+    pub sessions: Vec<FocusSession>,
+    /// Per-local-day rollups, kept sorted ascending by `day` and retained to
+    /// the last [`UsageStats::DAYS_RETAINED`] days (drop-oldest).
+    pub days: Vec<DayStat>,
+    /// Lifetime totals — running counters, never pruned.
+    pub totals: LifetimeTotals,
+}
+
+impl UsageStats {
+    /// Most recent focus sessions kept; older ones drop off the front.
+    pub const SESSIONS_CAP: usize = 200;
+    /// Most recent day rollups kept; older ones drop off the front.
+    pub const DAYS_RETAINED: usize = 365;
+
+    /// Find (or insert, keeping `days` sorted ascending) the rollup row for
+    /// `day`. Callers must run [`UsageStats::enforce_day_retention`] after any
+    /// insert so the window stays bounded.
+    fn day_entry(&mut self, day: i64) -> &mut DayStat {
+        match self.days.binary_search_by_key(&day, |d| d.day) {
+            Ok(i) => &mut self.days[i],
+            Err(i) => {
+                self.days.insert(
+                    i,
+                    DayStat {
+                        day,
+                        ..Default::default()
+                    },
+                );
+                &mut self.days[i]
+            }
+        }
+    }
+
+    /// Drop the oldest day rows once the retention window is exceeded. `days`
+    /// is sorted ascending, so the oldest are at the front.
+    fn enforce_day_retention(&mut self) {
+        if self.days.len() > Self::DAYS_RETAINED {
+            let overflow = self.days.len() - Self::DAYS_RETAINED;
+            self.days.drain(0..overflow);
+        }
+    }
+
+    /// Record a completed focus session: append it (ring-capped), credit its
+    /// day's `focus_secs`/`sessions_completed`, and bump lifetime totals. The
+    /// day is passed in (the local day of `ended_at_unix`) so this stays
+    /// clock-free — the caller computes it, exactly as `reconcile` receives
+    /// `today`.
+    pub fn credit_session(&mut self, session: FocusSession, day: i64) {
+        let dur = session.duration_secs;
+        self.totals.focus_secs = self.totals.focus_secs.saturating_add(dur);
+        self.totals.sessions = self.totals.sessions.saturating_add(1);
+        {
+            let d = self.day_entry(day);
+            d.focus_secs = d.focus_secs.saturating_add(dur);
+            d.sessions_completed = d.sessions_completed.saturating_add(1);
+        }
+        self.enforce_day_retention();
+        self.sessions.push(session);
+        if self.sessions.len() > Self::SESSIONS_CAP {
+            let overflow = self.sessions.len() - Self::SESSIONS_CAP;
+            self.sessions.drain(0..overflow);
+        }
+    }
+
+    /// Credit a break taken (count + seconds) to `day`. No lifetime counter —
+    /// breaks taken are a per-day-only figure.
+    pub fn credit_break(&mut self, day: i64, secs: u64) {
+        let d = self.day_entry(day);
+        d.breaks_taken = d.breaks_taken.saturating_add(1);
+        d.break_secs = d.break_secs.saturating_add(secs);
+        self.enforce_day_retention();
+    }
+
+    /// Credit a refused break attempt (a temptation the tool caught) to `day`
+    /// and to the lifetime total.
+    pub fn credit_break_refused(&mut self, day: i64) {
+        {
+            let d = self.day_entry(day);
+            d.breaks_refused = d.breaks_refused.saturating_add(1);
+        }
+        self.totals.breaks_refused = self.totals.breaks_refused.saturating_add(1);
+        self.enforce_day_retention();
+    }
+
+    /// Credit `n` distinct app kills to `day` and to the lifetime total. A
+    /// zero drain is a no-op so opportunistic flushes never create empty day
+    /// rows.
+    pub fn credit_app_kills(&mut self, day: i64, n: u64) {
+        if n == 0 {
+            return;
+        }
+        {
+            let d = self.day_entry(day);
+            d.app_kills = d.app_kills.saturating_add(n as u32);
+        }
+        self.totals.app_kills = self.totals.app_kills.saturating_add(n);
+        self.enforce_day_retention();
+    }
+
+    /// Compute `(current, longest)` focus streaks from `days`, treating a day
+    /// as "focused" when `sessions_completed > 0`. Pure over `days` + `today`
+    /// (never stored — a persisted streak would rot across a restart or a
+    /// date change):
+    /// * current = the run of consecutive focused days ending TODAY or
+    ///   YESTERDAY (today may be mid-progress, so an unfinished today must not
+    ///   read as a broken streak);
+    /// * longest = the longest such run anywhere in the retained history.
+    pub fn compute_streak(&self, today: i64) -> (u32, u32) {
+        let active: std::collections::HashSet<i64> = self
+            .days
+            .iter()
+            .filter(|d| d.sessions_completed > 0)
+            .map(|d| d.day)
+            .collect();
+
+        // Current: anchor on today if it counts, else yesterday, then walk
+        // backwards while the run continues.
+        let mut current = 0u32;
+        let anchor = if active.contains(&today) {
+            Some(today)
+        } else if active.contains(&(today - 1)) {
+            Some(today - 1)
+        } else {
+            None
+        };
+        if let Some(mut d) = anchor {
+            while active.contains(&d) {
+                current = current.saturating_add(1);
+                d -= 1;
+            }
+        }
+
+        // Longest: from each run START (a focused day whose predecessor is
+        // not focused) count forward. Every run is visited exactly once.
+        let mut longest = 0u32;
+        for &d in &active {
+            if active.contains(&(d - 1)) {
+                continue;
+            }
+            let mut len = 0u32;
+            let mut c = d;
+            while active.contains(&c) {
+                len = len.saturating_add(1);
+                c += 1;
+            }
+            longest = longest.max(len);
+        }
+
+        (current, longest)
+    }
+}
+
 /// Daemon-side persisted state.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
@@ -165,6 +390,12 @@ pub struct State {
     /// opportunistically whenever any other change saves.
     #[serde(default)]
     pub high_water_unix: u64,
+    /// Usage-stats record (focus history, per-day rollups, lifetime totals).
+    /// Recording is ALWAYS on (cheap, harmless); only the read is license-
+    /// gated, so a later purchase reveals prior history. `serde(default)` so
+    /// state written before this field existed still loads clean.
+    #[serde(default)]
+    pub stats: UsageStats,
 }
 
 fn deserialize_active<'de, D>(d: D) -> Result<Vec<ActiveBlock>, D::Error>
@@ -252,6 +483,10 @@ pub enum Request {
     Unlock {
         password: String,
     },
+    /// Read the usage-stats payload. Gated on the `usage_stats` feature (the
+    /// READ only — recording is always on): unlicensed callers get the
+    /// feature message.
+    GetUsageStats {},
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -310,6 +545,17 @@ pub enum Response {
     /// The challenge string issued for a `GetBreakChallenge` request.
     BreakChallenge {
         text: String,
+    },
+    /// The usage-stats payload for a licensed `GetUsageStats` request.
+    /// `sessions` is the stored ring (already capped ~200); `days` is the
+    /// recent charting window (last ~30 rollups); `current_streak`/
+    /// `longest_streak` are COMPUTED in the read path, never stored.
+    UsageStats {
+        totals: LifetimeTotals,
+        sessions: Vec<FocusSession>,
+        days: Vec<DayStat>,
+        current_streak: u32,
+        longest_streak: u32,
     },
     Error {
         message: String,
@@ -489,5 +735,215 @@ mod tests {
         );
         let a: ActiveBlock = serde_json::from_str(&active_json).unwrap();
         assert_eq!(a.lock, LockMode::Normal);
+    }
+
+    // ── usage stats (B2.b) ──────────────────────────────────────────────────
+
+    fn session(day_end: u64, dur: u64, origin: Origin) -> FocusSession {
+        FocusSession {
+            block_id: 1,
+            name: "reddit".into(),
+            started_at_unix: day_end.saturating_sub(dur),
+            ended_at_unix: day_end,
+            origin,
+            duration_secs: dur,
+        }
+    }
+
+    #[test]
+    fn credit_session_credits_day_and_totals() {
+        let mut s = UsageStats::default();
+        s.credit_session(session(1000, 300, Origin::Manual), 42);
+        s.credit_session(session(2000, 120, Origin::Schedule), 42);
+        assert_eq!(s.sessions.len(), 2);
+        assert_eq!(s.totals.focus_secs, 420);
+        assert_eq!(s.totals.sessions, 2);
+        assert_eq!(s.days.len(), 1);
+        assert_eq!(s.days[0].day, 42);
+        assert_eq!(s.days[0].focus_secs, 420);
+        assert_eq!(s.days[0].sessions_completed, 2);
+    }
+
+    #[test]
+    fn credit_break_and_refused_and_kills() {
+        let mut s = UsageStats::default();
+        s.credit_break(42, 60);
+        s.credit_break(42, 30);
+        s.credit_break_refused(42);
+        s.credit_app_kills(42, 3);
+        s.credit_app_kills(42, 0); // no-op
+        let d = &s.days[0];
+        assert_eq!(d.breaks_taken, 2);
+        assert_eq!(d.break_secs, 90);
+        assert_eq!(d.breaks_refused, 1);
+        assert_eq!(d.app_kills, 3);
+        assert_eq!(s.totals.breaks_refused, 1);
+        assert_eq!(s.totals.app_kills, 3);
+        // A zero-drain must not have created a second day row.
+        assert_eq!(s.days.len(), 1);
+    }
+
+    #[test]
+    fn days_stay_sorted_and_windowed() {
+        let mut s = UsageStats::default();
+        // Insert out of order; day_entry keeps them ascending.
+        for day in [5, 1, 3, 2, 4] {
+            s.credit_break(day, 1);
+        }
+        let ordered: Vec<i64> = s.days.iter().map(|d| d.day).collect();
+        assert_eq!(ordered, vec![1, 2, 3, 4, 5]);
+
+        // Retention drops the oldest beyond the window.
+        let mut s = UsageStats::default();
+        for day in 0..(UsageStats::DAYS_RETAINED as i64 + 10) {
+            s.credit_break(day, 1);
+        }
+        assert_eq!(s.days.len(), UsageStats::DAYS_RETAINED);
+        assert_eq!(s.days.first().unwrap().day, 10); // 0..=9 dropped
+    }
+
+    #[test]
+    fn sessions_ring_caps_dropping_oldest() {
+        let mut s = UsageStats::default();
+        let total = UsageStats::SESSIONS_CAP + 5;
+        for i in 0..total {
+            let mut fs = session(1000 + i as u64, 1, Origin::Manual);
+            fs.block_id = i as u64; // tag so we can see which survived
+            s.credit_session(fs, 42);
+        }
+        assert_eq!(s.sessions.len(), UsageStats::SESSIONS_CAP);
+        // Oldest five dropped: the first surviving block_id is 5.
+        assert_eq!(s.sessions.first().unwrap().block_id, 5);
+        assert_eq!(s.sessions.last().unwrap().block_id, (total - 1) as u64);
+        // Totals count every session ever, not just the retained ring.
+        assert_eq!(s.totals.sessions, total as u64);
+    }
+
+    #[test]
+    fn streak_today_only() {
+        let mut s = UsageStats::default();
+        s.credit_session(session(0, 60, Origin::Manual), 100);
+        assert_eq!(s.compute_streak(100), (1, 1));
+    }
+
+    #[test]
+    fn streak_counts_yesterday_when_today_empty() {
+        // Today may be mid-progress: a run ending yesterday is still current.
+        let mut s = UsageStats::default();
+        for day in [98, 99] {
+            s.credit_session(session(0, 60, Origin::Manual), day);
+        }
+        assert_eq!(s.compute_streak(100), (2, 2));
+    }
+
+    #[test]
+    fn streak_gap_breaks_current_but_longest_persists() {
+        let mut s = UsageStats::default();
+        // A 3-day run long ago, then a 1-day run ending today.
+        for day in [10, 11, 12, 100] {
+            s.credit_session(session(0, 60, Origin::Manual), day);
+        }
+        assert_eq!(s.compute_streak(100), (1, 3));
+    }
+
+    #[test]
+    fn streak_empty_history_and_stale_run() {
+        let s = UsageStats::default();
+        assert_eq!(s.compute_streak(100), (0, 0));
+        // A run that ended two days ago is no longer current, but is still
+        // the longest.
+        let mut s = UsageStats::default();
+        for day in [96, 97, 98] {
+            s.credit_session(session(0, 60, Origin::Manual), day);
+        }
+        assert_eq!(s.compute_streak(100), (0, 3));
+    }
+
+    #[test]
+    fn streak_ignores_days_without_completed_sessions() {
+        // A day with only a break (no completed session) does not count.
+        let mut s = UsageStats::default();
+        s.credit_break(100, 60);
+        assert_eq!(s.compute_streak(100), (0, 0));
+    }
+
+    // Pin the wire names of the new usage-stats frames: "get_usage_stats"
+    // under the "method" tag and "usage_stats" under the "result" tag.
+    #[test]
+    fn usage_stats_wire_tags_round_trip() {
+        let req: Request = serde_json::from_str(r#"{"method":"get_usage_stats"}"#).unwrap();
+        assert!(matches!(req, Request::GetUsageStats {}));
+        let json = serde_json::to_string(&Request::GetUsageStats {}).unwrap();
+        assert!(json.contains(r#""method":"get_usage_stats""#), "got {json}");
+
+        let resp = Response::UsageStats {
+            totals: LifetimeTotals {
+                focus_secs: 420,
+                sessions: 2,
+                app_kills: 5,
+                breaks_refused: 1,
+            },
+            sessions: vec![session(2000, 120, Origin::Schedule)],
+            days: vec![DayStat {
+                day: 42,
+                focus_secs: 420,
+                sessions_completed: 2,
+                breaks_taken: 1,
+                break_secs: 60,
+                breaks_refused: 1,
+                app_kills: 5,
+            }],
+            current_streak: 3,
+            longest_streak: 7,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""result":"usage_stats""#), "got {json}");
+        let back: Response = serde_json::from_str(&json).unwrap();
+        match back {
+            Response::UsageStats {
+                totals,
+                sessions,
+                days,
+                current_streak,
+                longest_streak,
+            } => {
+                assert_eq!(totals.focus_secs, 420);
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0].origin, Origin::Schedule);
+                assert_eq!(days[0].day, 42);
+                assert_eq!(current_streak, 3);
+                assert_eq!(longest_streak, 7);
+            }
+            other => panic!("expected UsageStats, got {other:?}"),
+        }
+    }
+
+    // Old state.json compat: state written before `stats` existed loads with
+    // a default (empty) UsageStats.
+    #[test]
+    fn state_without_stats_field_still_deserializes() {
+        let old = r#"{ "next_id": 1, "blocks": [] }"#;
+        let st: State = serde_json::from_str(old).unwrap();
+        assert!(st.stats.sessions.is_empty());
+        assert!(st.stats.days.is_empty());
+        assert_eq!(st.stats.totals.sessions, 0);
+    }
+
+    // Pin Origin's snake_case wire values.
+    #[test]
+    fn origin_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&Origin::Manual).unwrap(),
+            r#""manual""#
+        );
+        assert_eq!(
+            serde_json::to_string(&Origin::Schedule).unwrap(),
+            r#""schedule""#
+        );
+        assert_eq!(
+            Origin::from(&Originator::Schedule { schedule_id: 9 }),
+            Origin::Schedule
+        );
+        assert_eq!(Origin::from(&Originator::Manual), Origin::Manual);
     }
 }

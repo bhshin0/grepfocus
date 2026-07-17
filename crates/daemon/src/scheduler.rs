@@ -17,7 +17,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
 use grepfocus_core::license::features;
-use grepfocus_core::{day_set, now_unix, ActiveBlock, Originator, Schedule, State};
+use grepfocus_core::{
+    day_set, now_unix, ActiveBlock, FocusSession, Origin, Originator, Schedule, State, UsageStats,
+};
 use tracing::{error, info, warn};
 
 use crate::{enforce, has_feature, state, Daemon};
@@ -70,6 +72,16 @@ async fn tick(daemon: &Arc<Daemon>, skipped_fires: &mut HashSet<(u64, u64)>) {
         if now_unix > st.high_water_unix {
             st.high_water_unix = now_unix;
         }
+        // Fold any app kills procwatch counted since the last tick into today's
+        // rollup. Like the high-water mark above, this is an in-memory bump
+        // that persists opportunistically on the next save from any cause — no
+        // fsync of its own. Drained to zero here whether or not we save this
+        // tick; if we don't, the credit still lives in `st.stats` and rides the
+        // next save (a crash loses at most this unflushed count).
+        let drained = daemon
+            .app_kills_pending
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        st.stats.credit_app_kills(today, drained);
         let gates = {
             let lic = daemon.license.lock().await;
             Gates {
@@ -136,19 +148,33 @@ fn reconcile(
     let schedules: Vec<Schedule> = st.schedules.clone();
     let mut changed = false;
 
+    // Steps 1 and 2 are the SINGLE choke point where a block "ends": a
+    // manual block can only end by wall-clock expiry (step 1, no cancel), a
+    // scheduled block by expiry or by its window sliding/disabling/deleting
+    // (step 2). Both used to be plain `retain` drops; now each dropped active
+    // is turned into exactly one recorded `FocusSession`. A daemon restart
+    // mid-block emits NO false end — the `ActiveBlock` persists in `State` and
+    // is still active on reload, so nothing is dropped here.
+
     // 1. Expire by wall clock.
     let before = st.active.len();
-    st.active.retain(|a| a.ends_at_unix > now_unix);
+    let (kept, ended) = partition_active(std::mem::take(&mut st.active), |a| {
+        a.ends_at_unix > now_unix
+    });
+    st.active = kept;
     let expired = before - st.active.len();
     if expired > 0 {
         info!(count = expired, "expired active blocks");
+        for a in &ended {
+            record_ended_session(&mut st.stats, a, now_unix, today);
+        }
         changed = true;
     }
 
     // 2. End scheduled actives whose driving schedule disappeared,
     //    was disabled, or slid out of its window.
     let before = st.active.len();
-    st.active.retain(|a| match &a.originator {
+    let (kept, ended) = partition_active(std::mem::take(&mut st.active), |a| match &a.originator {
         Originator::Manual => true,
         Originator::Schedule { schedule_id } => schedules
             .iter()
@@ -156,9 +182,13 @@ fn reconcile(
             .map(|s| s.enabled && schedule_active_at(s, now_local))
             .unwrap_or(false),
     });
+    st.active = kept;
     let auto_ended = before - st.active.len();
     if auto_ended > 0 {
         info!(count = auto_ended, "ended schedule-driven blocks");
+        for a in &ended {
+            record_ended_session(&mut st.stats, a, now_unix, today);
+        }
         changed = true;
     }
 
@@ -246,6 +276,32 @@ fn reconcile(
     let ledger_pruned = st.allowance.len() != before;
 
     changed || ledger_pruned
+}
+
+/// Split `active` into `(kept, dropped)` by `keep`. A partition rather than a
+/// `retain` so the caller can turn each DROPPED active into a recorded
+/// session — `retain` would discard them silently.
+fn partition_active(
+    active: Vec<ActiveBlock>,
+    keep: impl Fn(&ActiveBlock) -> bool,
+) -> (Vec<ActiveBlock>, Vec<ActiveBlock>) {
+    active.into_iter().partition(keep)
+}
+
+/// Record a just-ended block as a completed [`FocusSession`]. The block ended
+/// NOW (`now_unix`), so that is its `ended_at_unix` and the duration is
+/// `now_unix - started_at_unix`; it is credited to `today` (the local day of
+/// that end). Pure — no clock, no IO — so `reconcile` stays unit-testable.
+fn record_ended_session(stats: &mut UsageStats, a: &ActiveBlock, now_unix: u64, today: i64) {
+    let session = FocusSession {
+        block_id: a.block.id,
+        name: a.block.name.clone(),
+        started_at_unix: a.started_at_unix,
+        ended_at_unix: now_unix,
+        origin: Origin::from(&a.originator),
+        duration_secs: now_unix.saturating_sub(a.started_at_unix),
+    };
+    stats.credit_session(session, today);
 }
 
 /// Days since the Common-Era epoch in local time. The absolute value is
@@ -603,6 +659,92 @@ mod tests {
         assert!(changed);
         assert_eq!(st.allowance.len(), 1);
         assert_eq!(st.allowance[0].day, today);
+    }
+
+    // ── session recording (B2.b) ────────────────────────────────────────────
+
+    #[test]
+    fn wall_clock_expiry_records_exactly_one_session() {
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let today = day_of(&now_l);
+        let mut st = State::default();
+        let mut ended = manual_active(0, now - 1); // ended a second ago
+        ended.started_at_unix = now - 100; // ran 100s
+        st.active.push(ended);
+        st.active.push(manual_active(1, now + 100)); // still live → no session
+        let changed = reconcile(
+            &mut st,
+            now,
+            &now_l,
+            today,
+            &all_gates(),
+            &mut HashSet::new(),
+        );
+        assert!(changed);
+        // Exactly one session recorded, for the ended block, credited to today.
+        assert_eq!(st.stats.sessions.len(), 1);
+        let s = &st.stats.sessions[0];
+        assert_eq!(s.block_id, 0);
+        assert_eq!(s.origin, Origin::Manual);
+        assert_eq!(s.ended_at_unix, now);
+        assert_eq!(s.duration_secs, 100);
+        assert_eq!(st.stats.days.len(), 1);
+        assert_eq!(st.stats.days[0].day, today);
+        assert_eq!(st.stats.days[0].focus_secs, 100);
+        assert_eq!(st.stats.days[0].sessions_completed, 1);
+        assert_eq!(st.stats.totals.sessions, 1);
+    }
+
+    #[test]
+    fn schedule_end_records_a_schedule_origin_session() {
+        // Disabled schedule → its active is dropped in step 2 and recorded.
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let today = day_of(&now_l);
+        let mut st = State::default();
+        st.blocks.push(block(0));
+        let mut sch = s(540, 60, DAY_MON);
+        sch.enabled = false;
+        st.schedules.push(sch);
+        let mut a = sched_active(0, 1, now + 3600);
+        a.started_at_unix = now - 42;
+        st.active.push(a);
+        let changed = reconcile(
+            &mut st,
+            now,
+            &now_l,
+            today,
+            &all_gates(),
+            &mut HashSet::new(),
+        );
+        assert!(changed);
+        assert_eq!(st.stats.sessions.len(), 1);
+        assert_eq!(st.stats.sessions[0].origin, Origin::Schedule);
+        assert_eq!(st.stats.sessions[0].duration_secs, 42);
+    }
+
+    #[test]
+    fn persisted_midblock_active_records_no_session() {
+        // The reload case: an active that is still live (ends in the future)
+        // is retained untouched and emits NO session — a daemon restart
+        // mid-block must never record a false end.
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let mut st = State::default();
+        st.active.push(manual_active(0, now + 3600));
+        let changed = reconcile(
+            &mut st,
+            now,
+            &now_l,
+            day_of(&now_l),
+            &all_gates(),
+            &mut HashSet::new(),
+        );
+        assert!(!changed);
+        assert_eq!(st.active.len(), 1);
+        assert!(st.stats.sessions.is_empty());
+        assert!(st.stats.days.is_empty());
     }
 
     // ── license gates ───────────────────────────────────────────────────────
