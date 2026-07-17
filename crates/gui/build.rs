@@ -16,6 +16,8 @@ fn main() {
             "unlock",
             "take_break",
             "get_break_challenge",
+            "start_pomodoro",
+            "stop_pomodoro",
         ]));
     tauri_build::try_build(attributes).expect("tauri-build failed");
 }

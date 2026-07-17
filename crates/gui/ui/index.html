@@ -14,6 +14,7 @@
         <button data-tab="new">New block</button>
         <button data-tab="list">Block list</button>
         <button data-tab="schedules">Schedules</button>
+        <button data-tab="pomodoro" id="pomodoro-tab-btn" hidden>Pomodoro</button>
         <button data-tab="stats" id="stats-tab-btn" hidden>Stats</button>
         <button data-tab="settings">Settings</button>
         <button data-tab="license">License</button>
@@ -94,6 +95,11 @@
             <p id="schedule-msg" class="msg"></p>
           </form>
         </details>
+      </section>
+
+      <section id="pomodoro" class="tab">
+        <h2>Pomodoro</h2>
+        <div id="pomodoro-content">Loading…</div>
       </section>
 
       <section id="stats" class="tab">

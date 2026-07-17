@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use grepfocus_core::{
-    ActiveBlock, AllowanceLedger, Block, DayStat, FocusSession, LifetimeTotals, Request, Response,
-    Schedule,
+    ActiveBlock, AllowanceLedger, Block, DayStat, FocusSession, LifetimeTotals, PomodoroStatus,
+    Request, Response, Schedule,
 };
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -51,6 +51,43 @@ async fn start_block(id: u64, duration_secs: u64) -> Result<(), String> {
     }
 }
 
+/// Start a pomodoro session driving a saved block through alternating
+/// focus/break intervals. Gated by the daemon on the `pomodoro` feature — an
+/// unlicensed request comes back as `Response::Error` and surfaces to JS as the
+/// thrown feature-gate string, same as the other premium commands.
+#[tauri::command]
+async fn start_pomodoro(
+    block_id: u64,
+    focus_secs: u64,
+    break_secs: u64,
+    cycles: u32,
+) -> Result<(), String> {
+    match client::call(Request::StartPomodoro {
+        block_id,
+        focus_secs,
+        break_secs,
+        cycles,
+    })
+    .await?
+    {
+        Response::Ok {} => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+/// Stop the running pomodoro session. Hybrid commitment model: the daemon
+/// allows this only during a break and refuses it mid-focus, returning its
+/// refusal verbatim for the frontend to surface.
+#[tauri::command]
+async fn stop_pomodoro() -> Result<(), String> {
+    match client::call(Request::StopPomodoro {}).await? {
+        Response::Ok {} => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct StatusOut {
     active: Vec<ActiveBlock>,
@@ -64,6 +101,7 @@ struct StatusOut {
     license_email: Option<String>,
     license_expires_at: Option<i64>,
     licensed_features: Vec<String>,
+    pomodoro: Option<PomodoroStatus>,
 }
 
 #[tauri::command]
@@ -81,9 +119,7 @@ async fn get_status() -> Result<StatusOut, String> {
             license_email,
             license_expires_at,
             licensed_features,
-            // The pomodoro session view is consumed by the follow-up Pomodoro
-            // tab; ignored here so this existing command keeps compiling.
-            pomodoro: _,
+            pomodoro,
         } => Ok(StatusOut {
             active,
             now_unix,
@@ -96,6 +132,7 @@ async fn get_status() -> Result<StatusOut, String> {
             license_email,
             license_expires_at,
             licensed_features,
+            pomodoro,
         }),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),
@@ -427,6 +464,8 @@ fn main() {
             unlock,
             take_break,
             get_break_challenge,
+            start_pomodoro,
+            stop_pomodoro,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

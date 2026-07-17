@@ -382,3 +382,83 @@ dialog .row { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
+
+/* ─── Pomodoro tab ───────────────────────────────────────────────────────── */
+
+/* Setup form: focus / break / cycles side by side. */
+.pomo-inputs {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.pomo-inputs label { flex: 1 1 120px; }
+.pomo-inputs input { width: 100%; }
+.pomo-total { color: var(--accent); font-size: 13px; margin: 0; }
+
+/* Running banner. The break variant recolours (green) so the phase you are in
+   is unmistakable at a glance, not only from the label. */
+.pomo-banner {
+  color: white;
+  padding: 16px 18px;
+  border-radius: 8px;
+  margin-bottom: 14px;
+}
+.pomo-focus { background: var(--accent); }
+.pomo-break { background: #2f9e5f; }
+.pomo-phase {
+  font-size: 28px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.pomo-cycle { font-size: 14px; opacity: 0.92; margin-top: 6px; }
+.pomo-block { font-size: 14px; opacity: 0.92; margin-top: 6px; }
+
+/* Cycle progress dots: filled = done/current, hollow = remaining. */
+.pomo-dots { display: flex; gap: 8px; margin-top: 10px; }
+.pomo-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid white;
+  box-sizing: border-box;
+}
+.pomo-dot.filled { background: white; }
+
+/* The always-visible statement of the commitment rule. */
+.pomo-rule {
+  font-size: 14px;
+  color: var(--fg);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin: 0 0 14px;
+}
+
+/* End-session button. The disabled (during-focus) state is deliberately loud —
+   a hatched, greyed, not-allowed look — so the commitment is obvious, not just
+   a dead click. The enabled (during-break) state is a normal danger action. */
+.pomo-end-btn {
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid var(--danger);
+  padding: 8px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  width: fit-content;
+}
+.pomo-end-btn:disabled {
+  color: var(--muted);
+  border: 1px dashed var(--border);
+  background: repeating-linear-gradient(
+    45deg,
+    transparent,
+    transparent 6px,
+    rgba(128, 128, 128, 0.12) 6px,
+    rgba(128, 128, 128, 0.12) 12px
+  );
+  cursor: not-allowed;
+  opacity: 0.9;
+}

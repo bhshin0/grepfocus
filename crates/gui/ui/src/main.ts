@@ -39,6 +39,21 @@ interface ActiveBlock {
   lock: LockMode;
 }
 
+/// Mirrors core's `PomodoroPhase` (snake_case on the wire): which half of the
+/// pomodoro rhythm the session is in.
+type PomodoroPhase = "focus" | "break";
+
+/// The running-session view carried on `Status` (a projection of the daemon's
+/// live `PomodoroSession`). `cycle_index` is 0-based; `phase_ends_unix` is the
+/// unix time the current interval ends.
+interface PomodoroStatus {
+  block_id: number;
+  phase: PomodoroPhase;
+  phase_ends_unix: number;
+  cycle_index: number;
+  cycles_total: number;
+}
+
 interface Status {
   active: ActiveBlock[];
   now_unix: number;
@@ -51,6 +66,7 @@ interface Status {
   license_email: string | null;
   license_expires_at: number | null;
   licensed_features: string[];
+  pomodoro: PomodoroStatus | null;
 }
 
 interface Schedule {
@@ -77,6 +93,7 @@ tabs.forEach((btn) => {
     if (target === "list") refreshList();
     if (target === "status") refreshStatus();
     if (target === "schedules") refreshSchedules();
+    if (target === "pomodoro") refreshPomodoro();
     if (target === "stats") refreshStats();
     if (target === "settings") refreshSettings();
     if (target === "license") refreshLicense();
@@ -274,6 +291,10 @@ async function refreshStatus() {
     // live without adding load while it is hidden.
     applyStatsGating(s.license_valid);
     if (statsTabVisible()) void refreshStats();
+    // Same gating for the Pomodoro tab. Its running view is driven off THIS
+    // poll (no separate timer): keep it in sync while the tab is open.
+    applyPomodoroGating(s.license_valid);
+    if (pomodoroTabVisible()) syncPomodoro(s);
     if (s.active.length === 0) {
       statusEl.innerHTML = `<p class="empty">No active block. Pick one from "Block list" to start, or set up a schedule.</p>`;
       stopCountdownTimer();
@@ -322,8 +343,14 @@ function renderActive(s: Status) {
     const div = document.createElement("div");
     div.className = "active-banner";
     div.dataset.endsAt = String(a.ends_at_unix);
-    const origin =
-      a.originator.kind === "schedule"
+    // A pomodoro-driven block is labelled "(pomodoro)" the way a scheduled one
+    // shows "(scheduled)", and its manual break row is suppressed below — the
+    // pomodoro session owns break scheduling and the daemon refuses manual
+    // breaks on it anyway.
+    const isPomodoro = s.pomodoro != null && s.pomodoro.block_id === a.block.id;
+    const origin = isPomodoro
+      ? ` <span class="origin">(pomodoro)</span>`
+      : a.originator.kind === "schedule"
         ? ` <span class="origin">(scheduled)</span>`
         : "";
     div.innerHTML = `
@@ -334,7 +361,7 @@ function renderActive(s: Status) {
     div.querySelector<HTMLSpanElement>(".name")!.textContent = a.block.name;
 
     const allowance = a.block.allowance_secs_per_day;
-    if (allowance > 0) {
+    if (allowance > 0 && !isPomodoro) {
       const onBreak = a.break_until_unix != null && a.break_until_unix > nowSec;
       if (onBreak) {
         const ob = document.createElement("div");
@@ -453,6 +480,16 @@ function tickCountdowns() {
       setTimeout(refreshStatus, 500);
     }
   });
+
+  // Pomodoro phase banner: same skew-aligned tick as the active countdowns.
+  // When the interval elapses, refresh so the daemon-advanced phase shows.
+  const pomoCd = pomodoroEl.querySelector<HTMLElement>(".pomo-countdown");
+  if (pomoCd) {
+    const endsAt = Number(pomoCd.dataset.endsAt);
+    const rem = endsAt - nowSec;
+    pomoCd.textContent = fmtPhaseRemaining(rem);
+    if (rem <= 0) setTimeout(refreshStatus, 500);
+  }
 
   if (allDone) setTimeout(refreshStatus, 500);
 }
@@ -1242,6 +1279,268 @@ async function refreshStats() {
     }
     statsEl.appendChild(p);
   }
+}
+
+// ─── Pomodoro (premium) ──────────────────────────────────────────────────────
+
+const pomodoroTabBtn = document.querySelector<HTMLButtonElement>("#pomodoro-tab-btn")!;
+const pomodoroEl = document.querySelector<HTMLDivElement>("#pomodoro-content")!;
+const pomodoroSection = document.querySelector<HTMLElement>("#pomodoro")!;
+
+/// Which view is currently in the DOM. Tracked so a 5s status poll only rebuilds
+/// the setup form on a genuine setup→running→setup transition, never mid-entry
+/// (a rebuild would wipe the user's half-typed focus/break/cycles).
+let pomodoroView: "setup" | "running" | null = null;
+/// Held while a stop_pomodoro request is in flight so the poll cannot rebuild
+/// the running view (and re-enable the End button) out from under it.
+let pomodoroStopInFlight = false;
+
+function pomodoroTabVisible(): boolean {
+  return pomodoroSection.classList.contains("active");
+}
+
+/// Show the Pomodoro nav button only when licensed — same all-or-nothing gate as
+/// the Stats tab. If the license lapses while the tab is open, fall back to
+/// Status so the user is never stranded on a tab that has stopped answering.
+function applyPomodoroGating(licenseValid: boolean) {
+  pomodoroTabBtn.hidden = !licenseValid;
+  if (!licenseValid && pomodoroTabVisible()) statusTabBtn.click();
+}
+
+/// Phase-countdown format: MM:SS, rolling up to H:MM:SS past an hour (a focus
+/// interval can be up to 180 min). Same math as `fmtRemaining`, but a bare
+/// clock without the always-present hours field reads better in the banner.
+function fmtPhaseRemaining(secs: number): string {
+  const s = Math.max(0, Math.floor(secs));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+  const mm = String(m).padStart(2, "0");
+  const rr = String(r).padStart(2, "0");
+  return h > 0 ? `${h}:${mm}:${rr}` : `${mm}:${rr}`;
+}
+
+/// Route the live status into whichever view fits. Called off the status poll
+/// while the tab is open, so it must not clobber user input in the setup form.
+function syncPomodoro(s: Status) {
+  if (s.pomodoro) {
+    pomodoroView = "running";
+    renderPomodoroRunning(s);
+  } else if (pomodoroView !== "setup") {
+    // Session just ended (or never ran): switch to setup once, then leave the
+    // form alone so subsequent polls don't reset the inputs.
+    pomodoroView = "setup";
+    void renderPomodoroSetup();
+  }
+}
+
+/// Full refresh on tab activation: fetch status and render the matching view
+/// fresh (the setup form is rebuilt here, repopulating the block dropdown).
+async function refreshPomodoro() {
+  try {
+    const s = await invoke<Status>("get_status");
+    if (s.pomodoro) {
+      pomodoroView = "running";
+      renderPomodoroRunning(s);
+    } else {
+      pomodoroView = "setup";
+      await renderPomodoroSetup();
+    }
+  } catch (e) {
+    pomodoroView = null;
+    pomodoroEl.innerHTML = "";
+    const p = document.createElement("p");
+    p.className = "msg error";
+    p.textContent = String(e);
+    pomodoroEl.appendChild(p);
+  }
+}
+
+async function renderPomodoroSetup() {
+  pomodoroEl.innerHTML = `
+    <p class="hint">A pomodoro session drives one saved block through alternating focus and break intervals: it enforces during focus, lifts for the short break, then cycles. A focus interval can't be interrupted; you can end the session during a break.</p>
+    <form id="pomodoro-form">
+      <label>Block
+        <select name="block_id" required></select>
+      </label>
+      <div class="pomo-inputs">
+        <label>Focus (minutes)
+          <input type="number" name="focus_min" min="1" max="180" step="1" value="25" />
+        </label>
+        <label>Break (minutes)
+          <input type="number" name="break_min" min="1" max="60" step="1" value="5" />
+        </label>
+        <label>Cycles
+          <input type="number" name="cycles" min="1" max="12" step="1" value="4" />
+        </label>
+      </div>
+      <p class="pomo-total"></p>
+      <button type="submit">Start session</button>
+      <p id="pomodoro-msg" class="msg"></p>
+    </form>
+  `;
+  const form = pomodoroEl.querySelector<HTMLFormElement>("#pomodoro-form")!;
+  const select = form.querySelector<HTMLSelectElement>('select[name="block_id"]')!;
+  const focusIn = form.querySelector<HTMLInputElement>('input[name="focus_min"]')!;
+  const breakIn = form.querySelector<HTMLInputElement>('input[name="break_min"]')!;
+  const cyclesIn = form.querySelector<HTMLInputElement>('input[name="cycles"]')!;
+  const total = form.querySelector<HTMLParagraphElement>(".pomo-total")!;
+  const msg = form.querySelector<HTMLParagraphElement>("#pomodoro-msg")!;
+  const startBtn = form.querySelector<HTMLButtonElement>('button[type="submit"]')!;
+
+  // Live "Total: ~1h 55m across 4 focus intervals". The set's wall-clock length
+  // is focus*cycles + break*(cycles-1) — no trailing break after the last focus.
+  function updateTotal() {
+    const f = Math.max(1, Math.floor(Number(focusIn.value) || 0));
+    const b = Math.max(1, Math.floor(Number(breakIn.value) || 0));
+    const c = Math.max(1, Math.floor(Number(cyclesIn.value) || 0));
+    const totalSecs = (f * c + b * Math.max(0, c - 1)) * 60;
+    total.textContent = `Total: ~${fmtDuration(totalSecs)} across ${c} focus interval${c === 1 ? "" : "s"}`;
+  }
+  for (const el of [focusIn, breakIn, cyclesIn]) el.addEventListener("input", updateTotal);
+  updateTotal();
+
+  // Populate the block dropdown; a session needs a saved block to drive.
+  try {
+    const blocks = await invoke<Block[]>("list_blocks");
+    select.innerHTML = "";
+    if (blocks.length === 0) {
+      const opt = document.createElement("option");
+      opt.disabled = true;
+      opt.textContent = "(create a block first)";
+      select.appendChild(opt);
+      select.disabled = true;
+      startBtn.disabled = true;
+      msg.textContent = 'No saved blocks yet. Create one in "New block" first.';
+    } else {
+      for (const b of blocks) {
+        const opt = document.createElement("option");
+        opt.value = String(b.id);
+        opt.textContent = b.name;
+        select.appendChild(opt);
+      }
+    }
+  } catch (e) {
+    msg.classList.add("error");
+    msg.textContent = String(e);
+    startBtn.disabled = true;
+  }
+
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    msg.classList.remove("error");
+    msg.textContent = "";
+    const blockId = Number(select.value);
+    if (!Number.isFinite(blockId) || select.disabled) return;
+    const focusMin = Math.max(1, Math.floor(Number(focusIn.value) || 0));
+    const breakMin = Math.max(1, Math.floor(Number(breakIn.value) || 0));
+    const cycles = Math.max(1, Math.floor(Number(cyclesIn.value) || 0));
+    startBtn.disabled = true;
+    try {
+      // camelCase arg keys: Tauri maps the snake_case Rust params
+      // (block_id/focus_secs/break_secs/cycles) to these.
+      await invoke("start_pomodoro", {
+        blockId,
+        focusSecs: focusMin * 60,
+        breakSecs: breakMin * 60,
+        cycles,
+      });
+      // Success: flip straight to the running view off a fresh status.
+      await refreshPomodoro();
+      refreshStatus();
+    } catch (e) {
+      // Daemon refusals (bounds, already-running, feature gate) land here.
+      msg.classList.add("error");
+      msg.textContent = String(e);
+      startBtn.disabled = false;
+    }
+  });
+}
+
+function renderPomodoroRunning(s: Status) {
+  // Held while a stop is in flight so the poll doesn't rebuild + re-enable End.
+  if (pomodoroStopInFlight) return;
+  const p = s.pomodoro!;
+  const blockName = s.active.find((a) => a.block.id === p.block_id)?.block.name ?? `#${p.block_id}`;
+  const isFocus = p.phase === "focus";
+  const phaseLabel = isFocus ? "Focus" : "Break";
+  // 1-based interval currently being worked; during a break, the just-finished
+  // one is done and the next focus is cycle_index+2 (a break only happens when
+  // more cycles remain, so that next interval always exists).
+  const cycleLine = isFocus
+    ? `Focus interval ${p.cycle_index + 1} of ${p.cycles_total}`
+    : `On a break — next up: focus interval ${p.cycle_index + 2} of ${p.cycles_total}`;
+  // Filled = done + current: cycle_index+1 in both phases (during a break the
+  // interval just finished counts as done).
+  const filled = Math.min(p.cycles_total, p.cycle_index + 1);
+
+  pomodoroEl.innerHTML = "";
+  const banner = document.createElement("div");
+  banner.className = `pomo-banner ${isFocus ? "pomo-focus" : "pomo-break"}`;
+  banner.innerHTML = `
+    <div class="pomo-phase">${phaseLabel} — <span class="pomo-countdown" data-ends-at="${p.phase_ends_unix}">--:--</span></div>
+    <div class="pomo-cycle"></div>
+    <div class="pomo-dots"></div>
+    <div class="pomo-block">Blocking: <span class="pomo-block-name"></span></div>
+  `;
+  banner.querySelector<HTMLDivElement>(".pomo-cycle")!.textContent = cycleLine;
+  banner.querySelector<HTMLSpanElement>(".pomo-block-name")!.textContent = blockName;
+  const dots = banner.querySelector<HTMLDivElement>(".pomo-dots")!;
+  for (let i = 0; i < p.cycles_total; i++) {
+    const dot = document.createElement("span");
+    dot.className = i < filled ? "pomo-dot filled" : "pomo-dot";
+    dots.appendChild(dot);
+  }
+  pomodoroEl.appendChild(banner);
+
+  // The commitment rule, stated in plain words and ALWAYS visible.
+  const rule = document.createElement("p");
+  rule.className = "pomo-rule";
+  rule.textContent = "A focus interval can't be interrupted. You can end the session during a break.";
+  pomodoroEl.appendChild(rule);
+
+  // End session: disabled during focus (with a tooltip), enabled during break.
+  const endBtn = document.createElement("button");
+  endBtn.className = "pomo-end-btn";
+  endBtn.textContent = "End session";
+  const endMsg = document.createElement("p");
+  endMsg.className = "msg";
+  if (isFocus) {
+    endBtn.disabled = true;
+    endBtn.title = "Available during breaks";
+  } else {
+    endBtn.disabled = false;
+    endBtn.title = "End the session now";
+  }
+  endBtn.addEventListener("click", async () => {
+    endMsg.classList.remove("error");
+    endMsg.textContent = "";
+    endBtn.disabled = true;
+    pomodoroStopInFlight = true;
+    let ok = false;
+    try {
+      await invoke("stop_pomodoro");
+      ok = true;
+    } catch (e) {
+      // The daemon is the authority: if the phase raced into focus between the
+      // poll and the click, it refuses — surface that softly and re-enable so
+      // the button matches the (now-stale) break view until the next poll.
+      endMsg.classList.add("error");
+      endMsg.textContent = String(e);
+      endBtn.disabled = false;
+    } finally {
+      pomodoroStopInFlight = false;
+    }
+    if (ok) {
+      await refreshPomodoro();
+      refreshStatus();
+    }
+  });
+  pomodoroEl.appendChild(endBtn);
+  pomodoroEl.appendChild(endMsg);
+
+  // Paint the countdown immediately rather than waiting up to 1s for the tick.
+  tickCountdowns();
 }
 
 // ─── Shared helpers ────────────────────────────────────────────────────────
