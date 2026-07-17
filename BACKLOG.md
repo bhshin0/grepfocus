@@ -127,6 +127,16 @@ to be redone when the item is picked up.
   retention). Recording is always on and daemon-side; only the `GetUsageStats`
   read is gated on `usage_stats`. Store copy reworded (grepfocus-web
   `e89fa9a`). Remaining B2: `pomodoro`.
+- **[DONE — `premium` branch, 2026-07-17] Pomodoro (B2.c)** — implemented and
+  live-verified per `docs/plans/premium-pomodoro.md`. A session drives one
+  saved block through focus/break cycles (new `Originator::Pomodoro`), reusing
+  the `ActiveBlock` machinery; auto-breaks set `break_until_unix` directly
+  (free, no allowance charge). HYBRID commitment: a focus interval can't be
+  interrupted, `StopPomodoro` allowed only during a break — surfaced clearly in
+  the GUI. `StartPomodoro` gated on `pomodoro` + bounds-checked; manual breaks
+  refused on a pomodoro block; one break-inclusive `origin=pomodoro` session
+  recorded at end via the reconcile step-1 choke point. **Completes Track B
+  (B2.a/b/c) — all 7 premium feature keys now have app-side implementations.**
 - **[DEFERRED] Packaging** — `.rpm` first. Use `sysusers.d`/`tmpfiles.d`
   for the group and runtime/state dirs; declare runtime deps (webkit2gtk4.1,
   libappindicator/ayatana); `%preun` can run `grepfocusd cleanup` verbatim.
