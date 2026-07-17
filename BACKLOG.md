@@ -108,6 +108,16 @@ to be redone when the item is picked up.
   blocks + 1 saved block / premium = app_blocking + schedules +
   tamper_protection + unlimited_blocks (per frostbite-web
   `lib/features.ts`).
+- **[DONE — `premium` branch, 2026-07-16] Lock modes (B2.a)** — implemented
+  and live-verified per `docs/plans/premium-lock-modes.md`. Per-block
+  `LockMode` (`normal`/`password_breaks`/`challenge_breaks`), gated at save
+  time, enforced from an `ActiveBlock.lock` activation snapshot so a mid-block
+  edit or downgrade can only make a running block stricter, never weaker.
+  Break decision is license-free (mode licensed at save). Challenges are
+  daemon-issued (40 chars, unambiguous alphabet), trimmed + case-sensitive
+  match, single-use, and retired when the block deactivates
+  (`prune_break_challenges`). No `NoBreaks` variant — `allowance == 0` already
+  gives that free. Remaining B2: `usage_stats`, `pomodoro`.
 - **[DEFERRED] Packaging** — `.rpm` first. Use `sysusers.d`/`tmpfiles.d`
   for the group and runtime/state dirs; declare runtime deps (webkit2gtk4.1,
   libappindicator/ayatana); `%preun` can run `grepfocusd cleanup` verbatim.
