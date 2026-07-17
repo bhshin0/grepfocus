@@ -9,8 +9,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use grepfocus_core::license::{self, LicenseClaims};
 use grepfocus_core::{
-    now_unix, ActiveBlock, AllowanceLedger, AppMatcher, LockMode, Originator, Request, Response,
-    Schedule, State,
+    now_unix, ActiveBlock, AllowanceLedger, AppMatcher, LockMode, Originator, PomodoroPhase,
+    PomodoroSession, PomodoroStatus, Request, Response, Schedule, State,
 };
 use nix::unistd::Group;
 use tokio::net::{UnixListener, UnixStream};
@@ -32,6 +32,8 @@ const MSG_SCHEDULES: &str = "Schedules are a premium feature. \
 const MSG_LOCK_MODES: &str = "Lock modes are a premium feature. \
      Enter a license key in Settings, or get one from the GrepFocus store.";
 const MSG_USAGE_STATS: &str = "Usage stats are a premium feature. \
+     Enter a license key in Settings, or get one from the GrepFocus store.";
+const MSG_POMODORO: &str = "Pomodoro sessions are a premium feature. \
      Enter a license key in Settings, or get one from the GrepFocus store.";
 
 /// The settings-lock refusal, shared by `gate_config` and `break_gate`:
@@ -139,6 +141,13 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 effective_now(&st),
             );
             drop(cached);
+            let pomodoro = st.pomodoro.as_ref().map(|p| PomodoroStatus {
+                block_id: p.block_id,
+                phase: p.phase,
+                phase_ends_unix: p.phase_ends_unix,
+                cycle_index: p.cycle_index,
+                cycles_total: p.cycles_total,
+            });
             Response::Status {
                 active: st.active.clone(),
                 now_unix: now,
@@ -151,6 +160,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 license_email: lic.email,
                 license_expires_at: lic.expires_at,
                 licensed_features: lic.features,
+                pomodoro,
             }
         }
 
@@ -327,6 +337,15 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 let (allowance, ends_at, lock) =
                     match st.active.iter().find(|a| a.block.id == block_id) {
                         Some(a) => {
+                            // A pomodoro session owns this block's break
+                            // schedule (auto-breaks via break_until_unix).
+                            // Refuse manual breaks before any mutation — the
+                            // GUI hides the manual break row for it.
+                            if a.originator == Originator::Pomodoro {
+                                return err(
+                                "this block is running a pomodoro session — breaks are automatic",
+                            );
+                            }
                             if a.break_until_unix.is_some_and(|t| t > now) {
                                 return err("this block is already on a break");
                             }
@@ -689,6 +708,132 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 longest_streak,
             }
         }
+
+        // Start a pomodoro session. Gated on the `pomodoro` feature at
+        // activation (snapshotted like StartBlock's app/lock features), but
+        // NOT settings-lock gated: starting is always allowed, same as
+        // StartBlock. The session drives ONE saved block through its rhythm.
+        Request::StartPomodoro {
+            block_id,
+            focus_secs,
+            break_secs,
+            cycles,
+        } => {
+            {
+                let mut st = daemon.state.lock().await;
+                {
+                    let lic = daemon.license.lock().await;
+                    if !has_feature(lic.as_ref(), &st, license::features::POMODORO) {
+                        return err(MSG_POMODORO);
+                    }
+                }
+                if st.pomodoro.is_some() {
+                    return err("a pomodoro session is already running");
+                }
+                if st.active.iter().any(|a| a.block.id == block_id) {
+                    return err(format!("block {block_id} is already active"));
+                }
+                if let Some(msg) = validate_pomodoro_bounds(focus_secs, break_secs, cycles) {
+                    return err(msg);
+                }
+                let block = match st.blocks.iter().find(|b| b.id == block_id) {
+                    Some(b) => b.clone(),
+                    None => return err(format!("no block with id {block_id}")),
+                };
+                // Snapshot app enforcement at activation, exactly like
+                // StartBlock: a license change while the session runs — either
+                // direction — must not alter it. The lock mode is snapshotted
+                // from the saved block for the same reason.
+                let apps_enforced = {
+                    let lic = daemon.license.lock().await;
+                    has_feature(lic.as_ref(), &st, license::features::APP_BLOCKING)
+                };
+                let now = now_unix();
+                let cycles_u64 = cycles as u64;
+                // The whole set's wall-clock length: a hard backstop on the
+                // driven block. `cycles >= 1` here (bounds validated), so
+                // `cycles_u64 - 1` never underflows.
+                let span = focus_secs
+                    .saturating_mul(cycles_u64)
+                    .saturating_add(break_secs.saturating_mul(cycles_u64 - 1));
+                st.pomodoro = Some(PomodoroSession {
+                    block_id,
+                    focus_secs,
+                    break_secs,
+                    cycles_total: cycles,
+                    cycle_index: 0,
+                    phase: PomodoroPhase::Focus,
+                    phase_ends_unix: now.saturating_add(focus_secs),
+                });
+                st.active.push(ActiveBlock {
+                    lock: block.lock,
+                    block,
+                    started_at_unix: now,
+                    ends_at_unix: now.saturating_add(span),
+                    originator: Originator::Pomodoro,
+                    break_until_unix: None,
+                    apps_enforced,
+                });
+                if let Err(e) = state::save(&st, &daemon.key) {
+                    st.active.pop();
+                    st.pomodoro = None;
+                    return err(format!("save failed: {e}"));
+                }
+            }
+            if let Err(e) = enforce::sync(daemon).await {
+                error!(?e, "failed to apply enforcement after start_pomodoro");
+                return err(format!(
+                    "pomodoro started, but enforcement failed to apply (will retry): {e}"
+                ));
+            }
+            info!(block_id, focus_secs, break_secs, cycles, "pomodoro started");
+            Response::Ok {}
+        }
+
+        // Stop the running pomodoro session. Hybrid commitment model: allowed
+        // only during a break — refused mid-focus (you can't cave in the
+        // akratic moment, but you're not trapped for the whole set). Ungated
+        // by license, like TakeBreak.
+        Request::StopPomodoro {} => {
+            {
+                let mut st = daemon.state.lock().await;
+                let block_id = match &st.pomodoro {
+                    None => return err("no pomodoro session is running"),
+                    Some(s) => {
+                        if s.phase == PomodoroPhase::Focus {
+                            return err(
+                                "can't stop during a focus interval — end it during a break",
+                            );
+                        }
+                        s.block_id
+                    }
+                };
+                // Clear the session and end the driven block by setting its
+                // end to now: reconcile step 1 drops it next tick and records
+                // the single FocusSession through the existing choke point.
+                // Keep enough to roll back cleanly if the save fails (mirrors
+                // StartBlock/AddBlock).
+                let prev_pomodoro = st.pomodoro.take();
+                let prev_active = st.active.clone();
+                let now = now_unix();
+                for a in st.active.iter_mut().filter(|a| a.block.id == block_id) {
+                    a.ends_at_unix = now;
+                }
+                if let Err(e) = state::save(&st, &daemon.key) {
+                    st.pomodoro = prev_pomodoro;
+                    st.active = prev_active;
+                    return err(format!("save failed: {e}"));
+                }
+            }
+            if let Err(e) = enforce::sync(daemon).await {
+                error!(?e, "failed to apply enforcement after stop_pomodoro");
+                return err(format!(
+                    "pomodoro stopped, but enforcement failed to apply (will retry): {e}"
+                ));
+            }
+            info!("pomodoro stopped");
+            Response::Ok {}
+        }
     }
 }
 
@@ -892,6 +1037,32 @@ fn validate_schedule(s: &Schedule) -> Option<String> {
     }
     if s.start_minute as u32 + s.duration_minutes as u32 > 1440 {
         return Some("schedule cannot span midnight; split into two schedules instead".into());
+    }
+    None
+}
+
+/// Bounds for `StartPomodoro`, validated before any mutation. Pure so the
+/// accept/reject matrix is unit-testable without a live daemon. Returns
+/// `Some(user-facing error)` when out of range, `None` when acceptable.
+///
+/// Focus 1–180 min, break 1–60 min, cycles 1–12 (see the plan): wide enough
+/// for any real rhythm, tight enough that a fat-fingered value can't push the
+/// backstop absurdly far out.
+fn validate_pomodoro_bounds(focus_secs: u64, break_secs: u64, cycles: u32) -> Option<&'static str> {
+    const FOCUS_MIN: u64 = 60;
+    const FOCUS_MAX: u64 = 10_800; // 180 min
+    const BREAK_MIN: u64 = 60;
+    const BREAK_MAX: u64 = 3_600; // 60 min
+    const CYCLES_MIN: u32 = 1;
+    const CYCLES_MAX: u32 = 12;
+    if !(FOCUS_MIN..=FOCUS_MAX).contains(&focus_secs) {
+        return Some("focus interval must be between 1 and 180 minutes");
+    }
+    if !(BREAK_MIN..=BREAK_MAX).contains(&break_secs) {
+        return Some("break interval must be between 1 and 60 minutes");
+    }
+    if !(CYCLES_MIN..=CYCLES_MAX).contains(&cycles) {
+        return Some("cycles must be between 1 and 12");
     }
     None
 }
@@ -2023,5 +2194,206 @@ mod tests {
         assert_eq!(st.stats.days[0].breaks_refused, 1);
         // A refusal is never a break taken, and never opens one.
         assert!(st.active[0].break_until_unix.is_none());
+    }
+
+    // ── pomodoro (B2.c) ─────────────────────────────────────────────────────
+
+    fn pomo_active(block_id: u64) -> ActiveBlock {
+        ActiveBlock {
+            block: blk(block_id, vec![]),
+            started_at_unix: 0,
+            ends_at_unix: u64::MAX,
+            originator: Originator::Pomodoro,
+            break_until_unix: None,
+            apps_enforced: false,
+            lock: LockMode::Normal,
+        }
+    }
+
+    #[test]
+    fn validate_pomodoro_bounds_matrix() {
+        // In-range: accepted (25/5/4, and each boundary).
+        assert_eq!(validate_pomodoro_bounds(1500, 300, 4), None);
+        assert_eq!(validate_pomodoro_bounds(60, 60, 1), None);
+        assert_eq!(validate_pomodoro_bounds(10_800, 3_600, 12), None);
+        // Focus out of range.
+        assert!(validate_pomodoro_bounds(59, 300, 4)
+            .unwrap()
+            .contains("focus"));
+        assert!(validate_pomodoro_bounds(10_801, 300, 4)
+            .unwrap()
+            .contains("focus"));
+        // Break out of range (focus valid).
+        assert!(validate_pomodoro_bounds(1500, 59, 4)
+            .unwrap()
+            .contains("break"));
+        assert!(validate_pomodoro_bounds(1500, 3_601, 4)
+            .unwrap()
+            .contains("break"));
+        // Cycles out of range (focus + break valid).
+        assert!(validate_pomodoro_bounds(1500, 300, 0)
+            .unwrap()
+            .contains("cycles"));
+        assert!(validate_pomodoro_bounds(1500, 300, 13)
+            .unwrap()
+            .contains("cycles"));
+    }
+
+    fn start_pomodoro(block_id: u64, focus: u64, brk: u64, cycles: u32) -> Request {
+        Request::StartPomodoro {
+            block_id,
+            focus_secs: focus,
+            break_secs: brk,
+            cycles,
+        }
+    }
+
+    #[tokio::test]
+    async fn start_pomodoro_unlicensed_returns_feature_message() {
+        let daemon = test_daemon(); // no license cached
+        daemon.state.lock().await.blocks.push(blk(1, vec![]));
+        let resp = dispatch(start_pomodoro(1, 1500, 300, 4), &daemon).await;
+        assert_eq!(err_msg(resp), MSG_POMODORO);
+        assert!(daemon.state.lock().await.pomodoro.is_none());
+    }
+
+    #[tokio::test]
+    async fn start_pomodoro_rejects_out_of_range_bounds() {
+        // Licensed so the feature gate passes; bounds are checked before the
+        // block lookup, so the block need not even exist.
+        let daemon = test_daemon();
+        *daemon.license.lock().await = Some(claims("perpetual", None));
+        assert!(err_msg(dispatch(start_pomodoro(1, 59, 300, 4), &daemon).await).contains("focus"));
+        assert!(err_msg(dispatch(start_pomodoro(1, 1500, 59, 4), &daemon).await).contains("break"));
+        assert!(
+            err_msg(dispatch(start_pomodoro(1, 1500, 300, 13), &daemon).await).contains("cycles")
+        );
+        assert!(daemon.state.lock().await.pomodoro.is_none());
+    }
+
+    #[tokio::test]
+    async fn start_pomodoro_refused_when_already_running() {
+        let daemon = test_daemon();
+        *daemon.license.lock().await = Some(claims("perpetual", None));
+        {
+            let mut st = daemon.state.lock().await;
+            st.blocks.push(blk(1, vec![]));
+            st.pomodoro = Some(PomodoroSession {
+                block_id: 9,
+                focus_secs: 1500,
+                break_secs: 300,
+                cycles_total: 4,
+                cycle_index: 0,
+                phase: PomodoroPhase::Focus,
+                phase_ends_unix: u64::MAX,
+            });
+        }
+        let resp = dispatch(start_pomodoro(1, 1500, 300, 4), &daemon).await;
+        assert_eq!(err_msg(resp), "a pomodoro session is already running");
+    }
+
+    #[tokio::test]
+    async fn start_pomodoro_refused_when_block_already_active() {
+        let daemon = test_daemon();
+        *daemon.license.lock().await = Some(claims("perpetual", None));
+        {
+            let mut st = daemon.state.lock().await;
+            st.blocks.push(blk(1, vec![]));
+            st.active.push(active_with_lock(1, LockMode::Normal, 0));
+        }
+        let resp = dispatch(start_pomodoro(1, 1500, 300, 4), &daemon).await;
+        assert_eq!(err_msg(resp), "block 1 is already active");
+    }
+
+    #[tokio::test]
+    async fn start_pomodoro_refused_for_unknown_block() {
+        // Licensed, in-range bounds, but no such block: the lookup (after the
+        // bounds check) reports the unknown id.
+        let daemon = test_daemon();
+        *daemon.license.lock().await = Some(claims("perpetual", None));
+        let resp = dispatch(start_pomodoro(7, 1500, 300, 4), &daemon).await;
+        assert_eq!(err_msg(resp), "no block with id 7");
+    }
+
+    #[tokio::test]
+    async fn stop_pomodoro_no_session_errors() {
+        let daemon = test_daemon();
+        let resp = dispatch(Request::StopPomodoro {}, &daemon).await;
+        assert_eq!(err_msg(resp), "no pomodoro session is running");
+    }
+
+    #[tokio::test]
+    async fn stop_pomodoro_refused_during_focus() {
+        let daemon = test_daemon();
+        daemon.state.lock().await.pomodoro = Some(PomodoroSession {
+            block_id: 1,
+            focus_secs: 1500,
+            break_secs: 300,
+            cycles_total: 4,
+            cycle_index: 0,
+            phase: PomodoroPhase::Focus,
+            phase_ends_unix: u64::MAX,
+        });
+        let resp = dispatch(Request::StopPomodoro {}, &daemon).await;
+        assert_eq!(
+            err_msg(resp),
+            "can't stop during a focus interval — end it during a break"
+        );
+        // Refused before any mutation: the session is untouched.
+        assert!(daemon.state.lock().await.pomodoro.is_some());
+    }
+
+    #[tokio::test]
+    async fn stop_pomodoro_allowed_during_break_passes_the_gate() {
+        // Phase == Break: the commitment gate clears. The accept path then
+        // reaches state::save (which fails against the real state dir in
+        // tests) — proving the gate was passed without a writable dir. It is
+        // NOT the focus refusal and NOT the no-session error.
+        let daemon = test_daemon();
+        {
+            let mut st = daemon.state.lock().await;
+            st.active.push(pomo_active(1));
+            st.pomodoro = Some(PomodoroSession {
+                block_id: 1,
+                focus_secs: 1500,
+                break_secs: 300,
+                cycles_total: 4,
+                cycle_index: 1,
+                phase: PomodoroPhase::Break,
+                phase_ends_unix: u64::MAX,
+            });
+        }
+        let resp = dispatch(Request::StopPomodoro {}, &daemon).await;
+        match resp {
+            Response::Ok {} => {} // saved cleanly (writable dir) — also fine
+            Response::Error { message } => {
+                assert!(
+                    !message.contains("focus interval") && !message.contains("no pomodoro"),
+                    "break-phase stop must clear the gate, got: {message}"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn take_break_refused_on_a_pomodoro_active() {
+        // A pomodoro-driven block owns its break schedule: a manual break is
+        // refused before any mutation.
+        let daemon = test_daemon();
+        {
+            let mut st = daemon.state.lock().await;
+            let mut a = pomo_active(1);
+            a.block.allowance_secs_per_day = 600; // even with allowance, refused
+            st.active.push(a);
+        }
+        let resp = dispatch(take_break(1, None), &daemon).await;
+        assert_eq!(
+            err_msg(resp),
+            "this block is running a pomodoro session — breaks are automatic"
+        );
+        let st = daemon.state.lock().await;
+        assert!(st.active[0].break_until_unix.is_none());
+        assert!(st.allowance.is_empty());
     }
 }

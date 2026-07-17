@@ -81,6 +81,9 @@ async fn get_status() -> Result<StatusOut, String> {
             license_email,
             license_expires_at,
             licensed_features,
+            // The pomodoro session view is consumed by the follow-up Pomodoro
+            // tab; ignored here so this existing command keeps compiling.
+            pomodoro: _,
         } => Ok(StatusOut {
             active,
             now_unix,

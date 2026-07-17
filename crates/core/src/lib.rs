@@ -71,6 +71,11 @@ pub enum Originator {
     Manual,
     /// Started by the recurring-schedule engine.
     Schedule { schedule_id: u64 },
+    /// Driven by a pomodoro session (see [`PomodoroSession`]). Behaves like
+    /// `Manual` for reconcile — it is not schedule-window-driven, so it is
+    /// retained across ticks and ends only by its own `ends_at_unix` (the
+    /// set's wall-clock backstop) or an explicit `stop_pomodoro`.
+    Pomodoro,
 }
 
 /// A block that is currently being enforced.
@@ -146,6 +151,9 @@ pub enum Origin {
     Manual,
     /// Started by the recurring-schedule engine.
     Schedule,
+    /// Driven by a pomodoro session. Labels the single break-inclusive
+    /// [`FocusSession`] a pomodoro set records at its end.
+    Pomodoro,
 }
 
 impl From<&Originator> for Origin {
@@ -153,6 +161,7 @@ impl From<&Originator> for Origin {
         match o {
             Originator::Manual => Origin::Manual,
             Originator::Schedule { .. } => Origin::Schedule,
+            Originator::Pomodoro => Origin::Pomodoro,
         }
     }
 }
@@ -358,6 +367,62 @@ impl UsageStats {
     }
 }
 
+/// Which half of the pomodoro rhythm a session is currently in.
+///
+/// A session alternates `Focus` (the block is enforced) and `Break` (the
+/// block's `break_until_unix` is set, lifting enforcement without touching
+/// the break-allowance ledger). `Default` is `Focus`: a session always opens
+/// on a focus interval, and old state that predates this field reads as such.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PomodoroPhase {
+    /// The driven block is enforced.
+    #[default]
+    Focus,
+    /// The driven block is on an auto-break; enforcement is lifted.
+    Break,
+}
+
+/// The phase machine driving ONE saved block through alternating focus/break
+/// intervals. Lives in [`State::pomodoro`] and is advanced once per scheduler
+/// tick (see the daemon's `advance_pomodoro`). Only one session runs at a
+/// time. It reuses the [`ActiveBlock`] identified by `block_id` for
+/// enforcement rather than a parallel path: focus enforces, break lifts via
+/// that block's `break_until_unix`. Persisted like the block itself, so an
+/// in-flight session resumes across a daemon restart.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PomodoroSession {
+    /// The saved block this session drives (its [`ActiveBlock`] carries
+    /// `Originator::Pomodoro`).
+    pub block_id: u64,
+    /// Length of each focus interval, in seconds.
+    pub focus_secs: u64,
+    /// Length of each auto-break between focus intervals, in seconds.
+    pub break_secs: u64,
+    /// Number of focus intervals in the set.
+    pub cycles_total: u32,
+    /// 0-based index of the current focus interval.
+    pub cycle_index: u32,
+    /// Whether the session is mid-focus or mid-break right now.
+    pub phase: PomodoroPhase,
+    /// Unix time the current phase ends; the tick advances the machine once
+    /// `now >= phase_ends_unix`.
+    pub phase_ends_unix: u64,
+}
+
+/// The running-session view a `Status` response carries so the GUI can render
+/// the pomodoro banner and cycle progress. A projection of the live
+/// [`PomodoroSession`] (omitting the interval lengths the GUI does not need to
+/// redraw); `None` when no session is running.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PomodoroStatus {
+    pub block_id: u64,
+    pub phase: PomodoroPhase,
+    pub phase_ends_unix: u64,
+    pub cycle_index: u32,
+    pub cycles_total: u32,
+}
+
 /// Daemon-side persisted state.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
@@ -396,6 +461,13 @@ pub struct State {
     /// state written before this field existed still loads clean.
     #[serde(default)]
     pub stats: UsageStats,
+    /// The in-flight pomodoro session, if one is running. Drives exactly one
+    /// active block through focus/break intervals; advanced once per
+    /// scheduler tick. `serde(default)` so state written before this field
+    /// existed still loads, and an in-flight session persists across a daemon
+    /// restart (resumes on reload, like an in-flight block).
+    #[serde(default)]
+    pub pomodoro: Option<PomodoroSession>,
 }
 
 fn deserialize_active<'de, D>(d: D) -> Result<Vec<ActiveBlock>, D::Error>
@@ -487,6 +559,21 @@ pub enum Request {
     /// READ only — recording is always on): unlicensed callers get the
     /// feature message.
     GetUsageStats {},
+    /// Start a pomodoro session driving block `block_id` through `cycles`
+    /// focus intervals of `focus_secs` each, separated by `break_secs`
+    /// auto-breaks. Gated on the `pomodoro` feature (activation-time, like
+    /// `StartBlock`'s snapshots); refused if a session already runs, the
+    /// block is already active or unknown, or the bounds are out of range.
+    StartPomodoro {
+        block_id: u64,
+        focus_secs: u64,
+        break_secs: u64,
+        cycles: u32,
+    },
+    /// Stop the running pomodoro session. Hybrid commitment model: allowed
+    /// only during a break — refused while a focus interval is in progress.
+    /// Ungated (like `TakeBreak`).
+    StopPomodoro {},
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -535,6 +622,10 @@ pub enum Response {
         /// populated while the license is valid — this drives gating display.
         #[serde(default)]
         licensed_features: Vec<String>,
+        /// The running pomodoro session's live view, or `None` when no
+        /// session is running. Drives the GUI's Pomodoro banner/progress.
+        #[serde(default)]
+        pomodoro: Option<PomodoroStatus>,
     },
     Added {
         id: u64,
@@ -945,5 +1036,142 @@ mod tests {
             Origin::Schedule
         );
         assert_eq!(Origin::from(&Originator::Manual), Origin::Manual);
+    }
+
+    // ── pomodoro (B2.c) ─────────────────────────────────────────────────────
+
+    // Pin the new Origin/Originator variants' snake_case wire and the
+    // Origin::from mapping.
+    #[test]
+    fn pomodoro_origin_and_originator_wire() {
+        assert_eq!(
+            serde_json::to_string(&Origin::Pomodoro).unwrap(),
+            r#""pomodoro""#
+        );
+        assert_eq!(Origin::from(&Originator::Pomodoro), Origin::Pomodoro);
+        // Unit-like Originator variant under the "kind" tag.
+        let json = serde_json::to_string(&Originator::Pomodoro).unwrap();
+        assert_eq!(json, r#"{"kind":"pomodoro"}"#);
+        let back: Originator = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Originator::Pomodoro);
+    }
+
+    // Pin PomodoroPhase's snake_case wire values and Default = Focus.
+    #[test]
+    fn pomodoro_phase_wire_and_default() {
+        assert_eq!(
+            serde_json::to_string(&PomodoroPhase::Focus).unwrap(),
+            r#""focus""#
+        );
+        assert_eq!(
+            serde_json::to_string(&PomodoroPhase::Break).unwrap(),
+            r#""break""#
+        );
+        assert_eq!(
+            serde_json::from_str::<PomodoroPhase>(r#""break""#).unwrap(),
+            PomodoroPhase::Break
+        );
+        assert_eq!(PomodoroPhase::default(), PomodoroPhase::Focus);
+    }
+
+    // Pin the wire tags of the new request frames.
+    #[test]
+    fn pomodoro_request_wire_tags_round_trip() {
+        let req: Request = serde_json::from_str(
+            r#"{"method":"start_pomodoro","block_id":3,"focus_secs":1500,"break_secs":300,"cycles":4}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            req,
+            Request::StartPomodoro {
+                block_id: 3,
+                focus_secs: 1500,
+                break_secs: 300,
+                cycles: 4,
+            }
+        ));
+        let json = serde_json::to_string(&Request::StartPomodoro {
+            block_id: 3,
+            focus_secs: 1500,
+            break_secs: 300,
+            cycles: 4,
+        })
+        .unwrap();
+        assert!(json.contains(r#""method":"start_pomodoro""#), "got {json}");
+
+        let req: Request = serde_json::from_str(r#"{"method":"stop_pomodoro"}"#).unwrap();
+        assert!(matches!(req, Request::StopPomodoro {}));
+        let json = serde_json::to_string(&Request::StopPomodoro {}).unwrap();
+        assert!(json.contains(r#""method":"stop_pomodoro""#), "got {json}");
+    }
+
+    // The Status frame carries the new `pomodoro` field; a Some(..) value
+    // round-trips, and old frames without it default to None (covered by
+    // `status_without_license_fields_still_deserializes` above via `..`).
+    #[test]
+    fn status_pomodoro_field_round_trips() {
+        let resp = Response::Status {
+            active: vec![],
+            now_unix: 1000,
+            password_set: false,
+            unlocked: true,
+            allowance_used: vec![],
+            license_present: true,
+            license_valid: true,
+            license_kind: Some("perpetual".into()),
+            license_email: None,
+            license_expires_at: None,
+            licensed_features: vec![],
+            pomodoro: Some(PomodoroStatus {
+                block_id: 7,
+                phase: PomodoroPhase::Break,
+                phase_ends_unix: 1300,
+                cycle_index: 1,
+                cycles_total: 4,
+            }),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        match back {
+            Response::Status { pomodoro, .. } => {
+                let p = pomodoro.expect("pomodoro present");
+                assert_eq!(p.block_id, 7);
+                assert_eq!(p.phase, PomodoroPhase::Break);
+                assert_eq!(p.phase_ends_unix, 1300);
+                assert_eq!(p.cycle_index, 1);
+                assert_eq!(p.cycles_total, 4);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    // A PomodoroSession survives a state round-trip, and old state without
+    // the field loads as None (resume-on-restart shape).
+    #[test]
+    fn state_pomodoro_round_trips_and_defaults_none() {
+        let old = r#"{ "next_id": 1, "blocks": [] }"#;
+        let st: State = serde_json::from_str(old).unwrap();
+        assert!(st.pomodoro.is_none());
+
+        let st = State {
+            pomodoro: Some(PomodoroSession {
+                block_id: 5,
+                focus_secs: 1500,
+                break_secs: 300,
+                cycles_total: 4,
+                cycle_index: 2,
+                phase: PomodoroPhase::Focus,
+                phase_ends_unix: 9999,
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&st).unwrap();
+        let back: State = serde_json::from_str(&json).unwrap();
+        let p = back.pomodoro.expect("session present");
+        assert_eq!(p.block_id, 5);
+        assert_eq!(p.cycle_index, 2);
+        assert_eq!(p.cycles_total, 4);
+        assert_eq!(p.phase, PomodoroPhase::Focus);
+        assert_eq!(p.phase_ends_unix, 9999);
     }
 }

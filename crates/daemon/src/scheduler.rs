@@ -18,7 +18,8 @@ use std::time::Duration;
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
 use grepfocus_core::license::features;
 use grepfocus_core::{
-    day_set, now_unix, ActiveBlock, FocusSession, Origin, Originator, Schedule, State, UsageStats,
+    day_set, now_unix, ActiveBlock, FocusSession, Origin, Originator, PomodoroPhase,
+    PomodoroSession, Schedule, State, UsageStats,
 };
 use tracing::{error, info, warn};
 
@@ -89,7 +90,26 @@ async fn tick(daemon: &Arc<Daemon>, skipped_fires: &mut HashSet<(u64, u64)>) {
                 app_blocking: has_feature(lic.as_ref(), &st, features::APP_BLOCKING),
             }
         };
-        if reconcile(&mut st, now_unix, &now_local, today, &gates, skipped_fires) {
+        // Advance the pomodoro phase machine BEFORE reconcile, deliberately:
+        // on the last focus interval `advance_pomodoro` only clears the
+        // session and leaves the driven `ActiveBlock` in place, handing the
+        // drop + single `FocusSession` record to reconcile step 1 in this same
+        // tick (the block's `ends_at_unix` == the last focus's `phase_ends`, so
+        // step 1 fires). Running first also means the two never fight over
+        // `break_until_unix`: advance sets a future break (step 4 leaves it) or
+        // clears an elapsed one (step 4 then finds nothing) — either way they
+        // converge. A phase transition MUST be persisted or a restart loses it,
+        // so its `changed` is OR'd into reconcile's before the save.
+        let pomo_changed = {
+            // Split the borrow: advance_pomodoro needs `pomodoro` and `active`
+            // mutably at once.
+            let State {
+                pomodoro, active, ..
+            } = &mut *st;
+            advance_pomodoro(pomodoro, active, now_unix)
+        };
+        let reconciled = reconcile(&mut st, now_unix, &now_local, today, &gates, skipped_fires);
+        if pomo_changed || reconciled {
             if let Err(e) = state::save(&st, &daemon.key) {
                 error!(?e, "scheduler save failed");
             }
@@ -117,6 +137,92 @@ async fn tick(daemon: &Arc<Daemon>, skipped_fires: &mut HashSet<(u64, u64)>) {
 /// per active block.
 fn prune_break_challenges(pending: &mut HashMap<u64, String>, active: &[ActiveBlock]) {
     pending.retain(|block_id, _| active.iter().any(|a| a.block.id == *block_id));
+}
+
+/// Advance the pomodoro phase machine one tick. Pure over `(session, active,
+/// now)` — no clock, no IO — so the transitions are unit-testable. Returns
+/// whether anything changed (the caller persists on `true`; an unpersisted
+/// phase transition would be lost on restart).
+///
+/// Runs BEFORE `reconcile` in the tick (see `tick`). Transition rules once the
+/// current phase has elapsed (`now >= phase_ends_unix`):
+/// * Focus ended, more cycles remain → enter Break: set the driven block's
+///   `break_until_unix = now + break_secs` (lifting enforcement directly,
+///   never touching the allowance ledger), and move `phase`/`phase_ends`.
+/// * Focus ended on the LAST cycle → clear the session and leave the
+///   `ActiveBlock` in place; its `ends_at_unix` (the set backstop) equals this
+///   focus's `phase_ends`, so reconcile step 1 drops it and records the ONE
+///   break-inclusive `FocusSession` through the existing single choke point.
+/// * Break ended → bump `cycle_index`, return to Focus, and clear the block's
+///   `break_until_unix` (reconcile step 4 would also clear an elapsed break —
+///   idempotent; clearing here keeps the block's state self-consistent).
+///
+/// Prune (checked first): if the session's block is no longer active — expired
+/// via its backstop, or force-ended — clear the session, mirroring
+/// `prune_break_challenges`.
+fn advance_pomodoro(
+    session: &mut Option<PomodoroSession>,
+    active: &mut [ActiveBlock],
+    now: u64,
+) -> bool {
+    let s = match session {
+        Some(s) => s,
+        None => return false,
+    };
+
+    // Prune: the driven block is gone (backstop expiry recorded it in step 1,
+    // or it was force-ended). Nothing left to drive.
+    if !active.iter().any(|a| a.block.id == s.block_id) {
+        *session = None;
+        return true;
+    }
+
+    if now < s.phase_ends_unix {
+        return false;
+    }
+
+    match s.phase {
+        PomodoroPhase::Focus => {
+            if s.cycle_index + 1 < s.cycles_total {
+                // Enter the auto-break: lift enforcement on the driven block.
+                if let Some(a) = active.iter_mut().find(|a| a.block.id == s.block_id) {
+                    a.break_until_unix = Some(now + s.break_secs);
+                }
+                s.phase = PomodoroPhase::Break;
+                s.phase_ends_unix = now + s.break_secs;
+                info!(
+                    block_id = s.block_id,
+                    cycle_index = s.cycle_index,
+                    "pomodoro: focus interval ended, entering break"
+                );
+                true
+            } else {
+                // Last focus interval done: the block's backstop has been
+                // reached — hand the drop + record to reconcile step 1.
+                let block_id = s.block_id;
+                *session = None;
+                info!(
+                    block_id,
+                    "pomodoro: final focus interval ended, session complete"
+                );
+                true
+            }
+        }
+        PomodoroPhase::Break => {
+            s.cycle_index += 1;
+            s.phase = PomodoroPhase::Focus;
+            s.phase_ends_unix = now + s.focus_secs;
+            if let Some(a) = active.iter_mut().find(|a| a.block.id == s.block_id) {
+                a.break_until_unix = None;
+            }
+            info!(
+                block_id = s.block_id,
+                cycle_index = s.cycle_index,
+                "pomodoro: break ended, resuming focus"
+            );
+            true
+        }
+    }
 }
 
 /// Bring `st.active` into agreement with wall-clock expiry and the schedule
@@ -176,6 +282,10 @@ fn reconcile(
     let before = st.active.len();
     let (kept, ended) = partition_active(std::mem::take(&mut st.active), |a| match &a.originator {
         Originator::Manual => true,
+        // Not schedule-window-driven: retained like Manual. A pomodoro active
+        // ends only by its own `ends_at_unix` (the set backstop, step 1) or by
+        // `stop_pomodoro`; `advance_pomodoro` drives its focus/break rhythm.
+        Originator::Pomodoro => true,
         Originator::Schedule { schedule_id } => schedules
             .iter()
             .find(|s| s.id == *schedule_id)
@@ -894,6 +1004,161 @@ mod tests {
             &mut HashSet::new()
         ));
         assert_eq!(st.active[0].lock, LockMode::Normal);
+    }
+
+    // ── pomodoro: advance_pomodoro (B2.c) ───────────────────────────────────
+
+    fn pomo_active(block_id: u64, ends_at_unix: u64) -> ActiveBlock {
+        ActiveBlock {
+            block: block(block_id),
+            started_at_unix: 0,
+            ends_at_unix,
+            originator: Originator::Pomodoro,
+            break_until_unix: None,
+            apps_enforced: false,
+            lock: LockMode::Normal,
+        }
+    }
+
+    fn pomo_session(
+        block_id: u64,
+        phase: PomodoroPhase,
+        cycle_index: u32,
+        cycles_total: u32,
+        phase_ends_unix: u64,
+    ) -> PomodoroSession {
+        PomodoroSession {
+            block_id,
+            focus_secs: 1500,
+            break_secs: 300,
+            cycles_total,
+            cycle_index,
+            phase,
+            phase_ends_unix,
+        }
+    }
+
+    #[test]
+    fn advance_pomodoro_none_and_before_phase_end_are_noops() {
+        assert!(!advance_pomodoro(&mut None, &mut [], 1000));
+
+        let mut session = Some(pomo_session(1, PomodoroPhase::Focus, 0, 4, 2000));
+        let mut active = vec![pomo_active(1, u64::MAX)];
+        // now < phase_ends: nothing changes — this is also the restart-resume
+        // shape (an in-flight focus interval keeps running on reload).
+        assert!(!advance_pomodoro(&mut session, &mut active, 1000));
+        let s = session.unwrap();
+        assert_eq!(s.phase, PomodoroPhase::Focus);
+        assert_eq!(s.cycle_index, 0);
+        assert!(active[0].break_until_unix.is_none());
+    }
+
+    #[test]
+    fn advance_pomodoro_focus_to_break_sets_break_until() {
+        let now = 2000;
+        let mut session = Some(pomo_session(1, PomodoroPhase::Focus, 0, 4, now));
+        let mut active = vec![pomo_active(1, u64::MAX)];
+        assert!(advance_pomodoro(&mut session, &mut active, now));
+        let s = session.unwrap();
+        assert_eq!(s.phase, PomodoroPhase::Break);
+        assert_eq!(s.cycle_index, 0); // not yet bumped — that happens on resume
+        assert_eq!(s.phase_ends_unix, now + s.break_secs);
+        assert_eq!(active[0].break_until_unix, Some(now + 300));
+    }
+
+    #[test]
+    fn advance_pomodoro_break_to_focus_bumps_cycle_and_clears_break() {
+        let now = 2000;
+        let mut session = Some(pomo_session(1, PomodoroPhase::Break, 0, 4, now));
+        let mut active = vec![pomo_active(1, u64::MAX)];
+        active[0].break_until_unix = Some(now - 5); // break has elapsed
+        assert!(advance_pomodoro(&mut session, &mut active, now));
+        let s = session.unwrap();
+        assert_eq!(s.phase, PomodoroPhase::Focus);
+        assert_eq!(s.cycle_index, 1);
+        assert_eq!(s.phase_ends_unix, now + s.focus_secs);
+        assert!(active[0].break_until_unix.is_none());
+    }
+
+    #[test]
+    fn advance_pomodoro_last_focus_clears_session_but_keeps_block() {
+        let now = 2000;
+        // cycle_index + 1 == cycles_total: the final focus interval.
+        let mut session = Some(pomo_session(1, PomodoroPhase::Focus, 3, 4, now));
+        let mut active = vec![pomo_active(1, now)]; // backstop reached
+        assert!(advance_pomodoro(&mut session, &mut active, now));
+        assert!(session.is_none(), "session cleared on the last focus");
+        // The block is LEFT for reconcile step 1 to drop + record.
+        assert_eq!(active.len(), 1);
+    }
+
+    #[test]
+    fn advance_pomodoro_prunes_when_block_gone() {
+        // The driven block expired via its backstop (or was force-ended) and
+        // is no longer active: clear the orphaned session.
+        let mut session = Some(pomo_session(1, PomodoroPhase::Break, 1, 4, 5000));
+        let mut active: Vec<ActiveBlock> = vec![];
+        assert!(advance_pomodoro(&mut session, &mut active, 1000));
+        assert!(session.is_none());
+    }
+
+    #[test]
+    fn pomodoro_last_cycle_records_exactly_one_pomodoro_session() {
+        // The tick order: advance_pomodoro (clears the session on the final
+        // focus) THEN reconcile step 1 (drops the backstop-reached block and
+        // records the ONE break-inclusive FocusSession, origin Pomodoro).
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let today = day_of(&now_l);
+        let mut st = State::default();
+        let mut a = pomo_active(0, now); // ends_at == now (set backstop reached)
+        a.started_at_unix = now - 100; // ran 100s wall-clock
+        st.active.push(a);
+        st.pomodoro = Some(pomo_session(0, PomodoroPhase::Focus, 3, 4, now));
+
+        let pomo_changed = advance_pomodoro(&mut st.pomodoro, &mut st.active, now);
+        assert!(pomo_changed);
+        assert!(st.pomodoro.is_none());
+        let reconciled = reconcile(
+            &mut st,
+            now,
+            &now_l,
+            today,
+            &all_gates(),
+            &mut HashSet::new(),
+        );
+        assert!(reconciled);
+        assert!(st.active.is_empty());
+        assert_eq!(st.stats.sessions.len(), 1);
+        assert_eq!(st.stats.sessions[0].origin, Origin::Pomodoro);
+        assert_eq!(st.stats.sessions[0].duration_secs, 100);
+        assert_eq!(st.stats.totals.sessions, 1);
+    }
+
+    #[test]
+    fn reconcile_retains_a_running_pomodoro_active() {
+        // Step 2 retains a Pomodoro active like Manual — it is not
+        // schedule-window-driven. A mid-focus session on reload keeps running
+        // and records no false end.
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let mut st = State::default();
+        st.active.push(pomo_active(0, now + 3600)); // backstop in the future
+        st.pomodoro = Some(pomo_session(0, PomodoroPhase::Focus, 0, 4, now + 1500));
+        let pomo_changed = advance_pomodoro(&mut st.pomodoro, &mut st.active, now);
+        let reconciled = reconcile(
+            &mut st,
+            now,
+            &now_l,
+            day_of(&now_l),
+            &all_gates(),
+            &mut HashSet::new(),
+        );
+        assert!(!pomo_changed);
+        assert!(!reconciled);
+        assert_eq!(st.active.len(), 1);
+        assert!(st.pomodoro.is_some());
+        assert!(st.stats.sessions.is_empty());
     }
 
     #[test]
