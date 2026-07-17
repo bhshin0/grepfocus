@@ -6,6 +6,7 @@ fn main() {
             "delete_block",
             "start_block",
             "get_status",
+            "get_usage_stats",
             "list_schedules",
             "add_schedule",
             "update_schedule",

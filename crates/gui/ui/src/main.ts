@@ -77,6 +77,7 @@ tabs.forEach((btn) => {
     if (target === "list") refreshList();
     if (target === "status") refreshStatus();
     if (target === "schedules") refreshSchedules();
+    if (target === "stats") refreshStats();
     if (target === "settings") refreshSettings();
     if (target === "license") refreshLicense();
   });
@@ -267,6 +268,12 @@ async function refreshStatus() {
   try {
     const s = await invoke<Status>("get_status");
     activeServerSkew = s.now_unix - Math.floor(Date.now() / 1000);
+    // Premium is all-or-nothing: a valid license reveals the Stats tab, an
+    // invalid/absent one hides it. This poll is the single place license
+    // state is refreshed, so gate here. When the tab is already open, keep it
+    // live without adding load while it is hidden.
+    applyStatsGating(s.license_valid);
+    if (statsTabVisible()) void refreshStats();
     if (s.active.length === 0) {
       statusEl.innerHTML = `<p class="empty">No active block. Pick one from "Block list" to start, or set up a schedule.</p>`;
       stopCountdownTimer();
@@ -1011,6 +1018,231 @@ licenseRemove.addEventListener("click", async () => {
     licenseMsg.textContent = String(e);
   }
 });
+
+// ─── Stats (premium) ─────────────────────────────────────────────────────────
+
+interface LifetimeTotals {
+  focus_secs: number;
+  sessions: number;
+  app_kills: number;
+  breaks_refused: number;
+}
+
+/// Mirrors core's `Origin` (snake_case on the wire).
+type Origin = "manual" | "schedule";
+
+interface FocusSession {
+  block_id: number;
+  name: string;
+  started_at_unix: number;
+  ended_at_unix: number;
+  origin: Origin;
+  duration_secs: number;
+}
+
+interface DayStat {
+  /// `num_days_from_ce` (a local-day integer), NOT a unix timestamp — use only
+  /// for ordering and labels relative to today, never as a clock time.
+  day: number;
+  focus_secs: number;
+  sessions_completed: number;
+  breaks_taken: number;
+  break_secs: number;
+  breaks_refused: number;
+  app_kills: number;
+}
+
+interface UsageStats {
+  totals: LifetimeTotals;
+  /// Stored ring, oldest-last — reverse for newest-first display.
+  sessions: FocusSession[];
+  /// Recent window, sorted ascending (oldest-first), last ~30 rollups.
+  days: DayStat[];
+  current_streak: number;
+  longest_streak: number;
+}
+
+const statsTabBtn = document.querySelector<HTMLButtonElement>("#stats-tab-btn")!;
+const statsEl = document.querySelector<HTMLDivElement>("#stats-content")!;
+const statsSection = document.querySelector<HTMLElement>("#stats")!;
+const statusTabBtn = document.querySelector<HTMLButtonElement>('nav button[data-tab="status"]')!;
+
+function statsTabVisible(): boolean {
+  return statsSection.classList.contains("active");
+}
+
+/// Show the Stats nav button only when licensed. If the license lapses while
+/// the tab is open, fall back to Status so the user is never stranded on a tab
+/// that is about to stop answering.
+function applyStatsGating(licenseValid: boolean) {
+  statsTabBtn.hidden = !licenseValid;
+  if (!licenseValid && statsTabVisible()) statusTabBtn.click();
+}
+
+/// Compact focus duration: "3h 20m" / "45m" / "30s". Distinct from
+/// `fmtRemaining` (a HH:MM:SS countdown) — a headline total reads better as
+/// human units than as a colon-clock.
+function fmtDuration(secs: number): string {
+  const s = Math.max(0, Math.floor(secs));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  if (m > 0) return `${m}m`;
+  return `${s}s`;
+}
+
+/// Relative label for a unix timestamp: "just now" / "2h ago" / "3d ago", and
+/// an absolute date once it is older than a week.
+function fmtWhen(unixSecs: number): string {
+  const diff = Math.floor(Date.now() / 1000) - unixSecs;
+  if (diff < 60) return "just now";
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  if (diff < 7 * 86400) return `${Math.floor(diff / 86400)}d ago`;
+  return new Date(unixSecs * 1000).toLocaleDateString();
+}
+
+/// Today's `num_days_from_ce` in local time — mirrors core's day integer so a
+/// `DayStat.day` can be labelled relative to today. 719163 = the CE ordinal of
+/// the unix epoch (1970-01-01); the offset shifts UTC to local midnight.
+function todayFromCe(): number {
+  const now = new Date();
+  const localMs = now.getTime() - now.getTimezoneOffset() * 60000;
+  return 719163 + Math.floor(localMs / 86400000);
+}
+
+function dayLabel(day: number, today: number): string {
+  const delta = today - day;
+  if (delta === 0) return "today";
+  if (delta === 1) return "yesterday";
+  return `${delta}d ago`;
+}
+
+function statTile(label: string, value: string, sub?: string): HTMLElement {
+  const tile = document.createElement("div");
+  tile.className = "stat-tile";
+  const v = document.createElement("div");
+  v.className = "stat-value";
+  v.textContent = value;
+  const l = document.createElement("div");
+  l.className = "stat-label";
+  l.textContent = label;
+  tile.append(v, l);
+  if (sub != null) {
+    const sb = document.createElement("div");
+    sb.className = "stat-sub";
+    sb.textContent = sub;
+    tile.appendChild(sb);
+  }
+  return tile;
+}
+
+function emptyDiv(text: string): HTMLDivElement {
+  const div = document.createElement("div");
+  div.className = "empty";
+  div.textContent = text;
+  return div;
+}
+
+function renderStats(stats: UsageStats) {
+  statsEl.innerHTML = "";
+
+  // Headline tiles.
+  const tiles = document.createElement("div");
+  tiles.className = "stat-tiles";
+  tiles.append(
+    statTile(
+      "Current streak",
+      `${stats.current_streak} day${stats.current_streak === 1 ? "" : "s"}`,
+      `best: ${stats.longest_streak}`,
+    ),
+    statTile("Total focus", fmtDuration(stats.totals.focus_secs)),
+    statTile("Sessions completed", String(stats.totals.sessions)),
+    statTile("Apps blocked", String(stats.totals.app_kills)),
+    statTile("Temptations resisted", String(stats.totals.breaks_refused)),
+  );
+  statsEl.appendChild(tiles);
+
+  // Per-day focus bars.
+  const chartWrap = document.createElement("div");
+  chartWrap.className = "stats-section";
+  const chartHead = document.createElement("h3");
+  chartHead.textContent = "Focus, last 30 days";
+  chartWrap.appendChild(chartHead);
+  if (stats.days.length === 0) {
+    chartWrap.appendChild(emptyDiv("No focus sessions recorded yet."));
+  } else {
+    const today = todayFromCe();
+    const maxSecs = Math.max(...stats.days.map((d) => d.focus_secs), 1);
+    const chart = document.createElement("div");
+    chart.className = "day-bars";
+    for (const d of stats.days) {
+      const col = document.createElement("div");
+      col.className = "day-bar";
+      const fill = document.createElement("div");
+      fill.className = "day-bar-fill";
+      // Floor at a hairline so a day with any focus is still visibly nonzero.
+      const pct = d.focus_secs > 0 ? Math.max(2, Math.round((d.focus_secs / maxSecs) * 100)) : 0;
+      fill.style.height = `${pct}%`;
+      col.title = `${dayLabel(d.day, today)}: ${fmtDuration(d.focus_secs)} · ${d.sessions_completed} session${d.sessions_completed === 1 ? "" : "s"}`;
+      col.appendChild(fill);
+      chart.appendChild(col);
+    }
+    chartWrap.appendChild(chart);
+  }
+  statsEl.appendChild(chartWrap);
+
+  // Recent sessions, newest first (the stored ring is oldest-last).
+  const sessWrap = document.createElement("div");
+  sessWrap.className = "stats-section";
+  const sessHead = document.createElement("h3");
+  sessHead.textContent = "Recent sessions";
+  sessWrap.appendChild(sessHead);
+  if (stats.sessions.length === 0) {
+    sessWrap.appendChild(emptyDiv("No completed sessions yet."));
+  } else {
+    const ul = document.createElement("ul");
+    ul.className = "session-list";
+    for (const s of [...stats.sessions].reverse()) {
+      const li = document.createElement("li");
+      li.className = "session-row";
+      const name = document.createElement("span");
+      name.className = "session-name";
+      name.textContent = s.name;
+      const meta = document.createElement("span");
+      meta.className = "session-meta";
+      const origin = s.origin === "schedule" ? "scheduled" : "manual";
+      meta.textContent = `${fmtDuration(s.duration_secs)} · ${origin} · ${fmtWhen(s.ended_at_unix)}`;
+      li.append(name, meta);
+      ul.appendChild(li);
+    }
+    sessWrap.appendChild(ul);
+  }
+  statsEl.appendChild(sessWrap);
+}
+
+async function refreshStats() {
+  try {
+    const stats = await invoke<UsageStats>("get_usage_stats");
+    renderStats(stats);
+  } catch (e) {
+    // The daemon is the authority on the gate, so it may refuse even when the
+    // UI thinks we're licensed. Surface its premium refusal as a soft note, any
+    // other failure (daemon down, etc.) as a plain error — never a raw dump for
+    // the expected case.
+    const msg = String(e);
+    statsEl.innerHTML = "";
+    const p = document.createElement("p");
+    if (/premium/i.test(msg)) {
+      p.className = "msg";
+      p.textContent = "Usage stats are a premium feature.";
+    } else {
+      p.className = "msg error";
+      p.textContent = msg;
+    }
+    statsEl.appendChild(p);
+  }
+}
 
 // ─── Shared helpers ────────────────────────────────────────────────────────
 

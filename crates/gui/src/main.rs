@@ -7,7 +7,10 @@ mod tray;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use grepfocus_core::{ActiveBlock, AllowanceLedger, Block, Request, Response, Schedule};
+use grepfocus_core::{
+    ActiveBlock, AllowanceLedger, Block, DayStat, FocusSession, LifetimeTotals, Request, Response,
+    Schedule,
+};
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
@@ -148,6 +151,40 @@ async fn take_break(block_id: u64, secs: u64, challenge: Option<String>) -> Resu
 async fn get_break_challenge(block_id: u64) -> Result<String, String> {
     match client::call(Request::GetBreakChallenge { block_id }).await? {
         Response::BreakChallenge { text } => Ok(text),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+/// Usage-stats payload, mirroring `Response::UsageStats`. The nested core types
+/// already derive `Serialize`, so they cross to the frontend as-is. Gated by the
+/// daemon on the `usage_stats` feature — an unlicensed request comes back as
+/// `Response::Error` and surfaces to JS as the thrown feature-gate string.
+#[derive(serde::Serialize)]
+struct UsageStatsOut {
+    totals: LifetimeTotals,
+    sessions: Vec<FocusSession>,
+    days: Vec<DayStat>,
+    current_streak: u32,
+    longest_streak: u32,
+}
+
+#[tauri::command]
+async fn get_usage_stats() -> Result<UsageStatsOut, String> {
+    match client::call(Request::GetUsageStats {}).await? {
+        Response::UsageStats {
+            totals,
+            sessions,
+            days,
+            current_streak,
+            longest_streak,
+        } => Ok(UsageStatsOut {
+            totals,
+            sessions,
+            days,
+            current_streak,
+            longest_streak,
+        }),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),
     }
@@ -377,6 +414,7 @@ fn main() {
             delete_block,
             start_block,
             get_status,
+            get_usage_stats,
             list_schedules,
             add_schedule,
             update_schedule,
