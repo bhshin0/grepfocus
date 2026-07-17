@@ -118,6 +118,15 @@ to be redone when the item is picked up.
   match, single-use, and retired when the block deactivates
   (`prune_break_challenges`). No `NoBreaks` variant — `allowance == 0` already
   gives that free. Remaining B2: `usage_stats`, `pomodoro`.
+- **[DONE — `premium` branch, 2026-07-17] Usage stats (B2.b)** — implemented
+  and live-verified per `docs/plans/premium-usage-stats.md`. Option A scope:
+  focus history, app-block kills (PID-deduped), breaks taken/**refused**, and
+  derived streaks — NOT per-domain attempt counts (unobservable without a DNS
+  proxy; rejected as disproportionate for an akrasia-only tool). `UsageStats`
+  lives in `State` (HMAC-protected, bounded by a 200-session ring + 365-day
+  retention). Recording is always on and daemon-side; only the `GetUsageStats`
+  read is gated on `usage_stats`. Store copy reworded (grepfocus-web
+  `e89fa9a`). Remaining B2: `pomodoro`.
 - **[DEFERRED] Packaging** — `.rpm` first. Use `sysusers.d`/`tmpfiles.d`
   for the group and runtime/state dirs; declare runtime deps (webkit2gtk4.1,
   libappindicator/ayatana); `%preun` can run `grepfocusd cleanup` verbatim.
