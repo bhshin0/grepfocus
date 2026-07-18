@@ -50,6 +50,10 @@ override_dh_auto_install:
 		debian/grepfocus/etc/xdg/autostart/grepfocus.desktop
 	install -D -m0644 crates/gui/icons/icon.png \
 		debian/grepfocus/usr/share/icons/hicolor/64x64/apps/grepfocus.png
+	# Ship the full licence text. PolyForm Shield's Notices clause requires
+	# recipients to get these terms (or their URL) AND any `Required Notice:`
+	# lines, which live in LICENSE — and debian/copyright points here for it.
+	install -D -m0644 LICENSE debian/grepfocus/usr/share/doc/grepfocus/LICENSE
 
 # Enable + start grepfocusd on install (dh default), restart on upgrade.
 override_dh_installsystemd:
