@@ -1,0 +1,2 @@
+# Fedora's default preset disables unknown units; %systemd_post honors this file.
+enable grepfocusd.service

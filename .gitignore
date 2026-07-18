@@ -2,6 +2,9 @@
 **/*.rs.bk
 Cargo.lock.bak
 
+# RPMs from packaging/build-rpm.sh
+/dist
+
 # Tauri / node
 /crates/gui/ui/node_modules
 /crates/gui/ui/dist
