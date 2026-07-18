@@ -17,7 +17,7 @@ Release:        1%{?dist}
 Summary:        Website and app blocker for Linux
 
 License:        LicenseRef-PolyForm-Shield-1.0.0
-URL:            https://github.com/bhshin0/grepfocus
+URL:            https://grepfocus.com
 Source0:        grepfocus-%{version}.tar.gz
 
 BuildRequires:  systemd-rpm-macros

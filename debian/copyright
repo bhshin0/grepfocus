@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: grepfocus
-Source: https://github.com/bhshin0/grepfocus
+Source: https://grepfocus.com
 
 Files: *
 Copyright: 2026 Bryan <bhshin@gmail.com>

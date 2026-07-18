@@ -1,6 +1,6 @@
 [Unit]
 Description=GrepFocus blocker daemon
-Documentation=https://github.com/bhshin0/grepfocus
+Documentation=https://grepfocus.com
 After=network-pre.target
 DefaultDependencies=no
 # Stronger restart resilience: keep restarting even if it crashes a lot.
