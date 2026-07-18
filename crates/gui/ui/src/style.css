@@ -220,6 +220,16 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
 dialog h3 { margin: 0 0 8px; }
 dialog .row { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
 
+/* License tab */
+.license-key {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+.feature-heading { margin-top: 8px; }
+.feature-list { margin: 4px 0 0; padding-left: 18px; font-size: 13px; }
+.feature-list li { margin: 2px 0; }
+
 /* Break allowance controls on active banners */
 .active-banner .break-row {
   display: flex;
@@ -250,4 +260,205 @@ dialog .row { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
   padding: 6px 10px;
   border-radius: 6px;
   display: inline-block;
+}
+
+/* Lock badge on a break row: this break will cost you a password or a retyped
+   challenge. Sits on the accent-coloured banner, so it borrows the same
+   translucent-white treatment as .on-break. */
+.active-banner .break-lock {
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.18);
+  padding: 3px 8px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+/* Non-blocking warning (e.g. password-locked breaks with no password set).
+   Distinct from .msg.error: the save still goes through. */
+.msg.warn { color: var(--fg); opacity: 0.9; }
+
+/* Challenge dialog: wider than the 360px default so a 40-char string can
+   breathe on one or two lines. */
+#challenge-dialog { max-width: 460px; }
+
+/*
+ * The challenge text is deliberately NOT selectable. The entire point of
+ * challenge-locked breaks is that a human retypes 40 characters by hand:
+ * letting them select and copy it hands that friction straight back and turns
+ * the mode into a two-click break. Paste and drop into .challenge-input are
+ * blocked in main.ts for exactly the same reason — see the comment there,
+ * including the honest note on what this does NOT stop.
+ *
+ * Monospace with generous tracking and line-height: this string is going to be
+ * read one character at a time while typing, so legibility beats compactness.
+ */
+.challenge-text {
+  -webkit-user-select: none;
+  user-select: none;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 15px;
+  letter-spacing: 0.14em;
+  line-height: 1.9;
+  word-break: break-all;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 6px 0 4px;
+  min-height: 2.6em;
+}
+.challenge-input {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 15px;
+  letter-spacing: 0.14em;
+}
+#challenge-submit:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ─── Stats tab ─────────────────────────────────────────────────────────── */
+.stat-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 10px;
+  margin-bottom: 20px;
+}
+.stat-tile {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.stat-value {
+  font-size: 22px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.stat-label { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.stat-sub { font-size: 12px; color: var(--accent); margin-top: 4px; }
+
+.stats-section { margin-bottom: 22px; }
+.stats-section h3 { font-size: 14px; margin: 0 0 10px; }
+
+/* Per-day focus bars: fixed-height track, fill scaled to the window max. */
+.day-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 120px;
+  padding: 8px 10px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+}
+.day-bar {
+  flex: 1 1 0;
+  min-width: 6px;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+}
+.day-bar-fill {
+  width: 100%;
+  min-height: 0;
+  background: var(--accent);
+  border-radius: 3px 3px 0 0;
+}
+
+.session-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; }
+.session-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+.session-name { font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
+.session-meta {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── Pomodoro tab ───────────────────────────────────────────────────────── */
+
+/* Setup form: focus / break / cycles side by side. */
+.pomo-inputs {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.pomo-inputs label { flex: 1 1 120px; }
+.pomo-inputs input { width: 100%; }
+.pomo-total { color: var(--accent); font-size: 13px; margin: 0; }
+
+/* Running banner. The break variant recolours (green) so the phase you are in
+   is unmistakable at a glance, not only from the label. */
+.pomo-banner {
+  color: white;
+  padding: 16px 18px;
+  border-radius: 8px;
+  margin-bottom: 14px;
+}
+.pomo-focus { background: var(--accent); }
+.pomo-break { background: #2f9e5f; }
+.pomo-phase {
+  font-size: 28px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.pomo-cycle { font-size: 14px; opacity: 0.92; margin-top: 6px; }
+.pomo-block { font-size: 14px; opacity: 0.92; margin-top: 6px; }
+
+/* Cycle progress dots: filled = done/current, hollow = remaining. */
+.pomo-dots { display: flex; gap: 8px; margin-top: 10px; }
+.pomo-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid white;
+  box-sizing: border-box;
+}
+.pomo-dot.filled { background: white; }
+
+/* The always-visible statement of the commitment rule. */
+.pomo-rule {
+  font-size: 14px;
+  color: var(--fg);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin: 0 0 14px;
+}
+
+/* End-session button. The disabled (during-focus) state is deliberately loud —
+   a hatched, greyed, not-allowed look — so the commitment is obvious, not just
+   a dead click. The enabled (during-break) state is a normal danger action. */
+.pomo-end-btn {
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid var(--danger);
+  padding: 8px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  width: fit-content;
+}
+.pomo-end-btn:disabled {
+  color: var(--muted);
+  border: 1px dashed var(--border);
+  background: repeating-linear-gradient(
+    45deg,
+    transparent,
+    transparent 6px,
+    rgba(128, 128, 128, 0.12) 6px,
+    rgba(128, 128, 128, 0.12) 12px
+  );
+  cursor: not-allowed;
+  opacity: 0.9;
 }

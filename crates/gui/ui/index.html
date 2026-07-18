@@ -14,7 +14,10 @@
         <button data-tab="new">New block</button>
         <button data-tab="list">Block list</button>
         <button data-tab="schedules">Schedules</button>
+        <button data-tab="pomodoro" id="pomodoro-tab-btn" hidden>Pomodoro</button>
+        <button data-tab="stats" id="stats-tab-btn" hidden>Stats</button>
         <button data-tab="settings">Settings</button>
+        <button data-tab="license">License</button>
       </nav>
     </header>
     <main>
@@ -36,6 +39,15 @@
           <label>Daily break allowance (minutes, 0 = none)
             <input type="number" name="allowance_minutes" min="0" step="1" value="0" />
           </label>
+          <label>Break lock
+            <select name="lock">
+              <option value="normal">Breaks work normally</option>
+              <option value="password_breaks">Breaks require the settings password</option>
+              <option value="challenge_breaks">Breaks require typing a challenge string</option>
+            </select>
+          </label>
+          <p class="hint">Lock modes are a premium feature — they add friction to taking a break on this block. The free tier can always set the break allowance to 0, for a block with no breaks at all.</p>
+          <p id="lock-warn" class="msg warn" hidden></p>
           <button type="submit">Save block</button>
           <p id="new-block-msg" class="msg"></p>
         </form>
@@ -85,9 +97,19 @@
         </details>
       </section>
 
+      <section id="pomodoro" class="tab">
+        <h2>Pomodoro</h2>
+        <div id="pomodoro-content">Loading…</div>
+      </section>
+
+      <section id="stats" class="tab">
+        <h2>Usage stats</h2>
+        <div id="stats-content">Loading…</div>
+      </section>
+
       <section id="settings" class="tab">
         <h2>Settings</h2>
-        <p class="hint">A settings password adds friction against weakening your blocks on a whim. When set, changing configuration (adding, editing, or deleting blocks and schedules) requires unlocking first. Starting blocks and taking breaks never need the password. The daemon relocks on restart. Note: this is friction, not security — anyone with root can bypass it.</p>
+        <p class="hint">A settings password adds friction against weakening your blocks on a whim. When set, changing configuration (adding, editing, or deleting blocks and schedules) requires unlocking first. Starting blocks never needs the password, and neither does taking a break — unless the block uses password-locked breaks. The daemon relocks on restart. Note: this is friction, not security — anyone with root can bypass it.</p>
 
         <div id="lock-state" class="lock-state"></div>
 
@@ -106,6 +128,22 @@
           <p id="password-msg" class="msg"></p>
         </form>
       </section>
+
+      <section id="license" class="tab">
+        <h2>License</h2>
+        <p class="hint">License keys come from the GrepFocus store. The free tier keeps working without one — a license only adds premium features.</p>
+
+        <div id="license-state" class="lock-state"></div>
+
+        <form id="license-form">
+          <label>License key
+            <textarea name="token" rows="4" class="license-key" spellcheck="false" autocomplete="off" placeholder="paste your license key here"></textarea>
+          </label>
+          <button type="submit">Activate</button>
+          <button type="button" id="license-remove" class="ghost" hidden>Remove license</button>
+          <p id="license-msg" class="msg"></p>
+        </form>
+      </section>
     </main>
 
     <dialog id="unlock-dialog">
@@ -120,6 +158,32 @@
           <button type="button" id="unlock-cancel" class="ghost">Cancel</button>
         </div>
         <p id="unlock-msg" class="msg"></p>
+      </form>
+    </dialog>
+
+    <dialog id="challenge-dialog">
+      <form id="challenge-form" method="dialog">
+        <h3>Type the challenge</h3>
+        <p>This block's breaks are challenge-locked. Retype the string below, exactly, to take your break. It cannot be selected or copied — typing it out is the point.</p>
+        <!-- Not selectable (see .challenge-text in style.css). -->
+        <div id="challenge-text" class="challenge-text"></div>
+        <label>Your response
+          <input
+            id="challenge-input"
+            name="response"
+            class="challenge-input"
+            autocomplete="off"
+            autocapitalize="off"
+            autocorrect="off"
+            spellcheck="false"
+          />
+        </label>
+        <div class="row">
+          <button type="submit" id="challenge-submit" disabled>Take a break</button>
+          <button type="button" id="challenge-new" class="ghost">New challenge</button>
+          <button type="button" id="challenge-cancel" class="ghost">Cancel</button>
+        </div>
+        <p id="challenge-msg" class="msg"></p>
       </form>
     </dialog>
 

@@ -1,0 +1,74 @@
+{
+  "note": "Generated via grepfocus-web lib/license.ts signLicense() with a throwaway Ed25519 keypair and fixed timestamps. Regenerate: from inside the grepfocus-web checkout, run the gen-kat.mts script reproduced in the header comment of crates/core/tests/license_kat.rs with `node --experimental-strip-types`, redirecting stdout to this file.",
+  "test_pubkey_b64url": "do_eBTVJAn9gveNLnfjfW1VuECdK0gRSOH5r5P_7dKY",
+  "valid_perpetual": {
+    "token": "eyJsaWNlbnNlX2lkIjoiR0YtS0FULVBFUlAtMDAwMSIsImVtYWlsIjoia2F0QGV4YW1wbGUuY29tIiwidGllciI6InByZW1pdW0iLCJraW5kIjoicGVycGV0dWFsIiwiZmVhdHVyZXMiOlsiYXBwX2Jsb2NraW5nIiwic2NoZWR1bGVzIiwidGFtcGVyX3Byb3RlY3Rpb24iLCJ1bmxpbWl0ZWRfYmxvY2tzIiwibG9ja19tb2RlcyIsInVzYWdlX3N0YXRzIiwicG9tb2Rvcm8iXSwiaXNzdWVkX2F0IjoxNzUyMTkyMDAwLCJleHBpcmVzX2F0IjpudWxsLCJtYXhfZGV2aWNlcyI6M30.nDrpjwsQ2dKn81Xcg2YM1u1J7EwqStu8QgiAjS76QweWxWt5XOcMoHSeueyZlR25VHafgPd2EX0Tgh8lV6PdCQ",
+    "claims": {
+      "license_id": "GF-KAT-PERP-0001",
+      "email": "kat@example.com",
+      "tier": "premium",
+      "kind": "perpetual",
+      "features": [
+        "app_blocking",
+        "schedules",
+        "tamper_protection",
+        "unlimited_blocks",
+        "lock_modes",
+        "usage_stats",
+        "pomodoro"
+      ],
+      "issued_at": 1752192000,
+      "expires_at": null,
+      "max_devices": 3
+    }
+  },
+  "valid_trial": {
+    "token": "eyJsaWNlbnNlX2lkIjoiR0YtS0FULVRSSUFMLTAwMDEiLCJlbWFpbCI6ImthdEBleGFtcGxlLmNvbSIsInRpZXIiOiJwcmVtaXVtIiwia2luZCI6InRyaWFsIiwiZmVhdHVyZXMiOlsiYXBwX2Jsb2NraW5nIiwic2NoZWR1bGVzIiwidGFtcGVyX3Byb3RlY3Rpb24iLCJ1bmxpbWl0ZWRfYmxvY2tzIiwibG9ja19tb2RlcyIsInVzYWdlX3N0YXRzIiwicG9tb2Rvcm8iXSwiaXNzdWVkX2F0IjoxNzUyMTkyMDAwLCJleHBpcmVzX2F0Ijo0MTAyNDQ0ODAwLCJtYXhfZGV2aWNlcyI6M30.VuDPvkz-6LUt4gLVCrd0tETd5QsF-7UxbyjazMdb0tc89S7q8YQooxGRao4pXUD9qroftuTy6kR9v6g-IHDlBg",
+    "claims": {
+      "license_id": "GF-KAT-TRIAL-0001",
+      "email": "kat@example.com",
+      "tier": "premium",
+      "kind": "trial",
+      "features": [
+        "app_blocking",
+        "schedules",
+        "tamper_protection",
+        "unlimited_blocks",
+        "lock_modes",
+        "usage_stats",
+        "pomodoro"
+      ],
+      "issued_at": 1752192000,
+      "expires_at": 4102444800,
+      "max_devices": 3
+    }
+  },
+  "expired_trial": {
+    "token": "eyJsaWNlbnNlX2lkIjoiR0YtS0FULUVYUElSRUQtMDAwMSIsImVtYWlsIjoia2F0QGV4YW1wbGUuY29tIiwidGllciI6InByZW1pdW0iLCJraW5kIjoidHJpYWwiLCJmZWF0dXJlcyI6WyJhcHBfYmxvY2tpbmciLCJzY2hlZHVsZXMiLCJ0YW1wZXJfcHJvdGVjdGlvbiIsInVubGltaXRlZF9ibG9ja3MiLCJsb2NrX21vZGVzIiwidXNhZ2Vfc3RhdHMiLCJwb21vZG9ybyJdLCJpc3N1ZWRfYXQiOjk0NDk1NjgwMCwiZXhwaXJlc19hdCI6OTQ2Njg0ODAwLCJtYXhfZGV2aWNlcyI6M30.r3HAgYkDHYAmBy9DO65jNl8JDAaxLb-yPfPz_AaSVXobjmltFsf5M8eUxC15AuzqsxNcm5YNzyw60dLrkxhCDA"
+  },
+  "unknown_field": {
+    "token": "eyJsaWNlbnNlX2lkIjoiR0YtS0FULUZVVFVSRS0wMDAxIiwiZW1haWwiOiJrYXRAZXhhbXBsZS5jb20iLCJ0aWVyIjoicHJlbWl1bSIsImtpbmQiOiJwZXJwZXR1YWwiLCJmZWF0dXJlcyI6WyJhcHBfYmxvY2tpbmciLCJzY2hlZHVsZXMiLCJ0YW1wZXJfcHJvdGVjdGlvbiIsInVubGltaXRlZF9ibG9ja3MiLCJsb2NrX21vZGVzIiwidXNhZ2Vfc3RhdHMiLCJwb21vZG9ybyJdLCJpc3N1ZWRfYXQiOjE3NTIxOTIwMDAsImV4cGlyZXNfYXQiOm51bGwsIm1heF9kZXZpY2VzIjozLCJmdXR1cmVfZmllbGQiOjF9.916X0eooucMcN6CFcmHOXyaFmlUAu0WGQa4cpic_pRqgMhbKRb3IRO8OGOObw6oQlUHHJefDvjF6J3rXbBSfAw",
+    "claims": {
+      "license_id": "GF-KAT-FUTURE-0001",
+      "email": "kat@example.com",
+      "tier": "premium",
+      "kind": "perpetual",
+      "features": [
+        "app_blocking",
+        "schedules",
+        "tamper_protection",
+        "unlimited_blocks",
+        "lock_modes",
+        "usage_stats",
+        "pomodoro"
+      ],
+      "issued_at": 1752192000,
+      "expires_at": null,
+      "max_devices": 3
+    }
+  },
+  "prod_expired": {
+    "token": "eyJsaWNlbnNlX2lkIjoiR0YtS0FULVBST0QtRVhQSVJFRC0wMDAxIiwiZW1haWwiOiJrYXRAZXhhbXBsZS5jb20iLCJ0aWVyIjoicHJlbWl1bSIsImtpbmQiOiJ0cmlhbCIsImZlYXR1cmVzIjpbImFwcF9ibG9ja2luZyIsInNjaGVkdWxlcyIsInRhbXBlcl9wcm90ZWN0aW9uIiwidW5saW1pdGVkX2Jsb2NrcyIsImxvY2tfbW9kZXMiLCJ1c2FnZV9zdGF0cyIsInBvbW9kb3JvIl0sImlzc3VlZF9hdCI6OTQ0OTU2ODAwLCJleHBpcmVzX2F0Ijo5NDY2ODQ4MDAsIm1heF9kZXZpY2VzIjozfQ.sBgQ1MerGFi9-ZsO158VXIz07A3h4Xx2c00NLqFmRG8R7YT3FDWEf22yStG-amjJw1PttRidqjyBEMHgCee5Bw",
+    "note": "Signed by the PRODUCTION key (post-rotation ceremony 2026-07-11) with fixed literals; expired 2000-01-01 so it proves the embedded pubkey matches the vaulted signing key without committing a usable license. Minted via mint-expired-kat.mts (same registerHooks + signLicense pattern as the generator in license_kat.rs)."
+  }
+}

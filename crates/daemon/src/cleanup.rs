@@ -330,7 +330,7 @@ pub(crate) fn remove_stale_tmp(path: &str) -> io::Result<bool> {
 mod tests {
     use super::*;
     use crate::paths::{HOSTS_BEGIN, HOSTS_END};
-    use grepfocus_core::{ActiveBlock, Block, Originator, State};
+    use grepfocus_core::{ActiveBlock, Block, LockMode, Originator, State};
     use std::os::unix::fs::PermissionsExt;
 
     fn hosts_with_region() -> String {
@@ -492,6 +492,7 @@ mod tests {
             domains: vec!["reddit.com".into()],
             apps: vec![],
             allowance_secs_per_day: 0,
+            lock: LockMode::Normal,
         };
         let st = State {
             next_id: 2,
@@ -502,6 +503,8 @@ mod tests {
                 ends_at_unix: u64::MAX,
                 originator: Originator::Manual,
                 break_until_unix: None,
+                apps_enforced: false,
+                lock: LockMode::Normal,
             }],
             ..Default::default()
         };

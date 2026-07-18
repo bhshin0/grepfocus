@@ -14,12 +14,17 @@
     "allow-delete-block",
     "allow-start-block",
     "allow-get-status",
+    "allow-get-usage-stats",
     "allow-list-schedules",
     "allow-add-schedule",
     "allow-update-schedule",
     "allow-delete-schedule",
     "allow-set-password",
+    "allow-set-license",
     "allow-unlock",
-    "allow-take-break"
+    "allow-take-break",
+    "allow-get-break-challenge",
+    "allow-start-pomodoro",
+    "allow-stop-pomodoro"
   ]
 }

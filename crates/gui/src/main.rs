@@ -7,7 +7,10 @@ mod tray;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use grepfocus_core::{ActiveBlock, AllowanceLedger, Block, Request, Response, Schedule};
+use grepfocus_core::{
+    ActiveBlock, AllowanceLedger, Block, DayStat, FocusSession, LifetimeTotals, PomodoroStatus,
+    Request, Response, Schedule,
+};
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
@@ -48,6 +51,43 @@ async fn start_block(id: u64, duration_secs: u64) -> Result<(), String> {
     }
 }
 
+/// Start a pomodoro session driving a saved block through alternating
+/// focus/break intervals. Gated by the daemon on the `pomodoro` feature — an
+/// unlicensed request comes back as `Response::Error` and surfaces to JS as the
+/// thrown feature-gate string, same as the other premium commands.
+#[tauri::command]
+async fn start_pomodoro(
+    block_id: u64,
+    focus_secs: u64,
+    break_secs: u64,
+    cycles: u32,
+) -> Result<(), String> {
+    match client::call(Request::StartPomodoro {
+        block_id,
+        focus_secs,
+        break_secs,
+        cycles,
+    })
+    .await?
+    {
+        Response::Ok {} => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+/// Stop the running pomodoro session. Hybrid commitment model: the daemon
+/// allows this only during a break and refuses it mid-focus, returning its
+/// refusal verbatim for the frontend to surface.
+#[tauri::command]
+async fn stop_pomodoro() -> Result<(), String> {
+    match client::call(Request::StopPomodoro {}).await? {
+        Response::Ok {} => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct StatusOut {
     active: Vec<ActiveBlock>,
@@ -55,6 +95,13 @@ struct StatusOut {
     password_set: bool,
     unlocked: bool,
     allowance_used: Vec<AllowanceLedger>,
+    license_present: bool,
+    license_valid: bool,
+    license_kind: Option<String>,
+    license_email: Option<String>,
+    license_expires_at: Option<i64>,
+    licensed_features: Vec<String>,
+    pomodoro: Option<PomodoroStatus>,
 }
 
 #[tauri::command]
@@ -66,12 +113,26 @@ async fn get_status() -> Result<StatusOut, String> {
             password_set,
             unlocked,
             allowance_used,
+            license_present,
+            license_valid,
+            license_kind,
+            license_email,
+            license_expires_at,
+            licensed_features,
+            pomodoro,
         } => Ok(StatusOut {
             active,
             now_unix,
             password_set,
             unlocked,
             allowance_used,
+            license_present,
+            license_valid,
+            license_kind,
+            license_email,
+            license_expires_at,
+            licensed_features,
+            pomodoro,
         }),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),
@@ -88,6 +149,15 @@ async fn set_password(old: Option<String>, new: Option<String>) -> Result<(), St
 }
 
 #[tauri::command]
+async fn set_license(token: Option<String>) -> Result<(), String> {
+    match client::call(Request::SetLicense { token }).await? {
+        Response::Ok {} => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+#[tauri::command]
 async fn unlock(password: String) -> Result<(), String> {
     match client::call(Request::Unlock { password }).await? {
         Response::Ok {} => Ok(()),
@@ -96,10 +166,65 @@ async fn unlock(password: String) -> Result<(), String> {
     }
 }
 
+/// Take a break on an active block. `challenge` is the user's typed response
+/// for a `ChallengeBreaks` block and `None` for every other mode — the daemon
+/// decides whether one was required, and verifies it. The frontend omits the
+/// argument entirely for normal breaks (Tauri maps a missing arg to `None`).
 #[tauri::command]
-async fn take_break(block_id: u64, secs: u64) -> Result<(), String> {
-    match client::call(Request::TakeBreak { block_id, secs }).await? {
+async fn take_break(block_id: u64, secs: u64, challenge: Option<String>) -> Result<(), String> {
+    match client::call(Request::TakeBreak {
+        block_id,
+        secs,
+        challenge,
+    })
+    .await?
+    {
         Response::Ok {} => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+/// Ask the daemon for a fresh break challenge. The daemon issues AND verifies
+/// the string (it never originates here), so this is a pure pass-through.
+#[tauri::command]
+async fn get_break_challenge(block_id: u64) -> Result<String, String> {
+    match client::call(Request::GetBreakChallenge { block_id }).await? {
+        Response::BreakChallenge { text } => Ok(text),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+/// Usage-stats payload, mirroring `Response::UsageStats`. The nested core types
+/// already derive `Serialize`, so they cross to the frontend as-is. Gated by the
+/// daemon on the `usage_stats` feature — an unlicensed request comes back as
+/// `Response::Error` and surfaces to JS as the thrown feature-gate string.
+#[derive(serde::Serialize)]
+struct UsageStatsOut {
+    totals: LifetimeTotals,
+    sessions: Vec<FocusSession>,
+    days: Vec<DayStat>,
+    current_streak: u32,
+    longest_streak: u32,
+}
+
+#[tauri::command]
+async fn get_usage_stats() -> Result<UsageStatsOut, String> {
+    match client::call(Request::GetUsageStats {}).await? {
+        Response::UsageStats {
+            totals,
+            sessions,
+            days,
+            current_streak,
+            longest_streak,
+        } => Ok(UsageStatsOut {
+            totals,
+            sessions,
+            days,
+            current_streak,
+            longest_streak,
+        }),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),
     }
@@ -353,13 +478,18 @@ fn main() {
             delete_block,
             start_block,
             get_status,
+            get_usage_stats,
             list_schedules,
             add_schedule,
             update_schedule,
             delete_schedule,
             set_password,
+            set_license,
             unlock,
             take_break,
+            get_break_challenge,
+            start_pomodoro,
+            stop_pomodoro,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -133,7 +133,7 @@ pub fn save_in(dir: &Path, state: &State, key: &[u8]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grepfocus_core::Block;
+    use grepfocus_core::{Block, LockMode};
 
     fn sample_state() -> State {
         State {
@@ -146,7 +146,10 @@ mod tests {
                 domains: vec!["reddit.com".into()],
                 apps: vec![],
                 allowance_secs_per_day: 600,
+                lock: LockMode::Normal,
             }],
+            license_token: Some("payload.signature".to_string()),
+            high_water_unix: 1_752_192_000,
             ..Default::default()
         }
     }
@@ -195,6 +198,42 @@ mod tests {
         assert!(!dir.path().join(STATE_MAC_SIDECAR).exists());
         let reloaded = load_in(dir.path(), key).unwrap();
         assert_eq!(json(&st), json(&reloaded));
+    }
+
+    #[test]
+    fn old_state_json_without_license_fields_loads_with_defaults() {
+        // A pre-license state.json — exactly the fields the daemon wrote
+        // before license_token/high_water_unix existed — must load with
+        // defaults. No migration step exists (State has no
+        // deny_unknown_fields and the HMAC single-file format is unchanged).
+        let old = r#"{
+            "next_id": 2,
+            "blocks": [],
+            "active": [],
+            "schedules": [],
+            "next_schedule_id": 1,
+            "password_hash": null,
+            "allowance": []
+        }"#;
+        let st: State = serde_json::from_str(old).unwrap();
+        assert_eq!(st.license_token, None);
+        assert_eq!(st.high_water_unix, 0);
+    }
+
+    #[test]
+    fn state_json_with_unknown_field_is_tolerated() {
+        // The other direction: a state written by a NEWER daemon (carrying a
+        // field this build doesn't know) still loads here.
+        let future = r#"{
+            "next_id": 2,
+            "blocks": [],
+            "license_token": "payload.signature",
+            "high_water_unix": 42,
+            "field_from_the_future": true
+        }"#;
+        let st: State = serde_json::from_str(future).unwrap();
+        assert_eq!(st.license_token.as_deref(), Some("payload.signature"));
+        assert_eq!(st.high_water_unix, 42);
     }
 
     #[test]

@@ -79,7 +79,12 @@ Research notes only — nothing below is scheduled or implemented unless
 marked fixed inline. Each entry records findings so the legwork doesn't have
 to be redone when the item is picked up.
 
-- **[DEFERRED] Licensing / paywall (v1 ships free)** — app-side integration
+- **[DONE — `premium` branch, 2026-07-11] Licensing / paywall** — implemented
+  and live-verified per `docs/plans/premium-licensing.md` (v1 on master still
+  ships free; the branch merges when the sell decision lands). The research
+  notes below are kept for reference; the keypair ceremony is DONE (key
+  vaulted; the first key was rotated after a transcript leak — never put the
+  signing key on a command line). Original bookmark: app-side integration
   spec from the frostbite-web audit (the external store repo; renaming it to
   match grepfocus is future work). Token format:
   `base64url(JSON claims) + "." + base64url(raw 64-byte Ed25519 signature)`;
@@ -119,6 +124,35 @@ to be redone when the item is picked up.
   user-side to actually ship: make the GitHub repo public, cut a Release and
   upload both artifacts, and point the store download links at them (the store
   hardcodes `releases/latest/download/grepfocus.rpm`; add the `.deb`).
+- **[DONE — `premium` branch, 2026-07-16] Lock modes (B2.a)** — implemented
+  and live-verified per `docs/plans/premium-lock-modes.md`. Per-block
+  `LockMode` (`normal`/`password_breaks`/`challenge_breaks`), gated at save
+  time, enforced from an `ActiveBlock.lock` activation snapshot so a mid-block
+  edit or downgrade can only make a running block stricter, never weaker.
+  Break decision is license-free (mode licensed at save). Challenges are
+  daemon-issued (40 chars, unambiguous alphabet), trimmed + case-sensitive
+  match, single-use, and retired when the block deactivates
+  (`prune_break_challenges`). No `NoBreaks` variant — `allowance == 0` already
+  gives that free. Remaining B2: `usage_stats`, `pomodoro`.
+- **[DONE — `premium` branch, 2026-07-17] Usage stats (B2.b)** — implemented
+  and live-verified per `docs/plans/premium-usage-stats.md`. Option A scope:
+  focus history, app-block kills (PID-deduped), breaks taken/**refused**, and
+  derived streaks — NOT per-domain attempt counts (unobservable without a DNS
+  proxy; rejected as disproportionate for an akrasia-only tool). `UsageStats`
+  lives in `State` (HMAC-protected, bounded by a 200-session ring + 365-day
+  retention). Recording is always on and daemon-side; only the `GetUsageStats`
+  read is gated on `usage_stats`. Store copy reworded (grepfocus-web
+  `e89fa9a`). Remaining B2: `pomodoro`.
+- **[DONE — `premium` branch, 2026-07-17] Pomodoro (B2.c)** — implemented and
+  live-verified per `docs/plans/premium-pomodoro.md`. A session drives one
+  saved block through focus/break cycles (new `Originator::Pomodoro`), reusing
+  the `ActiveBlock` machinery; auto-breaks set `break_until_unix` directly
+  (free, no allowance charge). HYBRID commitment: a focus interval can't be
+  interrupted, `StopPomodoro` allowed only during a break — surfaced clearly in
+  the GUI. `StartPomodoro` gated on `pomodoro` + bounds-checked; manual breaks
+  refused on a pomodoro block; one break-inclusive `origin=pomodoro` session
+  recorded at end via the reconcile step-1 choke point. **Completes Track B
+  (B2.a/b/c) — all 7 premium feature keys now have app-side implementations.**
 - **[FIXED — renamed to grepfocus, 2026-07-10] Rename** — research
   2026-07-06, resolved 2026-07-10: the project is now **grepfocus** (display
   name **GrepFocus**), collision-checked clean — crates.io free, no product

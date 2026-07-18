@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod auth;
 mod cleanup;
@@ -24,6 +24,7 @@ mod procwatch;
 mod scheduler;
 mod state;
 
+use grepfocus_core::license::LicenseClaims;
 use grepfocus_core::{now_unix, State};
 
 /// Runtime context shared across all daemon tasks.
@@ -40,6 +41,42 @@ pub struct Daemon {
     /// `None` means unknown/dirty — the next `enforce::sync` re-applies
     /// unconditionally. See `enforce::sync`.
     pub applied: Mutex<Option<enforce::Applied>>,
+    /// Claims from the verified `state.license_token`, or `None` when
+    /// unlicensed or the stored token failed verification. Derived and
+    /// in-memory only — rebuilt at startup and on `SetLicense`.
+    pub license: Mutex<Option<LicenseClaims>>,
+    /// Pending break challenges for `ChallengeBreaks` blocks: block_id → the
+    /// exact string the daemon issued via `GetBreakChallenge`. In-memory
+    /// only, deliberately: a daemon restart invalidating a pending challenge
+    /// fails safe — the user just requests a new one.
+    pub break_challenges: Mutex<std::collections::HashMap<u64, String>>,
+    /// Distinct app kills counted by procwatch since the last stats flush.
+    /// In-memory only — folded into today's `DayStat` opportunistically at the
+    /// next state save from the scheduler tick, exactly the `high_water_unix`
+    /// "accumulate in memory, persist when something else saves" pattern. No
+    /// fsync per kill; a crash loses at most the unflushed count.
+    pub app_kills_pending: std::sync::atomic::AtomicU64,
+}
+
+/// Wall-clock "now" (unix seconds) for license checks, clamped so a rewound
+/// system clock can never travel back before the highest time this daemon has
+/// observed (`state.high_water_unix`, bumped by the scheduler tick). Without
+/// the clamp, setting the clock to 1999 would resurrect any expired trial.
+pub fn effective_now(state: &State) -> i64 {
+    (now_unix() as i64).max(state.high_water_unix as i64)
+}
+
+/// Whether the cached license grants premium feature `key` right now.
+///
+/// True iff claims exist, are unexpired against `effective_now(state)`, and
+/// list `key` in `features`. The expiry comparison follows the frozen
+/// boundary rule shared with the verifier and `license_status_fields`:
+/// `expires_at == now` is still valid; `None` means perpetual.
+pub fn has_feature(license: Option<&LicenseClaims>, state: &State, key: &str) -> bool {
+    license.is_some_and(|c| {
+        c.expires_at.is_none_or(|t| t >= effective_now(state))
+            && c.features.iter().any(|f| f == key)
+    })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -118,9 +155,35 @@ async fn run_daemon() -> anyhow::Result<()> {
         }
     };
 
+    // Advance the clock-rollback high-water mark once at startup; the
+    // scheduler tick keeps it moving from here. If the stored mark is ahead
+    // of the system clock (rolled back while we were down), keep the mark.
+    let now = now_unix();
+    if now > initial.high_water_unix {
+        initial.high_water_unix = now;
+    }
+
+    // Verify any stored license token. Failure is never fatal and never
+    // strips the token from state: an expired/invalid token stays stored so
+    // GetStatus can report "present but invalid" — we just run unlicensed.
+    let license = match &initial.license_token {
+        None => None,
+        Some(token) => {
+            match grepfocus_core::license::verify_token(token, effective_now(&initial)) {
+                Ok(claims) => {
+                    info!(kind = %claims.kind, "stored license verified");
+                    Some(claims)
+                }
+                Err(err) => {
+                    warn!(%err, "stored license token failed verification — running unlicensed");
+                    None
+                }
+            }
+        }
+    };
+
     // Drop any active blocks that have already expired between shutdown and
     // startup. (They will simply never be re-applied.)
-    let now = now_unix();
     let before = initial.active.len();
     initial.active.retain(|a| a.ends_at_unix > now);
     let dropped = before - initial.active.len();
@@ -145,6 +208,9 @@ async fn run_daemon() -> anyhow::Result<()> {
         key,
         unlocked_until: Mutex::new(0),
         applied: Mutex::new(None),
+        license: Mutex::new(license),
+        break_challenges: Mutex::new(std::collections::HashMap::new()),
+        app_kills_pending: std::sync::atomic::AtomicU64::new(0),
     });
 
     // Re-apply the union of all still-active blocks before accepting clients.
@@ -165,4 +231,103 @@ async fn run_daemon() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_now_follows_clock_when_high_water_is_behind() {
+        let st = State::default(); // high_water_unix == 0
+        let before = now_unix() as i64;
+        let eff = effective_now(&st);
+        let after = now_unix() as i64;
+        assert!((before..=after).contains(&eff));
+    }
+
+    #[test]
+    fn effective_now_clamps_to_high_water_on_clock_rollback() {
+        // A high-water mark ahead of the system clock is exactly what a
+        // rewound clock looks like: effective time must not travel back.
+        let hw = 4_102_444_800; // 2100-01-01, safely ahead of any test run
+        let st = State {
+            high_water_unix: hw,
+            ..Default::default()
+        };
+        assert_eq!(effective_now(&st), hw as i64);
+    }
+
+    // ── has_feature() ───────────────────────────────────────────────────────
+
+    use grepfocus_core::license::features;
+
+    /// Pins `effective_now` in these tests: a high-water mark of 2100-01-01
+    /// dominates the real clock for any plausible test run, making the
+    /// expiry comparisons deterministic.
+    const HW: u64 = 4_102_444_800;
+
+    fn st_at_hw() -> State {
+        State {
+            high_water_unix: HW,
+            ..Default::default()
+        }
+    }
+
+    fn claims(feature_keys: &[&str], expires_at: Option<i64>) -> LicenseClaims {
+        LicenseClaims {
+            license_id: "GF-TEST-0001".into(),
+            email: "kat@example.com".into(),
+            tier: "premium".into(),
+            kind: "trial".into(),
+            features: feature_keys.iter().map(|s| s.to_string()).collect(),
+            issued_at: 0,
+            expires_at,
+            max_devices: 3,
+        }
+    }
+
+    #[test]
+    fn has_feature_false_without_license() {
+        assert!(!has_feature(None, &st_at_hw(), features::SCHEDULES));
+    }
+
+    #[test]
+    fn has_feature_false_when_expired() {
+        let c = claims(&features::ALL, Some(HW as i64 - 1));
+        assert!(!has_feature(Some(&c), &st_at_hw(), features::SCHEDULES));
+    }
+
+    #[test]
+    fn has_feature_boundary_expiry_equal_to_now_is_still_valid() {
+        // Frozen boundary rule (matches the verifier and
+        // license_status_fields): expires_at == now grants.
+        let c = claims(&features::ALL, Some(HW as i64));
+        assert!(has_feature(Some(&c), &st_at_hw(), features::SCHEDULES));
+    }
+
+    #[test]
+    fn has_feature_false_when_key_not_granted() {
+        // Valid license, but the queried key is not in `features`.
+        let c = claims(&[features::SCHEDULES], None);
+        assert!(!has_feature(Some(&c), &st_at_hw(), features::APP_BLOCKING));
+    }
+
+    #[test]
+    fn has_feature_true_for_every_granted_key_on_valid_license() {
+        let c = claims(&features::ALL, None); // perpetual
+        for key in features::ALL {
+            assert!(has_feature(Some(&c), &st_at_hw(), key), "key {key}");
+        }
+    }
+
+    #[test]
+    fn has_feature_respects_clock_rollback_clamp() {
+        // The license expired at HW-1; even though the *system clock* is far
+        // before HW, effective_now clamps to the high-water mark, so a
+        // rewound clock cannot resurrect the feature.
+        let c = claims(&features::ALL, Some(HW as i64 - 1));
+        let st = st_at_hw(); // real clock << HW in any test run
+        assert!(!has_feature(Some(&c), &st, features::TAMPER_PROTECTION));
+    }
 }
