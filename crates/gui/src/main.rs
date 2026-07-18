@@ -320,6 +320,30 @@ fn main() {
                 })
                 .build(app)?;
 
+            // Workaround for muda/appindicator on GNOME (tauri#8825): the
+            // StatusNotifier host can render the initial tray menu BLANK even
+            // though the exported DBusMenu is correct (verified: identical
+            // structure to apps that render fine). Re-setting the menu shortly
+            // after startup emits a fresh LayoutUpdated, forcing the host to
+            // re-read a populated layout. A freshly built menu (new internal
+            // ids → bumped revision) is a genuine "second menu", not a no-op
+            // re-assign. The tray icon and its `on_menu_event` handler (matched
+            // by item id, which we keep identical) persist across the swap.
+            let menu_reset_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                if let Some(tray) = menu_reset_app.tray_by_id("grepfocus-tray") {
+                    if let Ok(fresh) = MenuBuilder::new(&menu_reset_app)
+                        .text("show", "Show GrepFocus")
+                        .separator()
+                        .text("quit", "Quit")
+                        .build()
+                    {
+                        let _ = tray.set_menu(Some(fresh));
+                    }
+                }
+            });
+
             spawn_status_watcher(app.handle().clone());
             Ok(())
         })
