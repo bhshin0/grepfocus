@@ -1,0 +1,36 @@
+# Toolchain image for building the GrepFocus .deb (see packaging/build-deb.sh).
+# Ubuntu 24.04 so the GUI links Ubuntu's libwebkit2gtk-4.1 / libsoup3 etc. —
+# a Fedora-built binary would not run on Ubuntu.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Build deps: debhelper toolchain + the Tauri/webkit -dev libraries. The
+# appindicator lib is a RUNTIME dep only (muda dlopens it), so no -dev here,
+# matching the RPM spec.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        debhelper \
+        dpkg-dev \
+        build-essential \
+        pkg-config \
+        ca-certificates \
+        curl \
+        libgtk-3-dev \
+        libwebkit2gtk-4.1-dev \
+        libsoup-3.0-dev \
+        libjavascriptcoregtk-4.1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust toolchain — the workspace can need a newer cargo than apt ships (same
+# reason the RPM spec brings the toolchain rather than declaring BuildRequires).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Node + pnpm for the Tauri UI build (embedded into the binary at compile time).
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g pnpm
+
+WORKDIR /src

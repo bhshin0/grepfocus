@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+# On remove (not upgrade), tear down enforcement while the binary still exists
+# so a block's immutable /etc/hosts bit is never stranded. The daemon must be
+# stopped FIRST — `grepfocusd cleanup` refuses while the unit is active — so we
+# stop it explicitly before cleanup rather than relying on the ordering of the
+# dh_installsystemd snippet below. Mirrors the RPM %preun.
+if [ "$1" = "remove" ]; then
+    if [ -d /run/systemd/system ]; then
+        deb-systemd-invoke stop grepfocusd.service >/dev/null 2>&1 || true
+    fi
+    if [ -x /usr/bin/grepfocusd ]; then
+        timeout --kill-after=5 30 /usr/bin/grepfocusd cleanup || true
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,56 @@
+#!/usr/bin/make -f
+# GrepFocus Debian packaging. The Rust + Node toolchain is provided by the
+# build environment (packaging/build-deb.sh installs rustup + node/pnpm in the
+# ubuntu container) rather than via Build-Depends, mirroring the RPM spec: the
+# apt rustc/cargo can lag behind what the workspace needs.
+
+export DEB_BUILD_MAINTAINER_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+# Nothing to configure (no autotools/cmake).
+override_dh_auto_configure:
+
+# The Tauri build embeds ui/dist at compile time, so the UI must be built
+# before cargo (a plain `cargo build` does not run beforeBuildCommand).
+override_dh_auto_build:
+	pnpm --dir crates/gui/ui install --frozen-lockfile
+	pnpm --dir crates/gui/ui build
+	cargo build --release --locked
+
+# Workspace tests run in CI, not during the package build.
+override_dh_auto_test:
+
+# Leave target/ in place; cargo clean is slow and dh_clean handles debian/.
+override_dh_auto_clean:
+
+override_dh_auto_install:
+	install -D -m0755 target/release/grepfocusd debian/grepfocus/usr/bin/grepfocusd
+	install -D -m0755 target/release/grepfocus-gui debian/grepfocus/usr/bin/grepfocus-gui
+	# systemd unit: one source of truth (packaging/systemd/grepfocusd.service
+	# ships /usr/local/bin for the dev scripts); relocate to /usr/bin here.
+	install -d debian/grepfocus/usr/lib/systemd/system
+	sed 's|/usr/local/bin/|/usr/bin/|g' packaging/systemd/grepfocusd.service \
+		> debian/grepfocus/usr/lib/systemd/system/grepfocusd.service
+	chmod 0644 debian/grepfocus/usr/lib/systemd/system/grepfocusd.service
+	# sysusers.d (grepfocus group) + tmpfiles.d (/run/grepfocus). dh_installtmpfiles
+	# picks up the tmpfiles file from the staging tree and adds its own postinst
+	# snippet. dh_installsysusers is NOT in this compat-13 dh sequence, so the
+	# group is created explicitly by debian/grepfocus.postinst (which runs
+	# systemd-sysusers on this packaged file, before the service starts); the
+	# file is still shipped for boot-time reprocessing.
+	install -D -m0644 packaging/sysusers.d/grepfocus.conf debian/grepfocus/usr/lib/sysusers.d/grepfocus.conf
+	install -D -m0644 packaging/tmpfiles.d/grepfocus.conf debian/grepfocus/usr/lib/tmpfiles.d/grepfocus.conf
+	# Desktop + autostart (relocate the Exec path like the unit) and icon.
+	install -D -m0644 packaging/grepfocus.desktop debian/grepfocus/usr/share/applications/grepfocus.desktop
+	install -D -m0644 packaging/grepfocus.desktop debian/grepfocus/etc/xdg/autostart/grepfocus.desktop
+	sed -i 's|/usr/local/bin/|/usr/bin/|g' \
+		debian/grepfocus/usr/share/applications/grepfocus.desktop \
+		debian/grepfocus/etc/xdg/autostart/grepfocus.desktop
+	install -D -m0644 crates/gui/icons/icon.png \
+		debian/grepfocus/usr/share/icons/hicolor/64x64/apps/grepfocus.png
+
+# Enable + start grepfocusd on install (dh default), restart on upgrade.
+override_dh_installsystemd:
+	dh_installsystemd grepfocusd.service

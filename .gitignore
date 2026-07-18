@@ -2,8 +2,17 @@
 **/*.rs.bk
 Cargo.lock.bak
 
-# RPMs from packaging/build-rpm.sh
+# RPMs from packaging/build-rpm.sh, .debs from packaging/build-deb.sh
 /dist
+
+# Debian build artifacts (from dpkg-buildpackage in packaging/build-deb.sh)
+/.pnpm-store/
+/debian/grepfocus/
+/debian/files
+/debian/.debhelper/
+/debian/*.debhelper
+/debian/*.substvars
+/debian/debhelper-build-stamp
 
 # Tauri / node
 /crates/gui/ui/node_modules

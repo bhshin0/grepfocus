@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    # Create the socket-access group BEFORE the daemon starts. The
+    # debhelper-generated section below runs systemd-tmpfiles --create (for
+    # /run/grepfocus) and enables + starts grepfocusd.service, and the daemon
+    # chowns its socket to this group, so the group must exist first.
+    # dh_installsysusers is not part of this compat-13 dh sequence, so we
+    # process the packaged sysusers.d file ourselves, with a groupadd fallback
+    # where systemd-sysusers is absent.
+    if command -v systemd-sysusers >/dev/null 2>&1; then
+        systemd-sysusers /usr/lib/sysusers.d/grepfocus.conf || true
+    fi
+    if ! getent group grepfocus >/dev/null 2>&1; then
+        groupadd --system grepfocus || true
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

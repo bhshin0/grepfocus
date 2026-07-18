@@ -1,0 +1,28 @@
+Source: grepfocus
+Section: utils
+Priority: optional
+Maintainer: Bryan <bhshin@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               pkg-config,
+               libgtk-3-dev,
+               libwebkit2gtk-4.1-dev,
+               libsoup-3.0-dev,
+               libjavascriptcoregtk-4.1-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/bhshin0/grepfocus
+Rules-Requires-Root: no
+
+Package: grepfocus
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         nftables,
+         libayatana-appindicator3-1
+Description: Website and app blocker for Linux
+ GrepFocus is a website and application blocker for Linux. A root daemon
+ (grepfocusd) enforces blocks via /etc/hosts and nftables and keeps them in
+ place until they expire; a desktop GUI with a tray icon (grepfocus-gui)
+ manages blocks over a local socket.
+ .
+ The daemon holds blocks in place until they expire, so a block cannot be
+ casually turned off once it is running.

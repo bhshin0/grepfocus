@@ -1,0 +1,10 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: grepfocus
+Source: https://github.com/bhshin0/grepfocus
+
+Files: *
+Copyright: 2026 Bryan <bhshin@gmail.com>
+License: LicenseRef-PolyForm-Shield-1.0.0
+ This program is source-available under the PolyForm Shield License 1.0.0.
+ On this system the full texts are installed at
+ /usr/share/doc/grepfocus/LICENSE.
