@@ -14,18 +14,18 @@ Two daily-driver defects from the BACKLOG bookmarks:
 
 ## What shipped
 
-- `179378a` gui: quit on close when no tray host is present — close-time
+- `c1450e3` gui: quit on close when no tray host is present — close-time
   probe over D-Bus (busctl `call` verb with `--timeout=2 --auto-start=no`;
   `get-property` silently ignores both flags and would block up to the 25s
   default) + hidden-window rescue in the 5s status watcher (a hidden window
   never gets a close event, so a tray vanishing underneath it needs the
   watcher to re-show the window)
-- `f2ac83a` gui: actionable error copy for daemon connect failures —
+- `e9be3c3` gui: actionable error copy for daemon connect failures —
   ErrorKind classified at the connect site only; NotFound/ConnectionRefused →
   start/install guidance, PermissionDenied → usermod + relogin; raw error
   kept as a trailing line; `white-space: pre-line` on all three surfaces
-- `e4cb9b1` docs: README Known-limits bullet, BACKLOG entries flipped
-- `57c9586` gui: no goodbye notification on quit-close (see below)
+- `f105220` docs: README Known-limits bullet, BACKLOG entries flipped
+- `b6ad5ec` gui: no goodbye notification on quit-close (see below)
 
 Design decisions: detection over persisted settings (the GUI has no
 persistence layer and doesn't gain one); every probe failure counts as
@@ -54,7 +54,7 @@ design; exercised implicitly during the matrix (unit-tested classifier).
   stale binary — `upgrade.sh` had died silently at its first sudo step
   (fingerprint timeout) after the build succeeded, leaving Jul 7 binaries
   installed. Verify `/usr/local/bin` mtimes after every deploy.
-- **The quit notification was tried and removed** (`57c9586`): the
+- **The quit notification was tried and removed** (`b6ad5ec`): the
   notification plugin delivers on a spawned async task that process exit
   races and loses; a blocking notify-rust send instead can stall the main
   thread up to the D-Bus method timeout — observed live as a frozen window

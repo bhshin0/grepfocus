@@ -255,9 +255,5 @@ read, audit, run, modify, and redistribute GrepFocus for any purpose **except**
 providing a product that competes with it. Note this is deliberately *not* an
 OSI-approved open source licence — "source available" is the accurate term.
 
-Contributions are welcome; issues and pull requests are unaffected by the
-licence change.
-
-Versions up to and including 0.1.0 were published under `LicenseRef-PolyForm-Shield-1.0.0`,
-and that grant stands for those versions. Everything from 0.2.0 onward is
-under PolyForm Shield.
+Contributions are welcome — issues and pull requests are unaffected by the
+licence being source-available rather than open source.

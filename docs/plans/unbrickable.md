@@ -19,33 +19,33 @@ Decisions baked in (see README Recovery + Known limits):
 
 ## What shipped
 
-- `bfcab46` hosts: chattr degrades gracefully; strip_managed edge tests
-- `ff33447` `frostbited cleanup [--purge] [--force]`: idempotent,
+- `44a6403` hosts: chattr degrades gracefully; strip_managed edge tests
+- `e8af832` `frostbited cleanup [--purge] [--force]`: idempotent,
   state-independent offline teardown
-- `e989f99` packaging: uninstall.sh (teardown-first ordering, inline
+- `d6ad145` packaging: uninstall.sh (teardown-first ordering, inline
   fallback) + full-product install.sh
-- `dd95b8c` enforce: 30s liveness re-verify catches firewall/hosts drift
-- `1890f41` nftables: DoT drops daddr-scoped
-- `ffcf623` README Recovery runbook + BACKLOG bookmarks
+- `df04c1b` enforce: 30s liveness re-verify catches firewall/hosts drift
+- `465a5fe` nftables: DoT drops daddr-scoped
+- `7feeb48` README Recovery runbook + BACKLOG bookmarks
 
 Post-review fix wave (adversarial review, 17 findings adjudicated, all
 mechanically confirmed against the code):
 
-- `f109108` enforce: clock-step-immune probe (`abs_diff`); per-half memo —
+- `ec4a1cb` enforce: clock-step-immune probe (`abs_diff`); per-half memo —
   nft-only drift heals without rewriting /etc/hosts; broken-nft hosts no
   longer churn every 30s
-- `a62d8fd` nftables: every exec bounded by coreutils `timeout` (a hung nft
+- `5193e87` nftables: every exec bounded by coreutils `timeout` (a hung nft
   under the applied mutex would wedge the scheduler); port-set-aware
   plain-DNS test
-- `79ba9c0` cleanup: systemd-aware daemon guard (Restart=always respawn
+- `66c3878` cleanup: systemd-aware daemon guard (Restart=always respawn
   race); `--purge` keeps the recovery copy after a failed strip; non-UTF-8 /
   CRLF hosts handled byte-exactly; step (f) genuinely tested
-- `24e7d2c` packaging: delegation timeout (pre-milestone binaries ignore
+- `74738ed` packaging: delegation timeout (pre-milestone binaries ignore
   argv and boot the daemon); fallback restores a missing /etc/hosts;
   chroot-safe unit removal; install.sh restarts on re-run, probes cargo
-- `1740d88` README runbook corrections (`install -m 644`, cleanup --purge
+- `5f0e1a2` README runbook corrections (`install -m 644`, cleanup --purge
   scope)
-- `e699eaa` uninstall.sh: drain buffered keystrokes before the purge prompt
+- `f2832f4` uninstall.sh: drain buffered keystrokes before the purge prompt
   and echo the keep/purge decision (defect caught live during the matrix)
 
 ## Live failure-mode matrix (Fedora 43, 2026-07-07)
@@ -65,7 +65,7 @@ mechanically confirmed against the code):
 
 Extra finding from the matrix: the purge prompt could be answered by a stale
 keystroke buffered in the tty during an earlier sudo/fingerprint exchange
-(observed: prompt "answered" in under 2 seconds). Fixed in `e699eaa`.
+(observed: prompt "answered" in under 2 seconds). Fixed in `f2832f4`.
 
 Operational note: uninstall `--purge` + reinstall recreates the `frostbite`
 group with a new GID, so already-logged-in sessions can't reach the socket

@@ -39,28 +39,28 @@ so every token ever minted carries all seven keys.
 
 ## What shipped (all commits gated on ./scripts/check.sh)
 
-- `561d6ca` core: license module (verify_token, error taxonomy
+- `eb7f87a` core: license module (verify_token, error taxonomy
   Malformed/BadSignature/Expired with GUI-facing Display, 7 feature consts)
-- `a62660c` core: JS↔Rust known-answer vectors minted through the real
+- `d12e14a` core: JS↔Rust known-answer vectors minted through the real
   web-side `signLicense()` (tampered/wrong-key/padded/structural/mutation
   sweep/unknown-claim cases; generator preserved in the test header)
-- `d974d7e` core: embed the production public key (first ceremony)
-- `c5b8ab0` core: **rotate the key** — the first private key leaked into
+- `4a7ce52` core: embed the production public key (first ceremony)
+- `275fb16` core: **rotate the key** — the first private key leaked into
   tooling transcripts (truncated command-line paste, trivially recoverable)
   and was burned; free pre-sales, catastrophic after. Lesson recorded below.
-- `6f2b846` core: production-key KAT vector — an expired trial signed by the
+- `4801658` core: production-key KAT vector — an expired trial signed by the
   vaulted key: fully verifies at its 2000-01-01 boundary (happy path under
   the production key) and fails only `Expired` after it
-- `8439bd3` daemon: license_token + high_water_unix in state; fail-open
+- `22b167c` daemon: license_token + high_water_unix in state; fail-open
   startup verification (bad token → warn + run unlicensed, never crash,
   never strip)
-- `729f29b` daemon: SetLicense IPC (verify-before-store, settings-lock
+- `2c719bb` daemon: SetLicense IPC (verify-before-store, settings-lock
   gated) + six `license_*` Status fields re-checking expiry at status time
-- `63db1a1` daemon: the gates — AddBlock cap, app-list gating with
+- `442a35a` daemon: the gates — AddBlock cap, app-list gating with
   grandfathering, schedule add/update + fire-time gate (skips logged once
   per window occurrence, keys pruned), chattr-only tamper gate,
   apps_enforced snapshot consumed by procwatch
-- `c6d8e1e` gui: license tab (paste/activate/remove through the unlock
+- `c38d4f3` gui: license tab (paste/activate/remove through the unlock
   flow; renders free/perpetual/trial-with-expiry/present-but-invalid; the
   daemon stays the validity authority)
 

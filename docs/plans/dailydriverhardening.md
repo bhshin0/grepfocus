@@ -1,7 +1,7 @@
 # Frostbite — daily-driver hardening: implementation handoff
 
 Status: approved plan, not yet implemented. Written 2026-07-04 against
-commit `96bef82` (master). Line references are as of that commit and may
+commit `b84db7f` (master). Line references are as of that commit and may
 shift — treat symbols as authoritative, lines as hints.
 
 ## 1. Current MVP baseline
@@ -26,11 +26,11 @@ threat model.
   state survival across restarts; self-healing enforcement retried each
   scheduler tick.
 - **Deployment skew**: the installed daemon (`/usr/local/bin/frostbited`) is
-  the `77a2e92` build; the `96bef82` fixes (enforcement race, break edge
+  the `d1748b3` build; the `b84db7f` fixes (enforcement race, break edge
   cases) are built but not installed. The running GUI is the fixed build.
   First run of the new `packaging/upgrade.sh` (Phase 3) closes this skew.
 - **Quality baseline**: 24-agent adversarial review found 19 real bugs;
-  the 9 high/medium fixed in `96bef82`; 6 lows tracked in `BACKLOG.md`
+  the 9 high/medium fixed in `b84db7f`; 6 lows tracked in `BACKLOG.md`
   (the single known-issues ledger — repo has no TODO/FIXME comments).
   12 unit tests total; no integration tests; no CI.
 
@@ -225,14 +225,14 @@ compile verification on the author's machine (`cargo check -p frostbite-gui`).
 ## 8. Manual verification (author's machine, after merge)
 
 1. `./packaging/upgrade.sh` — first run also closes the deployment skew
-   (replaces the installed `77a2e92` daemon with the fixed build).
+   (replaces the installed `d1748b3` daemon with the fixed build).
 2. Durability: `kill -9` the daemon mid-save (loop config mutations while
    killing), restart, confirm blocks/schedules/password survive; confirm
    `/var/lib/frostbite/hosts.orig` exists and matches the unmanaged hosts
    content; confirm `state.json.mac` is gone after first save.
 3. Launcher: launch Frostbite from the GNOME app grid; log out/in → tray
    icon present without manual start.
-4. Live-verify the `96bef82` daemon fixes now that they're installed:
+4. Live-verify the `b84db7f` daemon fixes now that they're installed:
    already-on-break rejected; break grant capped by remaining block time;
    manual+schedule dedupe (manual start, then overlapping schedule window
    opens → still one ActiveBlock).
@@ -298,12 +298,12 @@ the implementation itself needs none of it until deploy time:
 All four repository-level phases are implemented and committed on `master`, one
 commit per phase, in order:
 
-- Phase 1 — `43fd859` (durability: hosts fsync + `hosts.orig`, single-file
+- Phase 1 — `818b8c4` (durability: hosts fsync + `hosts.orig`, single-file
   state)
-- Phase 2 — `b09c052` (backlog lows: config-arm rollback, off-lock Argon2,
+- Phase 2 — `b252b69` (backlog lows: config-arm rollback, off-lock Argon2,
   wire cap, GUI races)
-- Phase 3 — `0adba4d` (launcher `.desktop` + `upgrade.sh`)
-- Phase 4 — `f7ae9c2` (test floor, extracted helpers, `scripts/check.sh`,
+- Phase 3 — `1070199` (launcher `.desktop` + `upgrade.sh`)
+- Phase 4 — `b01c35a` (test floor, extracted helpers, `scripts/check.sh`,
   tree-wide `cargo fmt`)
 
 Repository acceptance criteria all pass on the author's machine:
@@ -344,15 +344,15 @@ build (`tsc -noEmit` + vite), and `cargo build --release` (both binaries).
 
 ### Adversarial review
 
-A multi-agent adversarial review of the full diff (`195095d..HEAD`, 8
+A multi-agent adversarial review of the full diff (`1603b2b..HEAD`, 8
 dimensions, each finding double-verified) surfaced four real low/medium issues,
 all fixed:
 
-- `03b4dff` — fsync the parent directory after rename in `state::save_in` /
+- `28c8927` — fsync the parent directory after rename in `state::save_in` /
   `hosts::write_atomic` (power-loss lost-update window); make the `hosts.orig`
   recovery-copy write best-effort so a full/RO `/var/lib` can't block an
   `/etc/hosts` enforcement change.
-- `91f0380` — `check.sh` now finds the repo root via `git rev-parse
+- `b84f8c5` — `check.sh` now finds the repo root via `git rev-parse
   --show-toplevel` (the old `$0`-based path broke the documented pre-commit
   hook) and runs `pnpm install` before the UI build (broke on a fresh clone).
 
@@ -365,11 +365,11 @@ opens a time-limited window, and the single-user race is benign).
 
 Unchanged from §8/§11 — none were run by the implementation:
 
-1. `./packaging/upgrade.sh` (first run also closes the `77a2e92` deployment
+1. `./packaging/upgrade.sh` (first run also closes the `d1748b3` deployment
    skew). Validated with `bash -n` + `desktop-file-validate`; not executed.
 2. `kill -9`-mid-save durability test against the live daemon; confirm
    blocks/schedules/password survive and `state.json.mac` is gone after the
    first save; confirm `/var/lib/frostbite/hosts.orig` exists and matches the
    unmanaged hosts content.
 3. Launcher + autostart check (app grid; log out/in).
-4. Live-verify the `96bef82` daemon fixes and re-run the 2026-07-04 E2E suite.
+4. Live-verify the `b84db7f` daemon fixes and re-run the 2026-07-04 E2E suite.

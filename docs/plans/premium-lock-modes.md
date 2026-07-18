@@ -80,7 +80,7 @@ The `break_gate` decision table (pure, fully unit-tested):
 
 ## What shipped (all commits gated on ./scripts/check.sh)
 
-- `ffbf261` core+daemon: lock modes. `LockMode` wire enum + `Block.lock` +
+- `ac4f8d6` core+daemon: lock modes. `LockMode` wire enum + `Block.lock` +
   `ActiveBlock.lock` snapshot (landed as one commit — the wire addition
   forces every `ActiveBlock` constructor, so a split would not compile
   standalone); `GetBreakChallenge`/`TakeBreak.challenge` IPC; save-time
@@ -92,7 +92,7 @@ The `break_gate` decision table (pure, fully unit-tested):
   uniqueness, TakeBreak through dispatch for every branch, GetBreakChallenge
   arm (issues/stores/overwrites/round-trips), snapshot-not-saved-block, and
   the prune test.
-- `7088981` gui: lock-mode selector in the new-block form; the
+- `8635aa8` gui: lock-mode selector in the new-block form; the
   password-lock "no key" non-blocking warning; break-row branching on the
   `ActiveBlock.lock` snapshot; the challenge dialog (fetch-display-echo, text
   `user-select:none`, paste/drop refused, submit gated on typed length);

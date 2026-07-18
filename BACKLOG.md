@@ -2,10 +2,10 @@
 
 Low-severity findings from the 2026-07-04 adversarial code review. Each was
 independently verified as real. File:line references are as of commit
-`77a2e92` (pre-fix-wave; may have shifted since).
+`d1748b3` (pre-fix-wave; may have shifted since).
 
 The daily-driver hardening milestone (see `docs/plans/dailydriverhardening.md`)
-resolved most of these across Phase 1 (durability, commit `43fd859`) and
+resolved most of these across Phase 1 (durability, commit `818b8c4`) and
 Phase 2 (backlog lows). Status is tracked inline below.
 
 The *Bookmarks* section at the end collects deferred research notes — not
@@ -33,7 +33,7 @@ review findings — so they don't have to be re-derived later.
   `ipc::handle` responds with `Error { "response too large" }` on
   `InvalidData` (the stream is intact because `write_json` size-checks before
   writing any bytes) instead of dropping the connection.
-- **[FIXED — Phase 1, `43fd859`] Crash window between the two renames in
+- **[FIXED — Phase 1, `818b8c4`] Crash window between the two renames in
   `state::save`** — `crates/daemon/src/state.rs`. A crash after `state.json`
   was renamed but before `state.json.mac` made the next startup treat state as
   corrupted and start fresh (wiping blocks/schedules/password). State is now a

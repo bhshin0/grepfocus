@@ -158,7 +158,7 @@ feature message if asked unlicensed):
 
 ## What shipped (all commits gated on ./scripts/check.sh)
 
-- `4533ac1` premium: core + daemon. `UsageStats`/`FocusSession`/`DayStat`/
+- `54dc41d` premium: core + daemon. `UsageStats`/`FocusSession`/`DayStat`/
   `LifetimeTotals`/`Origin` in core with pure, unit-tested helpers
   (`credit_session`/`credit_break`/`credit_break_refused`/`credit_app_kills`/
   `compute_streak`, retention + ring cap); `stats` on `State`; recording in
@@ -166,7 +166,7 @@ feature message if asked unlicensed):
   `TakeBreak` (taken + refused-defensively), procwatch (per-block attribution,
   PID dedup, in-memory counter folded into today's rollup on the next save);
   `GetUsageStats` IPC gated on `usage_stats`; streak computed on read. 19 tests.
-- `4fd6835` gui: the Stats tab — `get_usage_stats` command (registered at all
+- `1e0b733` gui: the Stats tab — `get_usage_stats` command (registered at all
   three ACL sites), shown only when licensed (daemon stays the gate), headline
   tiles, a dependency-free 30-day focus-bar strip, and a newest-first recent
   sessions list.

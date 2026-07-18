@@ -147,7 +147,7 @@ daemon stays the authority):
 
 ## What shipped (all commits gated on ./scripts/check.sh)
 
-- `0dec487` premium: core + daemon. `Originator::Pomodoro` + `Origin::Pomodoro`;
+- `7f4909f` premium: core + daemon. `Originator::Pomodoro` + `Origin::Pomodoro`;
   `PomodoroSession`/`PomodoroPhase`/`PomodoroStatus`; `State.pomodoro`; pure
   `advance_pomodoro` run before reconcile in the tick (persist-on-change);
   `StartPomodoro` (gated on `pomodoro`, bounds-validated) / `StopPomodoro`
@@ -155,7 +155,7 @@ daemon stays the authority):
   `FocusSession` recorded via reconcile step 1's existing choke point;
   `Response::Status.pomodoro`. Unit tests for the phase machine, bounds,
   gating, and the stop rule.
-- `6e243f4` gui: the Pomodoro tab — setup (block + focus/break/cycles + total
+- `2c28042` gui: the Pomodoro tab — setup (block + focus/break/cycles + total
   estimate) and a running view built for clarity: phase-countdown banner
   (green during breaks), cycle dots, the commitment rule stated in plain words
   and always visible, and an End-session button loudly disabled during focus /
