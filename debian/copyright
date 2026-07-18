@@ -5,6 +5,14 @@ Source: https://github.com/bhshin0/grepfocus
 Files: *
 Copyright: 2026 Bryan <bhshin@gmail.com>
 License: LicenseRef-PolyForm-Shield-1.0.0
- This program is source-available under the PolyForm Shield License 1.0.0.
- On this system the full texts are installed at
- /usr/share/doc/grepfocus/LICENSE.
+ Source-available under the PolyForm Shield License 1.0.0. Any purpose is a
+ permitted purpose, except providing a product that competes with this
+ software. This is NOT an OSI-approved open source licence, so the package is
+ not suitable for the Debian archive or any repository requiring DFSG-free
+ licensing.
+ .
+ The full text is at <https://polyformproject.org/licenses/shield/1.0.0> and is
+ installed on this system at /usr/share/doc/grepfocus/LICENSE.
+ .
+ Versions up to and including 0.1.0 were published under LicenseRef-PolyForm-Shield-1.0.0;
+ that grant stands for those versions.

@@ -12,7 +12,7 @@
 %global debug_package %{nil}
 
 Name:           grepfocus
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Website and app blocker for Linux
 
@@ -122,5 +122,9 @@ fi
 %dir %attr(0700,root,root) %{_sharedstatedir}/grepfocus
 
 %changelog
+* Sat Jul 18 2026 Bryan <bhshin@gmail.com> - 0.2.0-1
+- Relicense to PolyForm Shield 1.0.0 (source-available, noncompete)
+- Single binary: all premium features present, unlocked by a license key
+
 * Sat Jul 11 2026 Bryan <bhshin@gmail.com> - 0.1.0-1
 - Initial package
