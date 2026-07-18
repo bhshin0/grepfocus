@@ -17,13 +17,16 @@ podman build -t "$IMAGE" packaging/deb
 mkdir -p dist
 
 echo "==> Building the .deb in the container"
-# The repo is mounted at /src; a named volume caches the cargo registry across
-# runs. `target/` lives in the mounted tree, so recompiles are incremental.
+# The repo is mounted at /src; named volumes cache the cargo registry and hold
+# the build's target/ across runs. The target/ volume is mounted OVER /src/target
+# so the Ubuntu container never reads or clobbers a host (e.g. Fedora) target/ —
+# mixing toolchains' object files there would force full rebuilds on both sides.
 # dpkg-buildpackage writes the .deb to the PARENT of the source dir (/), so we
 # copy it back into the mounted dist/.
 podman run --rm \
     -v "$REPO_ROOT":/src:Z \
     -v grepfocus-deb-cargo:/root/.cargo/registry \
+    -v grepfocus-deb-target:/src/target \
     "$IMAGE" bash -euo pipefail -c '
         dpkg-buildpackage -b -us -uc
         mkdir -p /src/dist
