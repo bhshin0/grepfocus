@@ -103,11 +103,22 @@ to be redone when the item is picked up.
   blocks + 1 saved block / premium = app_blocking + schedules +
   tamper_protection + unlimited_blocks (per frostbite-web
   `lib/features.ts`).
-- **[DEFERRED] Packaging** — `.rpm` first. Use `sysusers.d`/`tmpfiles.d`
-  for the group and runtime/state dirs; declare runtime deps (webkit2gtk4.1,
-  libappindicator/ayatana); `%preun` can run `grepfocusd cleanup` verbatim.
-  `tauri.conf.json`'s bundle section is currently disabled. The store
-  download page artifacts are all "coming soon" placeholders.
+- **[DONE — 2026-07-17] Packaging (.rpm + .deb)** — native packaging for both
+  Fedora and Ubuntu, on `master`. RPM: `packaging/grepfocus.spec` +
+  `build-rpm.sh` (archives HEAD, rpmbuild; toolchain from the user's PATH, no
+  rust/pnpm BuildRequires). DEB: `debian/` (dh, compat 13) built via
+  `packaging/build-deb.sh` inside an `ubuntu:24.04` podman container
+  (`packaging/deb/Containerfile`) so the GUI links Ubuntu's libraries — a
+  Fedora-built binary won't run on Ubuntu. Both reuse the same
+  systemd unit/sysusers.d/tmpfiles.d; both tear down via `grepfocusd cleanup`
+  on erase/remove while the binary still exists. Gotcha recorded:
+  `dh_installsysusers` is NOT in the compat-13 dh sequence, so the deb creates
+  the group in `debian/grepfocus.postinst` (before the service starts) rather
+  than via a staged sysusers file. Both verified installing cleanly in clean
+  containers; outputs `dist/grepfocus.rpm` and `dist/grepfocus.deb`. STILL
+  user-side to actually ship: make the GitHub repo public, cut a Release and
+  upload both artifacts, and point the store download links at them (the store
+  hardcodes `releases/latest/download/grepfocus.rpm`; add the `.deb`).
 - **[FIXED — renamed to grepfocus, 2026-07-10] Rename** — research
   2026-07-06, resolved 2026-07-10: the project is now **grepfocus** (display
   name **GrepFocus**), collision-checked clean — crates.io free, no product
