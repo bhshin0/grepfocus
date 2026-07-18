@@ -23,10 +23,15 @@ echo "==> Building the .deb in the container"
 # mixing toolchains' object files there would force full rebuilds on both sides.
 # dpkg-buildpackage writes the .deb to the PARENT of the source dir (/), so we
 # copy it back into the mounted dist/.
+# CI=true so pnpm won't block on a no-TTY confirmation when it wants to refresh
+# node_modules. node_modules is a volume too (like target/): the host's copy
+# may be from a different pnpm store, and pnpm would otherwise purge it.
 podman run --rm \
+    -e CI=true \
     -v "$REPO_ROOT":/src:Z \
     -v grepfocus-deb-cargo:/root/.cargo/registry \
     -v grepfocus-deb-target:/src/target \
+    -v grepfocus-deb-node:/src/crates/gui/ui/node_modules \
     "$IMAGE" bash -euo pipefail -c '
         dpkg-buildpackage -b -us -uc
         mkdir -p /src/dist
