@@ -58,3 +58,9 @@ override_dh_auto_install:
 # Enable + start grepfocusd on install (dh default), restart on upgrade.
 override_dh_installsystemd:
 	dh_installsystemd grepfocusd.service
+
+# Keep the licence readable: dh_compress would gzip it, which is awkward for a
+# licence and would falsify debian/copyright's pointer to
+# /usr/share/doc/grepfocus/LICENSE.
+override_dh_compress:
+	dh_compress -X LICENSE
