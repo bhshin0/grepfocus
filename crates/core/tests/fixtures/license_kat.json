@@ -68,7 +68,7 @@
     }
   },
   "prod_expired": {
-    "token": "eyJsaWNlbnNlX2lkIjoiR0YtS0FULVBST0QtRVhQSVJFRC0wMDAxIiwiZW1haWwiOiJrYXRAZXhhbXBsZS5jb20iLCJ0aWVyIjoicHJlbWl1bSIsImtpbmQiOiJ0cmlhbCIsImZlYXR1cmVzIjpbImFwcF9ibG9ja2luZyIsInNjaGVkdWxlcyIsInRhbXBlcl9wcm90ZWN0aW9uIiwidW5saW1pdGVkX2Jsb2NrcyIsImxvY2tfbW9kZXMiLCJ1c2FnZV9zdGF0cyIsInBvbW9kb3JvIl0sImlzc3VlZF9hdCI6OTQ0OTU2ODAwLCJleHBpcmVzX2F0Ijo5NDY2ODQ4MDAsIm1heF9kZXZpY2VzIjozfQ.sBgQ1MerGFi9-ZsO158VXIz07A3h4Xx2c00NLqFmRG8R7YT3FDWEf22yStG-amjJw1PttRidqjyBEMHgCee5Bw",
-    "note": "Signed by the PRODUCTION key (post-rotation ceremony 2026-07-11) with fixed literals; expired 2000-01-01 so it proves the embedded pubkey matches the vaulted signing key without committing a usable license. Minted via mint-expired-kat.mts (same registerHooks + signLicense pattern as the generator in license_kat.rs)."
+    "note": "Signed by the PRODUCTION key (post-rotation ceremony 2026-07-17) with fixed literals; expired 2000-01-01 so it proves the embedded pubkey matches the vaulted signing key without committing a usable license. Minted via rotate-remint.mjs (standalone signer implementing the frozen contract).",
+    "token": "eyJsaWNlbnNlX2lkIjoiR0YtS0FULVBST0QtRVhQSVJFRC0wMDAxIiwiZW1haWwiOiJrYXRAZXhhbXBsZS5jb20iLCJ0aWVyIjoicHJlbWl1bSIsImtpbmQiOiJ0cmlhbCIsImZlYXR1cmVzIjpbImFwcF9ibG9ja2luZyIsInNjaGVkdWxlcyIsInRhbXBlcl9wcm90ZWN0aW9uIiwidW5saW1pdGVkX2Jsb2NrcyIsImxvY2tfbW9kZXMiLCJ1c2FnZV9zdGF0cyIsInBvbW9kb3JvIl0sImlzc3VlZF9hdCI6OTQ0OTU2ODAwLCJleHBpcmVzX2F0Ijo5NDY2ODQ4MDAsIm1heF9kZXZpY2VzIjozfQ.3s1l3c-6Z1KdUGJ52ZN3dNQpVGy37WbzncGEtYXjPVLOHCBbPCQIZP--NvG-1YZoCNGV_2jPmw5zt9AhrESsCw"
   }
 }

@@ -36,14 +36,15 @@ use std::fmt;
 /// The embedded license public key: raw 32-byte Ed25519 key, base64url
 /// without padding.
 ///
-/// Set at the keypair ceremony (2026-07-11, re-run same day after the first
-/// private key leaked into tooling transcripts pre-sales and was burned)
-/// from the `PUBLIC_KEY_BASE64URL` value printed by
+/// Set at the keypair ceremony (2026-07-11; rotated 2026-07-17 after the
+/// then-current private key leaked into a chat transcript during go-live
+/// setup — still pre-sales, so nothing sold was invalidated) from the
+/// `PUBLIC_KEY_BASE64URL` value printed by
 /// `grepfocus-web/scripts/gen-keypair.ts` (the JWK `x` component of the
 /// signing key). The private half lives only in the store's
 /// `LICENSE_SIGNING_KEY` env (vaulted). NEVER regenerate the keypair once
 /// licenses have been sold: rotating this key invalidates every one of them.
-pub const LICENSE_PUBKEY_B64URL: &str = "irtPSr-CCq0JSd0UV_2RncGhBm6OUsJTBWWp0PjCu8o";
+pub const LICENSE_PUBKEY_B64URL: &str = "q4Zz7G8tXk2KYUp_JjLIZhOHdElcjhJ37GyyA-aVfJc";
 
 /// Claims carried inside a license token.
 ///
