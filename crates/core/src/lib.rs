@@ -17,15 +17,124 @@ pub struct Block {
     pub name: String,
     pub domains: Vec<String>,
     pub apps: Vec<AppMatcher>,
-    /// Daily "break allowance": total seconds per local day the user may pause
-    /// this block while it is active. `0` disables breaks for the block.
+    /// LEGACY daily "break allowance": total seconds per local day the user
+    /// may pause this block, `0` meaning no breaks at all.
+    ///
+    /// Never read this directly — go through [`Block::policy`]. It is kept on
+    /// disk purely as a DOWNGRADE MIRROR, refreshed by [`Block::set_policy`],
+    /// so a daemon that predates [`AllowancePolicy`] reads a budget that is
+    /// never LOOSER than the real policy.
     #[serde(default)]
     pub allowance_secs_per_day: u64,
+    /// The break-allowance policy: how much break time this block grants and
+    /// over what period. `None` on records written before this field existed
+    /// (fall back to the legacy mirror above) AND on records carrying a policy
+    /// kind this build does not know — see [`lenient_policy`]. Read it through
+    /// [`Block::policy`], which resolves both cases.
+    #[serde(default, deserialize_with = "lenient_policy")]
+    pub allowance: Option<AllowancePolicy>,
     /// How taking a break is locked down while this block is active.
     /// Non-`Unlocked` modes are premium, gated when the block is saved.
     /// Defaults to `Unlocked` for records written before this field existed.
     #[serde(default)]
     pub lock: LockMode,
+}
+
+/// How much break time a block grants, and over what period.
+///
+/// This is the ALLOWANCE axis — *how much*. It is deliberately separate from
+/// the LOCK axis ([`LockMode`], *how hard is it to start a break*): friction is
+/// a lock, duration is an allowance. Policies are either/or by construction and
+/// never stack, which is why this is a discriminated enum rather than a bag of
+/// optional numeric fields. Free tier.
+///
+/// Internally tagged on `kind`, following the [`AppMatcher`] precedent in this
+/// file. Because an internally-tagged enum hard-errors on an unknown tag, the
+/// field that carries one on [`Block`] is read through [`lenient_policy`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AllowancePolicy {
+    /// No breaks at all. Wire name `"none"`; the Rust name avoids colliding
+    /// with `Option::None` at every match site.
+    #[default]
+    #[serde(rename = "none")]
+    Disabled,
+    /// `secs` per LOCAL day. What every pre-policy block folds into.
+    PerDay { secs: u64 },
+    /// At most `secs` within any trailing `window_secs`. The rolling form is
+    /// chosen over fixed clock slots because slots don't deliver what "5 min
+    /// per hour" promises: 5 min at 09:58 plus 5 min at 10:00 is ten
+    /// consecutive minutes within the rules — precisely the boundary a
+    /// motivated user learns to wait for.
+    ///
+    /// The only policy that needs break history.
+    RollingWindow { secs: u64, window_secs: u64 },
+    /// Every break is exactly `secs`, with no cumulative cap — the friction is
+    /// the LOCK ([`LockMode`]), not the allowance. Consults no history at all.
+    PerBreak { secs: u64 },
+}
+
+/// Deserialize [`Block::allowance`], degrading a policy kind this build does
+/// not know to `None` instead of erroring.
+///
+/// An internally-tagged enum hard-errors on an unknown tag, which would make
+/// state written by a NEWER daemon fail to load — and since the
+/// verified-but-unparseable state file became fatal at startup, that would take
+/// the whole daemon down after a downgrade rather than just one field. So an
+/// unrecognized policy degrades to `None` and the block falls back to its
+/// legacy `allowance_secs_per_day` mirror, which is never looser than the real
+/// policy. Same doctrine as [`deserialize_active`].
+fn lenient_policy<'de, D>(d: D) -> Result<Option<AllowancePolicy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum KnownOrNot {
+        Known(AllowancePolicy),
+        /// Anything else that is still valid JSON — a future `kind`, or a
+        /// malformed payload. Swallowed, never surfaced; the payload is
+        /// captured only so that serde has somewhere to put it.
+        Unknown(#[allow(dead_code)] serde_json::Value),
+    }
+    let v: Option<KnownOrNot> = Option::deserialize(d)?;
+    Ok(match v {
+        Some(KnownOrNot::Known(p)) => Some(p),
+        Some(KnownOrNot::Unknown(_)) | None => None,
+    })
+}
+
+impl Block {
+    /// The block's effective break-allowance policy.
+    ///
+    /// The SINGLE reader of `allowance_secs_per_day`: an explicit policy wins,
+    /// otherwise the legacy scalar folds into `PerDay` (or `Disabled` at `0`,
+    /// which is how "no breaks" has always been encoded).
+    pub fn policy(&self) -> AllowancePolicy {
+        match &self.allowance {
+            Some(p) => p.clone(),
+            None if self.allowance_secs_per_day > 0 => AllowancePolicy::PerDay {
+                secs: self.allowance_secs_per_day,
+            },
+            None => AllowancePolicy::Disabled,
+        }
+    }
+
+    /// Set the policy AND refresh the legacy downgrade mirror, so the two can
+    /// never drift.
+    ///
+    /// For `RollingWindow`, mirroring the per-window budget means an older
+    /// daemon enforces that budget per DAY instead — strictly stricter, which
+    /// is the only safe direction for a downgrade.
+    pub fn set_policy(&mut self, p: AllowancePolicy) {
+        self.allowance_secs_per_day = match &p {
+            AllowancePolicy::Disabled => 0,
+            AllowancePolicy::PerDay { secs }
+            | AllowancePolicy::RollingWindow { secs, .. }
+            | AllowancePolicy::PerBreak { secs } => *secs,
+        };
+        self.allowance = Some(p);
+    }
 }
 
 /// How taking a break on an active block is locked down.
@@ -834,6 +943,147 @@ mod tests {
         );
         let a: ActiveBlock = serde_json::from_str(&active_json).unwrap();
         assert_eq!(a.lock, LockMode::Unlocked);
+    }
+
+    // ── allowance policy ────────────────────────────────────────────────────
+
+    // Pin every policy's wire shape: internally tagged on "kind", snake_case,
+    // with Disabled deliberately carrying "none".
+    #[test]
+    fn allowance_policy_wire_round_trips() {
+        for (policy, wire) in [
+            (AllowancePolicy::Disabled, r#"{"kind":"none"}"#),
+            (
+                AllowancePolicy::PerDay { secs: 600 },
+                r#"{"kind":"per_day","secs":600}"#,
+            ),
+            (
+                AllowancePolicy::RollingWindow {
+                    secs: 300,
+                    window_secs: 3600,
+                },
+                r#"{"kind":"rolling_window","secs":300,"window_secs":3600}"#,
+            ),
+            (
+                AllowancePolicy::PerBreak { secs: 300 },
+                r#"{"kind":"per_break","secs":300}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&policy).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<AllowancePolicy>(wire).unwrap(),
+                policy
+            );
+        }
+    }
+
+    #[test]
+    fn allowance_policy_defaults_to_disabled() {
+        assert_eq!(AllowancePolicy::default(), AllowancePolicy::Disabled);
+    }
+
+    // THE forward-compatibility test. A policy kind written by a newer daemon
+    // must not fail the Block (and therefore the whole State) — it degrades to
+    // None and the block falls back to its legacy mirror, which is never
+    // looser than the real policy.
+    #[test]
+    fn unknown_policy_kind_degrades_to_legacy_mirror() {
+        let json = r#"{
+            "id": 1,
+            "name": "reddit",
+            "domains": [],
+            "apps": [],
+            "allowance_secs_per_day": 600,
+            "allowance": {"kind":"future_thing","x":1}
+        }"#;
+        let b: Block = serde_json::from_str(json).expect("unknown kind must not fail the Block");
+        assert_eq!(b.allowance, None);
+        assert_eq!(b.policy(), AllowancePolicy::PerDay { secs: 600 });
+
+        // And with a zero mirror it reads as "no breaks", never as unlimited.
+        let json = r#"{
+            "id": 1, "name": "reddit", "domains": [], "apps": [],
+            "allowance_secs_per_day": 0,
+            "allowance": {"kind":"future_thing","x":1}
+        }"#;
+        let b: Block = serde_json::from_str(json).unwrap();
+        assert_eq!(b.policy(), AllowancePolicy::Disabled);
+    }
+
+    #[test]
+    fn legacy_scalar_folds_into_per_day_or_disabled() {
+        let b = Block {
+            allowance_secs_per_day: 600,
+            ..Default::default()
+        };
+        assert_eq!(b.policy(), AllowancePolicy::PerDay { secs: 600 });
+
+        let b = Block {
+            allowance_secs_per_day: 0,
+            ..Default::default()
+        };
+        assert_eq!(b.policy(), AllowancePolicy::Disabled);
+    }
+
+    // An explicit policy is authoritative even when the mirror disagrees —
+    // the mirror exists for OLD daemons, never for this one.
+    #[test]
+    fn explicit_policy_wins_over_disagreeing_mirror() {
+        let b = Block {
+            allowance_secs_per_day: 600,
+            allowance: Some(AllowancePolicy::Disabled),
+            ..Default::default()
+        };
+        assert_eq!(b.policy(), AllowancePolicy::Disabled);
+
+        let b = Block {
+            allowance_secs_per_day: 0,
+            allowance: Some(AllowancePolicy::PerBreak { secs: 300 }),
+            ..Default::default()
+        };
+        assert_eq!(b.policy(), AllowancePolicy::PerBreak { secs: 300 });
+    }
+
+    #[test]
+    fn set_policy_refreshes_the_downgrade_mirror() {
+        for (policy, mirror) in [
+            (AllowancePolicy::Disabled, 0),
+            (AllowancePolicy::PerDay { secs: 600 }, 600),
+            (
+                // The per-WINDOW budget is mirrored, so an old daemon enforces
+                // it per day: strictly stricter, deliberately.
+                AllowancePolicy::RollingWindow {
+                    secs: 300,
+                    window_secs: 3600,
+                },
+                300,
+            ),
+            (AllowancePolicy::PerBreak { secs: 300 }, 300),
+        ] {
+            let mut b = Block {
+                allowance_secs_per_day: 9999,
+                ..Default::default()
+            };
+            b.set_policy(policy.clone());
+            assert_eq!(b.allowance_secs_per_day, mirror, "mirror for {policy:?}");
+            assert_eq!(b.policy(), policy);
+        }
+    }
+
+    // Old state.json compat: a Block written before `allowance` existed loads
+    // and resolves through the legacy scalar.
+    #[test]
+    fn block_without_allowance_field_still_deserializes() {
+        let json = r#"{
+            "id": 1,
+            "name": "reddit",
+            "domains": ["reddit.com"],
+            "apps": [],
+            "allowance_secs_per_day": 600
+        }"#;
+        let b: Block = serde_json::from_str(json).unwrap();
+        assert_eq!(b.allowance, None);
+        assert_eq!(b.policy(), AllowancePolicy::PerDay { secs: 600 });
     }
 
     // ── usage stats (B2.b) ──────────────────────────────────────────────────

@@ -200,6 +200,7 @@ mod tests {
                 domains: vec!["reddit.com".into()],
                 apps: vec![],
                 allowance_secs_per_day: 600,
+                allowance: None,
                 lock: LockMode::Unlocked,
             }],
             license_token: Some("payload.signature".to_string()),

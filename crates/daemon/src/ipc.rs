@@ -1393,6 +1393,7 @@ mod tests {
             domains: vec!["example.com".into()],
             apps,
             allowance_secs_per_day: 0,
+            allowance: None,
             lock: LockMode::Unlocked,
         }
     }

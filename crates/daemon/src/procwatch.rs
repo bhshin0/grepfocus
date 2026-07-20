@@ -280,6 +280,7 @@ mod tests {
                     name: "steam".into(),
                 }],
                 allowance_secs_per_day: 0,
+                allowance: None,
                 lock: LockMode::Unlocked,
             },
             started_at_unix: 0,

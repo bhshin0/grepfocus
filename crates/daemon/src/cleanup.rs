@@ -492,6 +492,7 @@ mod tests {
             domains: vec!["reddit.com".into()],
             apps: vec![],
             allowance_secs_per_day: 0,
+            allowance: None,
             lock: LockMode::Unlocked,
         };
         let st = State {
