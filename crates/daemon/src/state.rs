@@ -3,7 +3,8 @@
 //! The HMAC defends against hand-edits while the daemon is stopped. The key
 //! lives in /etc/grepfocus/secret (mode 0600). If the state file is missing
 //! or fails verification, the daemon starts fresh and clears any leftover
-//! hosts-file block.
+//! hosts-file block. If it *verifies* but does not parse, the daemon refuses
+//! to start rather than overwrite authentic state — see [`UnparseableState`].
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -21,6 +22,50 @@ use crate::paths;
 const STATE_JSON: &str = "state.json";
 /// Legacy MAC sidecar. Read for backward compatibility; deleted on first save.
 const STATE_MAC_SIDECAR: &str = "state.json.mac";
+
+/// The state file's HMAC verified, but the body underneath it did not
+/// deserialize into `State`.
+///
+/// This is a *categorically different* failure from a bad MAC, and the
+/// difference is the whole point of the type. A bad MAC means the bytes are
+/// not ours: hand-edited, truncated, restored from a mismatched secret. There
+/// is nothing to recover, so starting fresh is correct. A good MAC means we
+/// wrote these bytes ourselves — the content is authentic and simply cannot be
+/// read by *this* build (a serialization bug, or state written by a newer
+/// daemon whose schema we don't understand). Starting fresh there would
+/// overwrite a perfectly good state file on the next save and destroy every
+/// block, schedule, usage stat and the stored licence token. So this case is
+/// fatal at startup instead: the daemon refuses to run and leaves the file on
+/// disk for an operator (or a downgrade/upgrade) to sort out.
+///
+/// Callers detect it by downcasting through the `anyhow` chain — see
+/// [`is_unparseable`] — rather than matching on message text.
+#[derive(Debug)]
+pub struct UnparseableState(serde_json::Error);
+
+impl std::fmt::Display for UnparseableState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "state.json passed HMAC verification but its body could not be parsed"
+        )
+    }
+}
+
+impl std::error::Error for UnparseableState {
+    /// Keep the `serde_json` error reachable: "expected a string at line 4
+    /// column 18" is the entire diagnostic value of this failure.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// True if `err` came from [`load_in`] failing to parse an authentic
+/// (HMAC-verified) state file, as opposed to genuine corruption or a missing
+/// file. See [`UnparseableState`].
+pub fn is_unparseable(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<UnparseableState>())
+}
 
 pub fn load_or_create_secret() -> anyhow::Result<Vec<u8>> {
     match fs::read(paths::SECRET_FILE) {
@@ -52,10 +97,15 @@ pub fn load(key: &[u8]) -> anyhow::Result<State> {
 /// (32-byte HMAC prefix + JSON body), then falls back to the legacy two-file
 /// scheme (whole file as body, MAC in `state.json.mac`).
 ///
-/// A missing `state.json` propagates a `NotFound` error so `main` can tell
-/// "first run" from "corrupted" (see `main.rs`). Any file that exists but
-/// verifies under neither format returns a non-`NotFound` error, so corruption
-/// is reported rather than silently accepted.
+/// Failure modes, all three distinguishable by the caller (see `main.rs`):
+///   * missing `state.json` — a `NotFound` `io::Error` in the chain, i.e.
+///     "first run";
+///   * verifies under neither format — plain error, i.e. genuine corruption,
+///     reported rather than silently accepted;
+///   * verifies but does not deserialize — [`UnparseableState`], which must
+///     never be treated as corruption because doing so overwrites authentic
+///     state. Both formats report it the same way so the legacy path stays
+///     coherent with the new one.
 pub fn load_in(dir: &Path, key: &[u8]) -> anyhow::Result<State> {
     let raw = fs::read(dir.join(STATE_JSON)).context("reading state.json")?;
 
@@ -63,18 +113,22 @@ pub fn load_in(dir: &Path, key: &[u8]) -> anyhow::Result<State> {
     if raw.len() >= 32 {
         let (mac, body) = raw.split_at(32);
         if hmac_sig::verify(body, key, mac) {
-            if let Ok(state) = serde_json::from_slice::<State>(body) {
-                return Ok(state);
-            }
+            // The MAC proves we wrote this body, so a parse failure here is
+            // never corruption — do not fall through to the legacy branch and
+            // end up reporting it as one.
+            return serde_json::from_slice::<State>(body)
+                .map_err(|e| anyhow::Error::new(UnparseableState(e)));
         }
     }
 
     // Legacy two-file scheme: the whole file is the body, MAC in the sidecar.
-    // A new-format file whose MAC or JSON just failed also lands here and fails
-    // this check too, so genuine corruption still surfaces as an error.
+    // A new-format file whose MAC failed also lands here and fails this check
+    // too, so genuine corruption still surfaces as an error.
     if let Ok(mac) = fs::read(dir.join(STATE_MAC_SIDECAR)) {
         if hmac_sig::verify(&raw, key, &mac) {
-            return serde_json::from_slice(&raw).context("parsing legacy state.json");
+            return serde_json::from_slice(&raw)
+                .map_err(|e| anyhow::Error::new(UnparseableState(e)))
+                .context("parsing legacy state.json");
         }
     }
 
@@ -275,6 +329,100 @@ mod tests {
         let err = load_in(dir.path(), key).unwrap_err();
         assert!(!is_not_found(&err));
         assert!(err.to_string().contains("HMAC"));
+    }
+
+    /// Write `body` to `dir/state.json` in the new single-file format with a
+    /// MAC that genuinely verifies, whatever the body happens to contain.
+    fn write_signed(dir: &Path, key: &[u8], body: &[u8]) {
+        let mut raw = hmac_sig::sign(body, key).to_vec();
+        raw.extend_from_slice(body);
+        fs::write(dir.join(STATE_JSON), raw).unwrap();
+    }
+
+    #[test]
+    fn verified_but_malformed_body_is_unparseable_not_corruption() {
+        // The data-loss case: a file we signed ourselves whose body this build
+        // cannot read. It must NOT come back as an HMAC failure, because the
+        // caller answers that with "start fresh" and then saves over the file.
+        let dir = tempfile::tempdir().unwrap();
+        let key = b"unparseable-test-key-0123456789ab";
+        write_signed(dir.path(), key, b"{ this is not json");
+        let err = load_in(dir.path(), key).unwrap_err();
+        assert!(is_unparseable(&err), "got: {err:#}");
+        assert!(!is_not_found(&err));
+        assert!(
+            !format!("{err:#}").contains("failed HMAC verification"),
+            "must not be reported as corruption: {err:#}"
+        );
+    }
+
+    #[test]
+    fn verified_but_wrongly_typed_body_is_unparseable() {
+        // Well-formed JSON, wrong shape — the realistic "newer daemon changed
+        // a field's type" flavour of the same failure.
+        let dir = tempfile::tempdir().unwrap();
+        let key = b"typed-unparseable-key-0123456789a";
+        write_signed(dir.path(), key, br#"{"next_id": "not-a-number"}"#);
+        let err = load_in(dir.path(), key).unwrap_err();
+        assert!(is_unparseable(&err), "got: {err:#}");
+        // The serde diagnostic survives into the chain — that detail is the
+        // only thing an operator has to go on.
+        assert!(
+            format!("{err:#}").contains("invalid type: string \"not-a-number\""),
+            "serde detail must be preserved: {err:#}"
+        );
+    }
+
+    #[test]
+    fn legacy_verified_but_malformed_body_is_unparseable() {
+        // Same rule on the legacy two-file path: a valid sidecar MAC over an
+        // unreadable body is our data, not corruption.
+        let dir = tempfile::tempdir().unwrap();
+        let key = b"legacy-unparseable-key-0123456789";
+        let body = b"{ nope";
+        fs::write(dir.path().join(STATE_JSON), body).unwrap();
+        fs::write(
+            dir.path().join(STATE_MAC_SIDECAR),
+            hmac_sig::sign(body, key),
+        )
+        .unwrap();
+        let err = load_in(dir.path(), key).unwrap_err();
+        assert!(is_unparseable(&err), "got: {err:#}");
+        assert!(format!("{err:#}").contains("parsing legacy state.json"));
+    }
+
+    #[test]
+    fn bad_mac_is_corruption_not_unparseable() {
+        // The counterpart: a body this build could happily parse, but signed
+        // with the wrong key. That is corruption, and must stay corruption.
+        let dir = tempfile::tempdir().unwrap();
+        let st = sample_state();
+        save_in(dir.path(), &st, b"real-key-0123456789abcdef01234567").unwrap();
+        let err = load_in(dir.path(), b"other-key-0123456789abcdef0123456").unwrap_err();
+        assert!(!is_unparseable(&err), "got: {err:#}");
+        assert!(err.to_string().contains("HMAC"));
+    }
+
+    #[test]
+    fn missing_file_is_not_unparseable() {
+        // NotFound still means "first run" and nothing else.
+        let dir = tempfile::tempdir().unwrap();
+        let key = b"missing-not-unparseable-key-01234";
+        let err = load_in(dir.path(), key).unwrap_err();
+        assert!(is_not_found(&err));
+        assert!(!is_unparseable(&err), "got: {err:#}");
+    }
+
+    #[test]
+    fn unparseable_load_leaves_state_file_untouched() {
+        // load_in must never mutate the file; the caller's whole recovery
+        // story depends on the bytes still being there afterwards.
+        let dir = tempfile::tempdir().unwrap();
+        let key = b"untouched-test-key-0123456789abc";
+        write_signed(dir.path(), key, b"{ broken");
+        let before = fs::read(dir.path().join(STATE_JSON)).unwrap();
+        let _ = load_in(dir.path(), key).unwrap_err();
+        assert_eq!(before, fs::read(dir.path().join(STATE_JSON)).unwrap());
     }
 
     #[test]

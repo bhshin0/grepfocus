@@ -142,6 +142,20 @@ async fn run_daemon() -> anyhow::Result<()> {
             });
             if missing {
                 info!("no state file yet — first run, starting fresh");
+            } else if state::is_unparseable(&err) {
+                // The HMAC verified, so this file is authentically ours — it
+                // just doesn't fit this build's schema (our bug, or state
+                // written by a newer daemon). Starting fresh would save over
+                // it and destroy every block, schedule, stat and the stored
+                // licence token, so refuse to start instead and leave
+                // state.json exactly as it is. Note we deliberately do *not*
+                // clear the hosts block on this path: we cannot know what was
+                // being enforced, and for a blocker leaving enforcement up is
+                // the safe failure.
+                return Err(err).context(
+                    "refusing to start: state.json is authentic but unreadable by this build \
+                     (state left untouched — check for a version downgrade)",
+                );
             } else {
                 error!(
                     ?err,
