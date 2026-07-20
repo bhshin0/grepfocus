@@ -9,9 +9,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use grepfocus_core::license::{self, LicenseClaims};
 use grepfocus_core::{
-    compute_grant, evaluate_allowance, now_unix, ActiveBlock, AllowanceLedger, AllowanceStatus,
-    AppMatcher, BreakRecord, LockMode, Originator, PomodoroPhase, PomodoroSession, PomodoroStatus,
-    Request, Response, Schedule, State,
+    compute_grant, evaluate_allowance, now_unix, validate_policy, ActiveBlock, AllowanceLedger,
+    AllowanceStatus, AppMatcher, BreakRecord, LockMode, Originator, PomodoroPhase, PomodoroSession,
+    PomodoroStatus, Request, Response, Schedule, State,
 };
 use nix::unistd::Group;
 use tokio::net::{UnixListener, UnixStream};
@@ -205,6 +205,18 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                     return err(msg);
                 }
             }
+            // The allowance axis is deliberately FREE — there is no license
+            // check here and none on the break path. Validation and
+            // normalization only.
+            if let Some(msg) = validate_policy(&block.policy()) {
+                return err(msg);
+            }
+            // Normalize the client-supplied frame: `set_policy` rewrites the
+            // legacy `allowance_secs_per_day` mirror from the policy, so a
+            // client that sends the two disagreeing (or sends a policy and
+            // leaves the mirror at its default) cannot persist a block whose
+            // downgrade mirror lies about its own budget.
+            block.set_policy(block.policy());
             let prev_blocks = st.blocks.clone();
             let prev_next_id = st.next_id;
             block.id = st.next_id;
@@ -219,7 +231,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             Response::Added { id }
         }
 
-        Request::UpdateBlock { block } => {
+        Request::UpdateBlock { mut block } => {
             let mut st = daemon.state.lock().await;
             if let Some(resp) = gate_config(daemon, &st).await {
                 return resp;
@@ -252,6 +264,13 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                     }
                 }
             }
+            // Same free-tier validation and mirror normalization as AddBlock.
+            // No license gate and no grandfathering helper: allowance is free,
+            // so there is nothing to grandfather.
+            if let Some(msg) = validate_policy(&block.policy()) {
+                return err(msg);
+            }
+            block.set_policy(block.policy());
             let prev_blocks = st.blocks.clone();
             match st.blocks.iter_mut().find(|b| b.id == block.id) {
                 Some(slot) => *slot = block,
@@ -1429,6 +1448,95 @@ mod tests {
             }
             other => panic!("expected Status, got {other:?}"),
         }
+    }
+
+    fn blk_with_policy(id: u64, policy: AllowancePolicy) -> Block {
+        let mut b = blk(id, vec![]);
+        b.set_policy(policy);
+        b
+    }
+
+    // A policy `validate_policy` rejects is refused at SAVE time, before any
+    // mutation, with core's message verbatim — on both Add and Update. No
+    // license is cached in either test: the allowance axis is free, so an
+    // unlicensed client must reach the validator rather than a feature gate.
+    #[tokio::test]
+    async fn add_block_refuses_an_invalid_policy() {
+        let daemon = test_daemon();
+        // A budget larger than its own window can never bind.
+        let block = blk_with_policy(
+            0,
+            AllowancePolicy::RollingWindow {
+                secs: 3600,
+                window_secs: 600,
+            },
+        );
+        let resp = dispatch(Request::AddBlock { block }, &daemon).await;
+        assert_eq!(
+            err_msg(resp),
+            "break allowance cannot exceed its own window"
+        );
+        assert!(daemon.state.lock().await.blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_block_refuses_a_zero_budget_policy() {
+        let daemon = test_daemon();
+        let block = blk_with_policy(0, AllowancePolicy::PerBreak { secs: 0 });
+        let resp = dispatch(Request::AddBlock { block }, &daemon).await;
+        assert!(err_msg(resp).contains("choose \"no breaks\""));
+    }
+
+    #[tokio::test]
+    async fn update_block_refuses_an_invalid_policy() {
+        let daemon = test_daemon();
+        daemon.state.lock().await.blocks.push(blk(1, vec![]));
+        let block = blk_with_policy(1, AllowancePolicy::PerDay { secs: 90_000 });
+        let resp = dispatch(Request::UpdateBlock { block }, &daemon).await;
+        assert_eq!(err_msg(resp), "break allowance cannot exceed 24 hours");
+        // Refused before any mutation: the saved block is untouched.
+        let st = daemon.state.lock().await;
+        assert_eq!(st.blocks[0].policy(), AllowancePolicy::Disabled);
+    }
+
+    // The active-block refusal is checked BEFORE policy validation, so it
+    // still wins — editing a running block stays impossible whatever the
+    // policy says.
+    #[tokio::test]
+    async fn update_block_active_refusal_still_precedes_policy_validation() {
+        let daemon = test_daemon();
+        {
+            let mut st = daemon.state.lock().await;
+            st.blocks.push(blk(1, vec![]));
+            st.active
+                .push(active_with_policy(1, AllowancePolicy::Disabled));
+        }
+        let block = blk_with_policy(1, AllowancePolicy::PerDay { secs: 90_000 });
+        let resp = dispatch(Request::UpdateBlock { block }, &daemon).await;
+        assert_eq!(err_msg(resp), "cannot edit a block while it is active");
+    }
+
+    // Normalization contract, exercised on the same expression the two save
+    // arms use. A client frame whose legacy mirror disagrees with its policy
+    // is rewritten so the downgrade mirror can never lie: an older daemon
+    // reading this block gets the policy's own budget, enforced per day.
+    #[test]
+    fn set_policy_of_policy_normalizes_a_disagreeing_mirror() {
+        let mut b = blk(1, vec![]);
+        b.allowance = Some(AllowancePolicy::RollingWindow {
+            secs: 300,
+            window_secs: 3600,
+        });
+        b.allowance_secs_per_day = 99_999; // stale/hostile client value
+        b.set_policy(b.policy());
+        assert_eq!(b.allowance_secs_per_day, 300);
+        assert_eq!(
+            b.policy(),
+            AllowancePolicy::RollingWindow {
+                secs: 300,
+                window_secs: 3600,
+            }
+        );
     }
 
     /// The KAT fixture minted by the real web-side signer (see
