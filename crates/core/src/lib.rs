@@ -236,6 +236,58 @@ pub struct AllowanceLedger {
     pub used_secs: u64,
 }
 
+/// One break that was taken: the unit of break history.
+///
+/// This supersedes [`AllowanceLedger`], which was a per-day counter. Every
+/// allowance policy is a reducer over history, and history is a strict
+/// superset of a counter — a per-day sum is one `filter` away, while a rolling
+/// window cannot be recovered from a counter at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BreakRecord {
+    pub block_id: u64,
+    /// Unix time the break STARTED — the bucketing key for window policies.
+    /// Bucketing by start (not end) keeps usage monotone as `now` advances.
+    pub start_unix: u64,
+    pub secs: u64,
+    /// Local day of `start_unix`, STORED rather than derived: per-day
+    /// bucketing is timezone-dependent and every reducer here must stay
+    /// clock-free (the caller passes `today` in, exactly as `reconcile`
+    /// already does). Deriving it would let a DST change retroactively
+    /// re-bucket an already-charged break.
+    pub day: i64,
+}
+
+/// Longest trailing window any allowance policy may look back over, and
+/// therefore how far break history ever needs to reach. Validated at save
+/// time, so retention can prune anything older with no policy able to notice.
+pub const MAX_ALLOWANCE_WINDOW_SECS: u64 = 24 * 3600;
+
+/// Hard cap on retained [`BreakRecord`]s, mirroring [`UsageStats::SESSIONS_CAP`].
+///
+/// History is one row per break, not one per block per day, so this is only
+/// reachable by a non-GUI client spamming 1-second breaks. Dropping the oldest
+/// rows LOOSENS enforcement (forgotten spend reads as unspent), so this is a
+/// memory backstop, not a policy — the real bound is the window filter.
+pub const BREAKS_CAP: usize = 4000;
+
+/// Drop break records no policy can still see, then enforce [`BREAKS_CAP`].
+///
+/// A record is retained when it is either still relevant to a per-day policy
+/// (`day == today`) or still inside the longest permitted trailing window.
+/// Both conditions are needed: today's rows can be older than the window
+/// (early-morning breaks late in the day), and yesterday's rows can still be
+/// inside it (a break just before local midnight).
+///
+/// Pure — `now` and `today` are supplied by the caller.
+pub fn prune_breaks(breaks: &mut Vec<BreakRecord>, now: u64, today: i64, max_window: u64) {
+    let horizon = now.saturating_sub(max_window);
+    breaks.retain(|r| r.day == today || r.start_unix > horizon);
+    if breaks.len() > BREAKS_CAP {
+        let overflow = breaks.len() - BREAKS_CAP;
+        breaks.drain(0..overflow);
+    }
+}
+
 /// A recurring weekly schedule that automatically activates a block during a
 /// daily time window on selected weekdays.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -556,9 +608,17 @@ pub struct State {
     /// When set, configuration-changing requests require an active unlock.
     #[serde(default)]
     pub password_hash: Option<String>,
-    /// Break-allowance consumption per block per local day.
+    /// LEGACY break-allowance consumption per block per local day. Superseded
+    /// by `breaks`, but RETAINED as a field: an old ledger row cannot
+    /// deserialize into a [`BreakRecord`], and one failing element fails the
+    /// whole `State`. Folded once by [`State::absorb_legacy_allowance`].
     #[serde(default)]
     pub allowance: Vec<AllowanceLedger>,
+    /// Break history — the source every allowance policy reduces over. A NEW
+    /// field rather than a reinterpretation of `allowance`, for the reason
+    /// given there. `serde(default)` so state written before it existed loads.
+    #[serde(default)]
+    pub breaks: Vec<BreakRecord>,
     /// Signed license token exactly as issued by the store, or `None` when
     /// unlicensed. Verified before being stored and again at startup; a token
     /// that no longer verifies (e.g. an expired trial) is kept on disk so
@@ -583,6 +643,28 @@ pub struct State {
     /// restart (resumes on reload, like an in-flight block).
     #[serde(default)]
     pub pomodoro: Option<PomodoroSession>,
+}
+
+impl State {
+    /// Fold the legacy per-day allowance ledger into break history, once.
+    ///
+    /// Each ledger row becomes a single record carrying that day's whole spend.
+    /// `start_unix` is `0` — arbitrarily ancient — so the row can never count
+    /// against a rolling window it has no timing information for, while `day`
+    /// preserves per-day spend exactly. That is the conservative direction on
+    /// the only axis where the data is genuinely missing.
+    ///
+    /// Idempotent: it drains `allowance`, so a second call is a no-op.
+    pub fn absorb_legacy_allowance(&mut self) {
+        for row in self.allowance.drain(..) {
+            self.breaks.push(BreakRecord {
+                block_id: row.block_id,
+                start_unix: 0,
+                secs: row.used_secs,
+                day: row.day,
+            });
+        }
+    }
 }
 
 fn deserialize_active<'de, D>(d: D) -> Result<Vec<ActiveBlock>, D::Error>
@@ -1084,6 +1166,92 @@ mod tests {
         let b: Block = serde_json::from_str(json).unwrap();
         assert_eq!(b.allowance, None);
         assert_eq!(b.policy(), AllowancePolicy::PerDay { secs: 600 });
+    }
+
+    // ── break history ───────────────────────────────────────────────────────
+
+    fn brk(block_id: u64, start_unix: u64, secs: u64, day: i64) -> BreakRecord {
+        BreakRecord {
+            block_id,
+            start_unix,
+            secs,
+            day,
+        }
+    }
+
+    #[test]
+    fn absorb_legacy_allowance_preserves_day_and_drains() {
+        let mut st = State {
+            allowance: vec![
+                AllowanceLedger {
+                    block_id: 1,
+                    day: 42,
+                    used_secs: 300,
+                },
+                AllowanceLedger {
+                    block_id: 2,
+                    day: 41,
+                    used_secs: 60,
+                },
+            ],
+            ..Default::default()
+        };
+        st.absorb_legacy_allowance();
+
+        assert!(st.allowance.is_empty(), "ledger drained");
+        assert_eq!(st.breaks.len(), 2);
+        assert_eq!(st.breaks[0], brk(1, 0, 300, 42));
+        assert_eq!(st.breaks[1], brk(2, 0, 60, 41));
+
+        // Idempotent — a second absorb adds nothing.
+        st.absorb_legacy_allowance();
+        assert_eq!(st.breaks.len(), 2);
+    }
+
+    #[test]
+    fn prune_breaks_keeps_today_and_in_window_rows() {
+        let now = 100_000u64;
+        let window = 3600u64;
+        let mut breaks = vec![
+            // Today, but far older than the window: kept for per-day policies.
+            brk(1, now - 50_000, 60, 42),
+            // Yesterday, but still inside the window: kept for rolling ones.
+            brk(1, now - 60, 60, 41),
+            // Neither: dropped.
+            brk(1, now - 50_000, 60, 41),
+        ];
+        prune_breaks(&mut breaks, now, 42, window);
+        assert_eq!(breaks.len(), 2);
+        assert_eq!(breaks[0].day, 42);
+        assert_eq!(breaks[1].start_unix, now - 60);
+    }
+
+    #[test]
+    fn prune_breaks_drops_oldest_at_the_cap() {
+        let now = 1_000_000u64;
+        let mut breaks: Vec<BreakRecord> = (0..BREAKS_CAP as u64 + 10)
+            .map(|i| brk(1, now - 100 + i, 1, 42))
+            .collect();
+        prune_breaks(&mut breaks, now, 42, MAX_ALLOWANCE_WINDOW_SECS);
+        assert_eq!(breaks.len(), BREAKS_CAP);
+        // The ten oldest went; the front is now the eleventh record.
+        assert_eq!(breaks[0].start_unix, now - 100 + 10);
+    }
+
+    // Old state.json compat: state carrying only legacy allowance rows and no
+    // `breaks` field still loads, with the ledger intact for absorption.
+    #[test]
+    fn state_with_only_legacy_allowance_still_deserializes() {
+        let old = r#"{
+            "next_id": 1,
+            "blocks": [],
+            "allowance": [{"block_id": 1, "day": 42, "used_secs": 300}]
+        }"#;
+        let mut st: State = serde_json::from_str(old).unwrap();
+        assert!(st.breaks.is_empty());
+        assert_eq!(st.allowance.len(), 1);
+        st.absorb_legacy_allowance();
+        assert_eq!(st.breaks, vec![brk(1, 0, 300, 42)]);
     }
 
     // ── usage stats (B2.b) ──────────────────────────────────────────────────
