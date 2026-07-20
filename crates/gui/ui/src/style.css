@@ -246,6 +246,9 @@ dialog .row { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
   color: var(--fg);
 }
 .active-banner .break-left { white-space: pre-line; }
+/* The policy's budget, stated before the controls: what this block grants per
+   its own period, as opposed to .break-left's what-is-left-right-now. */
+.active-banner .break-budget { font-size: 13px; opacity: 0.9; white-space: nowrap; }
 .active-banner .break-btn {
   background: white;
   color: var(--accent);

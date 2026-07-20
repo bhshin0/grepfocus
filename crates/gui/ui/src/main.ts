@@ -567,10 +567,65 @@ function fmtRemaining(secs: number): string {
   return [h, m, r].map((n) => String(n).padStart(2, "0")).join(":");
 }
 
+/// The budget half of a break row: what the policy grants per its own period,
+/// independent of what is left right now.
+function budgetNote(p: AllowancePolicy): string {
+  const min = (secs: number) => Math.max(0, Math.floor(secs / 60));
+  switch (p.kind) {
+    case "per_day":
+      return `up to ${min(p.secs)} min/day`;
+    case "rolling_window":
+      return `up to ${min(p.secs)} min per rolling ${fmtWindow(p.window_secs)}`;
+    case "per_break":
+      return `${min(p.secs)} min per break`;
+    default:
+      return "";
+  }
+}
+
+/// Format an ABSOLUTE unix instant as a local wall-clock time.
+///
+/// Deliberately not adjusted by `activeServerSkew`: that skew exists to tick
+/// countdowns off a client clock that may disagree with the daemon's, whereas
+/// `next_free_unix` is already an absolute instant both machines agree on.
+/// Skewing it would double-count the correction.
+function fmtClock(unix: number): string {
+  return new Date(unix * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/// What is left of an active block's allowance, preferring the daemon's
+/// policy-aware `Status.allowance` and falling back to the deprecated
+/// per-day ledger.
+///
+/// The fallback is for a NEW GUI against an OLD daemon — one that predates
+/// `Status.allowance` and emits only `allowance_used`. It reconstructs exactly
+/// what this UI rendered before policies existed: a per-day budget from the
+/// block's legacy scalar, minus today's usage. A rolling window cannot be
+/// expressed this way, but an old daemon cannot enforce one either.
+function allowanceFor(
+  a: ActiveBlock,
+  fromStatus: Map<number, AllowanceStatus>,
+  usedByBlock: Map<number, number>,
+): AllowanceStatus {
+  const known = fromStatus.get(a.block.id);
+  if (known) return known;
+  const budget = a.block.allowance_secs_per_day;
+  return {
+    block_id: a.block.id,
+    policy: budget > 0 ? { kind: "per_day", secs: budget } : { kind: "none" },
+    budget_secs: budget,
+    remaining_secs: Math.max(0, budget - (usedByBlock.get(a.block.id) ?? 0)),
+    next_free_unix: null,
+    next_free_secs: 0,
+  };
+}
+
 function renderActive(s: Status) {
   statusEl.innerHTML = "";
   const usedByBlock = new Map<number, number>();
   for (const l of s.allowance_used) usedByBlock.set(l.block_id, l.used_secs);
+  const allowanceByBlock = new Map<number, AllowanceStatus>();
+  for (const v of s.allowance ?? []) allowanceByBlock.set(v.block_id, v);
   const nowSec = s.now_unix;
 
   for (const a of s.active) {
@@ -594,8 +649,11 @@ function renderActive(s: Status) {
     `;
     div.querySelector<HTMLSpanElement>(".name")!.textContent = a.block.name;
 
-    const allowance = a.block.allowance_secs_per_day;
-    if (allowance > 0 && !isPomodoro) {
+    // The break row renders only when breaks are possible at all. `"none"`
+    // covers what the legacy scalar encoded as 0, so a block with no allowance
+    // still shows no row rather than a permanently disabled one.
+    const av = allowanceFor(a, allowanceByBlock, usedByBlock);
+    if (av.policy.kind !== "none" && !isPomodoro) {
       const onBreak = a.break_until_unix != null && a.break_until_unix > nowSec;
       if (onBreak) {
         const ob = document.createElement("div");
@@ -604,19 +662,23 @@ function renderActive(s: Status) {
         ob.textContent = "On break — resumes in --:--:--";
         div.appendChild(ob);
       } else {
-        const used = usedByBlock.get(a.block.id) ?? 0;
-        const remainingMin = Math.floor((allowance - used) / 60);
+        const remainingMin = Math.floor(av.remaining_secs / 60);
         const row = document.createElement("div");
         row.className = "break-row";
         const defMin = Math.min(5, Math.max(1, remainingMin));
+        // `max` is clamped to what is actually left, not just the default
+        // value: a spinner that can be dialled up to a request the daemon is
+        // certain to refuse is a worse control than one that cannot.
         row.innerHTML = `
-          <input type="number" class="break-min" min="1" value="${defMin}" /> min
+          <span class="break-budget"></span>
+          <input type="number" class="break-min" min="1" max="${Math.max(1, remainingMin)}" value="${defMin}" /> min
           <button class="break-btn">Take a break</button>
           <span class="break-left"></span>
         `;
         const btn = row.querySelector<HTMLButtonElement>(".break-btn")!;
         const input = row.querySelector<HTMLInputElement>(".break-min")!;
         const left = row.querySelector<HTMLSpanElement>(".break-left")!;
+        row.querySelector<HTMLSpanElement>(".break-budget")!.textContent = budgetNote(av.policy);
 
         // Branch on the ACTIVE record's lock snapshot (`a.lock`), never on
         // `a.block.lock`: the snapshot is what the daemon's lock_gate
@@ -635,10 +697,28 @@ function renderActive(s: Status) {
           }
         }
 
-        if (remainingMin <= 0) {
+        // How much is left, phrased per policy. `per_break` gets no counter at
+        // all: it has no cumulative cap, so there is nothing to count down —
+        // its budget line already said everything there is to say.
+        const nextFreeMin = Math.max(1, Math.round(av.next_free_secs / 60));
+        if (av.policy.kind === "per_break") {
+          left.textContent = "";
+        } else if (remainingMin <= 0) {
+          // Whole minutes, not `remaining_secs > 0`: the input is denominated
+          // in minutes, so a sub-minute remainder cannot be spent through this
+          // control and reads as exhausted. Matches the pre-policy behaviour.
           btn.disabled = true;
           input.disabled = true;
-          left.textContent = "no allowance left today";
+          left.textContent =
+            av.policy.kind === "rolling_window" && av.next_free_unix != null
+              ? `no break time left — ${nextFreeMin} min returns at ${fmtClock(av.next_free_unix)}`
+              : "no allowance left today";
+        } else if (av.policy.kind === "rolling_window") {
+          const more =
+            av.next_free_unix != null
+              ? ` · +${nextFreeMin} min at ${fmtClock(av.next_free_unix)}`
+              : "";
+          left.textContent = `${remainingMin} min available now${more}`;
         } else {
           left.textContent = `${remainingMin} min left today`;
         }
