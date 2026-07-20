@@ -191,6 +191,9 @@ details summary {
 }
 details[open] summary { margin-bottom: 10px; }
 
+/* Per-card edit form: set it off from the card's action row above it. */
+.block-card details.edit { margin-top: 8px; border-top: 1px solid var(--border); }
+
 #schedule-list { list-style: none; padding: 0; display: grid; gap: 10px; margin-bottom: 16px; }
 form label > input[type="checkbox"] { width: auto; margin-right: 6px; }
 

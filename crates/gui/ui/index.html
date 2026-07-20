@@ -36,8 +36,19 @@
           <label>App exe paths or basenames (one per line)
             <textarea name="apps" rows="4" placeholder="/usr/bin/steam&#10;discord"></textarea>
           </label>
-          <label>Daily break allowance (minutes, 0 = none)
-            <input type="number" name="allowance_minutes" min="0" step="1" value="0" />
+          <label>Break allowance
+            <select name="allowance_kind">
+              <option value="none">No breaks</option>
+              <option value="per_day">Minutes per day</option>
+              <option value="rolling_window">Minutes per rolling window</option>
+              <option value="per_break">Minutes per break</option>
+            </select>
+          </label>
+          <label class="allow-secs" hidden>Allowance (minutes)
+            <input type="number" name="allowance_minutes" min="1" step="1" value="15" />
+          </label>
+          <label class="allow-window" hidden>Rolling window (minutes)
+            <input type="number" name="window_minutes" min="1" max="1440" step="1" value="60" />
           </label>
           <label>Break lock
             <select name="lock">
@@ -46,7 +57,7 @@
               <option value="challenge_breaks">Breaks require typing a challenge string</option>
             </select>
           </label>
-          <p class="hint">Lock modes are a premium feature — they add friction to taking a break on this block. The free tier can always set the break allowance to 0, for a block with no breaks at all.</p>
+          <p class="hint">Lock modes are a premium feature — they add friction to taking a break on this block. Break allowance is free — every allowance type above works without a license, including "No breaks", for a block with no breaks at all.</p>
           <p id="lock-warn" class="msg warn" hidden></p>
           <button type="submit">Save block</button>
           <p id="new-block-msg" class="msg"></p>

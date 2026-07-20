@@ -12,12 +12,25 @@ type AppMatcher =
 /// variant was renamed, the wire value deliberately was not.
 type LockMode = "normal" | "password_breaks" | "challenge_breaks";
 
+/// Mirrors core's `AllowancePolicy`, an internally-tagged enum on `kind`: how
+/// much break time a block grants. Either/or by construction — policies never
+/// stack. The whole axis is FREE; friction lives on `LockMode` instead.
+type AllowancePolicy =
+  | { kind: "none" }
+  | { kind: "per_day"; secs: number }
+  | { kind: "rolling_window"; secs: number; window_secs: number }
+  | { kind: "per_break"; secs: number };
+
 interface Block {
   id: number;
   name: string;
   domains: string[];
   apps: AppMatcher[];
+  /// LEGACY downgrade mirror of `allowance`, kept in step by the daemon on
+  /// save. Read `allowance` instead; this only survives so a block written by
+  /// this build still means something to an older daemon.
   allowance_secs_per_day: number;
+  allowance: AllowancePolicy | null;
   lock: LockMode;
 }
 
@@ -25,6 +38,24 @@ interface AllowanceLedger {
   block_id: number;
   day: number;
   used_secs: number;
+}
+
+/// One active block's allowance as reported by `get_status`: the policy plus
+/// the daemon's reduction of break history under it. The view's fields are
+/// `#[serde(flatten)]`ed in core, so they sit flat here rather than nested.
+///
+/// The daemon does this arithmetic precisely so raw break history never
+/// reaches the frontend and window math is never reimplemented in TypeScript.
+interface AllowanceStatus {
+  block_id: number;
+  policy: AllowancePolicy;
+  budget_secs: number;
+  remaining_secs: number;
+  /// Absolute unix seconds, or null for the policies where "when does more
+  /// appear" has no knowable instant (none, per_day, per_break).
+  next_free_unix: number | null;
+  /// How much returns at `next_free_unix`, ties summed. 0 when that is null.
+  next_free_secs: number;
 }
 
 type Originator = { kind: "manual" } | { kind: "schedule"; schedule_id: number };
@@ -35,6 +66,10 @@ interface ActiveBlock {
   ends_at_unix: number;
   originator: Originator;
   break_until_unix: number | null;
+  /// The allowance policy SNAPSHOTTED at activation, for the same reason as
+  /// `lock` below. Null on a record written before snapshotting existed, in
+  /// which case the embedded block's policy is the fallback.
+  allowance: AllowancePolicy | null;
   /// The lock mode SNAPSHOTTED at activation — not `block.lock`, which is the
   /// (editable) saved config. This is the one the daemon enforces, so it is
   /// the one the break UI must branch on.
@@ -61,6 +96,9 @@ interface Status {
   now_unix: number;
   password_set: boolean;
   unlocked: boolean;
+  allowance: AllowanceStatus[];
+  /// DEPRECATED, still emitted: a bare per-day counter. Only read as a
+  /// fallback when `allowance` is absent — see `renderActive`.
   allowance_used: AllowanceLedger[];
   license_present: boolean;
   license_valid: boolean;
@@ -114,6 +152,80 @@ function parseAppLines(raw: string): AppMatcher[] {
     );
 }
 
+/// Show only the inputs the selected allowance kind actually uses: "none"
+/// needs neither, the two flat budgets need the minutes box, and only the
+/// rolling window needs a window length.
+///
+/// Hidden inputs still submit their values, which is fine — `readPolicy`
+/// selects fields by kind and never reads one the kind does not own.
+function syncPolicyFields(form: HTMLFormElement) {
+  const kind = form.querySelector<HTMLSelectElement>('select[name="allowance_kind"]')!.value;
+  const secsLabel = form.querySelector<HTMLElement>(".allow-secs");
+  const windowLabel = form.querySelector<HTMLElement>(".allow-window");
+  if (secsLabel) secsLabel.hidden = kind === "none";
+  if (windowLabel) windowLabel.hidden = kind !== "rolling_window";
+}
+
+/// Read a block form's allowance controls into a wire policy, minutes → secs.
+/// Shared by the New-block tab and every per-card edit form so the two cannot
+/// drift into disagreeing about the encoding.
+function readPolicy(form: HTMLFormElement): AllowancePolicy {
+  const fd = new FormData(form);
+  const mins = (name: string) => Math.max(0, Math.floor(Number(fd.get(name) ?? 0)));
+  const secs = mins("allowance_minutes") * 60;
+  switch (String(fd.get("allowance_kind") ?? "none")) {
+    case "per_day":
+      return { kind: "per_day", secs };
+    case "rolling_window":
+      return { kind: "rolling_window", secs, window_secs: mins("window_minutes") * 60 };
+    case "per_break":
+      return { kind: "per_break", secs };
+    default:
+      return { kind: "none" };
+  }
+}
+
+/// The inverse of `readPolicy`: load a saved policy into a form's controls,
+/// secs → minutes, and sync which of them are visible. Leaves the defaults in
+/// the inputs a policy does not use, so switching kinds finds sane values.
+function writePolicy(form: HTMLFormElement, p: AllowancePolicy) {
+  form.querySelector<HTMLSelectElement>('select[name="allowance_kind"]')!.value = p.kind;
+  if (p.kind !== "none") {
+    const mins = form.querySelector<HTMLInputElement>('input[name="allowance_minutes"]');
+    if (mins) mins.value = String(Math.max(1, Math.round(p.secs / 60)));
+  }
+  if (p.kind === "rolling_window") {
+    const win = form.querySelector<HTMLInputElement>('input[name="window_minutes"]');
+    if (win) win.value = String(Math.max(1, Math.round(p.window_secs / 60)));
+  }
+  syncPolicyFields(form);
+}
+
+/// Read a whole block form into a wire `Block`. `id` is 0 for a new block and
+/// the existing id for an edit — the only difference between the two forms.
+///
+/// Both `allowance` and its legacy `allowance_secs_per_day` mirror go on the
+/// wire. The daemon re-derives the mirror from the policy on save, so this is
+/// not load-bearing, but sending a self-consistent frame beats sending one
+/// whose two halves contradict each other.
+function readBlockForm(form: HTMLFormElement, id: number): Block {
+  const fd = new FormData(form);
+  const allowance = readPolicy(form);
+  return {
+    id,
+    name: String(fd.get("name") ?? "").trim(),
+    domains: String(fd.get("domains") ?? "")
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean),
+    apps: parseAppLines(String(fd.get("apps") ?? "")),
+    allowance_secs_per_day: allowance.kind === "none" ? 0 : allowance.secs,
+    allowance,
+    // `"normal"` is the wire spelling of the unlocked mode (see `LockMode`).
+    lock: String(fd.get("lock") ?? "normal") as LockMode,
+  };
+}
+
 const newForm = document.querySelector<HTMLFormElement>("#new-block-form")!;
 const newMsg = document.querySelector<HTMLParagraphElement>("#new-block-msg")!;
 const lockSelect = newForm.querySelector<HTMLSelectElement>('select[name="lock"]')!;
@@ -143,23 +255,15 @@ async function refreshLockWarning() {
 }
 lockSelect.addEventListener("change", refreshLockWarning);
 
+const newPolicySelect = newForm.querySelector<HTMLSelectElement>('select[name="allowance_kind"]')!;
+newPolicySelect.addEventListener("change", () => syncPolicyFields(newForm));
+syncPolicyFields(newForm);
+
 newForm.addEventListener("submit", async (ev) => {
   ev.preventDefault();
   newMsg.classList.remove("error");
   newMsg.textContent = "";
-  const fd = new FormData(newForm);
-  const block = {
-    id: 0,
-    name: String(fd.get("name") ?? "").trim(),
-    domains: String(fd.get("domains") ?? "")
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean),
-    apps: parseAppLines(String(fd.get("apps") ?? "")),
-    allowance_secs_per_day: Math.max(0, Math.floor(Number(fd.get("allowance_minutes") ?? 0))) * 60,
-    // `"normal"` is the wire spelling of the unlocked mode (see `LockMode`).
-    lock: String(fd.get("lock") ?? "normal") as LockMode,
-  };
+  const block = readBlockForm(newForm, 0);
   if (!block.name) {
     newMsg.classList.add("error");
     newMsg.textContent = "name is required";
@@ -170,6 +274,9 @@ newForm.addEventListener("submit", async (ev) => {
     const id = await invoke<number>("add_block", { block });
     newMsg.textContent = `saved (id ${id})`;
     newForm.reset();
+    // reset() restores the markup defaults but fires no change event, so the
+    // conditional inputs would keep the last kind's visibility.
+    syncPolicyFields(newForm);
     refreshLockWarning();
   } catch (e) {
     newMsg.classList.add("error");
@@ -187,12 +294,22 @@ async function refreshList() {
   listMsg.textContent = "";
   listEl.innerHTML = "";
   try {
-    const blocks = await invoke<Block[]>("list_blocks");
+    // Status comes along for the ride purely to know which blocks are ACTIVE:
+    // the daemon refuses UpdateBlock on a running block, so those cards render
+    // their edit form disabled rather than letting the user fill it in and
+    // then meet a refusal. A failed status read is not fatal here — fall back
+    // to no active blocks and let the daemon have the last word on save.
+    const [blocks, active] = await Promise.all([
+      invoke<Block[]>("list_blocks"),
+      invoke<Status>("get_status")
+        .then((s) => new Set(s.active.map((a) => a.block.id)))
+        .catch(() => new Set<number>()),
+    ]);
     if (blocks.length === 0) {
       listEl.appendChild(emptyLi('No saved blocks yet. Create one in "New block".'));
       return;
     }
-    for (const b of blocks) listEl.appendChild(renderBlockCard(b));
+    for (const b of blocks) listEl.appendChild(renderBlockCard(b, active.has(b.id)));
   } catch (e) {
     listMsg.classList.add("error");
     listMsg.textContent = String(e);
@@ -209,7 +326,43 @@ const LOCK_NOTE: Record<LockMode, string> = {
   challenge_breaks: " · challenge-locked breaks",
 };
 
-function renderBlockCard(b: Block): HTMLLIElement {
+/// A rolling window's length, phrased for prose: "per rolling ${fmtWindow(w)}".
+/// The common hour reads as a word rather than "60 min"; other round hours
+/// follow suit, and anything else falls back to minutes.
+function fmtWindow(windowSecs: number): string {
+  if (windowSecs === 3600) return "hour";
+  if (windowSecs % 3600 === 0) return `${windowSecs / 3600} hours`;
+  return `${Math.max(1, Math.round(windowSecs / 60))} min`;
+}
+
+/// The block-list one-liner for an allowance policy. Empty for "no breaks":
+/// a block without breaks is the plain case and needs no annotation.
+function policyNote(p: AllowancePolicy): string {
+  const min = (secs: number) => Math.max(0, Math.floor(secs / 60));
+  switch (p.kind) {
+    case "per_day":
+      return ` · break allowance ${min(p.secs)} min/day`;
+    case "rolling_window":
+      return ` · break allowance ${min(p.secs)} min per rolling ${fmtWindow(p.window_secs)}`;
+    case "per_break":
+      return ` · breaks of ${min(p.secs)} min, uncapped`;
+    default:
+      return "";
+  }
+}
+
+/// The saved policy for a block, applying the same precedence core's
+/// `Block::policy()` does: an explicit policy wins, otherwise the legacy
+/// per-day scalar folds in (and 0 means no breaks). Keeps a block saved by an
+/// older daemon — which has no `allowance` field at all — rendering correctly.
+function blockPolicy(b: Block): AllowancePolicy {
+  if (b.allowance) return b.allowance;
+  return b.allowance_secs_per_day > 0
+    ? { kind: "per_day", secs: b.allowance_secs_per_day }
+    : { kind: "none" };
+}
+
+function renderBlockCard(b: Block, isActive: boolean): HTMLLIElement {
   const li = document.createElement("li");
   li.className = "block-card";
   li.innerHTML = `
@@ -220,6 +373,42 @@ function renderBlockCard(b: Block): HTMLLIElement {
       <button class="start-btn">Start</button>
       <button class="delete-btn">Delete</button>
     </div>
+    <details class="edit">
+      <summary>Edit</summary>
+      <form class="edit-block-form">
+        <p class="msg warn edit-active-note" hidden>This block is running. Editing is disabled until it ends — the daemon refuses changes to an active block so a running block's allowance and lock cannot be softened mid-flight.</p>
+        <label>Name <input name="name" required /></label>
+        <label>Domains (one per line)
+          <textarea name="domains" rows="4"></textarea>
+        </label>
+        <label>App exe paths or basenames (one per line)
+          <textarea name="apps" rows="4"></textarea>
+        </label>
+        <label>Break allowance
+          <select name="allowance_kind">
+            <option value="none">No breaks</option>
+            <option value="per_day">Minutes per day</option>
+            <option value="rolling_window">Minutes per rolling window</option>
+            <option value="per_break">Minutes per break</option>
+          </select>
+        </label>
+        <label class="allow-secs" hidden>Allowance (minutes)
+          <input type="number" name="allowance_minutes" min="1" step="1" value="15" />
+        </label>
+        <label class="allow-window" hidden>Rolling window (minutes)
+          <input type="number" name="window_minutes" min="1" max="1440" step="1" value="60" />
+        </label>
+        <label>Break lock
+          <select name="lock">
+            <option value="normal">Unlocked — breaks work normally</option>
+            <option value="password_breaks">Breaks require the settings password</option>
+            <option value="challenge_breaks">Breaks require typing a challenge string</option>
+          </select>
+        </label>
+        <button type="submit" class="save-btn">Save changes</button>
+        <p class="msg edit-msg"></p>
+      </form>
+    </details>
   `;
   li.querySelector("h3")!.textContent = b.name;
   const apps = b.apps.map((a) => {
@@ -227,8 +416,7 @@ function renderBlockCard(b: Block): HTMLLIElement {
     if (a.kind === "basename") return a.name;
     return `cmdline:${a.contains}`;
   });
-  const allowanceNote =
-    b.allowance_secs_per_day > 0 ? ` · break allowance ${Math.floor(b.allowance_secs_per_day / 60)} min/day` : "";
+  const allowanceNote = policyNote(blockPolicy(b));
   li.querySelector(".meta")!.textContent =
     `${b.domains.length} domain(s), ${b.apps.length} app(s)${allowanceNote}${LOCK_NOTE[b.lock]} — ${[...b.domains, ...apps].join(", ") || "(empty)"}`;
   const dur = li.querySelector<HTMLInputElement>(".duration")!;
@@ -253,6 +441,49 @@ function renderBlockCard(b: Block): HTMLLIElement {
     } catch (e) {
       listMsg.classList.add("error");
       listMsg.textContent = String(e);
+    }
+  });
+
+  // ── Edit form ──
+  const editForm = li.querySelector<HTMLFormElement>(".edit-block-form")!;
+  const editMsg = li.querySelector<HTMLParagraphElement>(".edit-msg")!;
+  editForm.querySelector<HTMLInputElement>('input[name="name"]')!.value = b.name;
+  editForm.querySelector<HTMLTextAreaElement>('textarea[name="domains"]')!.value =
+    b.domains.join("\n");
+  editForm.querySelector<HTMLTextAreaElement>('textarea[name="apps"]')!.value = apps.join("\n");
+  editForm.querySelector<HTMLSelectElement>('select[name="lock"]')!.value = b.lock;
+  writePolicy(editForm, blockPolicy(b));
+  editForm
+    .querySelector<HTMLSelectElement>('select[name="allowance_kind"]')!
+    .addEventListener("change", () => syncPolicyFields(editForm));
+
+  if (isActive) {
+    // The daemon answers "cannot edit a block while it is active". Say so up
+    // front instead of letting the form be filled in and then refused.
+    li.querySelector<HTMLElement>(".edit-active-note")!.hidden = false;
+    editForm
+      .querySelectorAll<HTMLInputElement>("input, textarea, select, button")
+      .forEach((el) => (el.disabled = true));
+  }
+
+  editForm.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    editMsg.classList.remove("error");
+    editMsg.textContent = "";
+    const block = readBlockForm(editForm, b.id);
+    if (!block.name) {
+      editMsg.classList.add("error");
+      editMsg.textContent = "name is required";
+      return;
+    }
+    if (!(await ensureUnlocked())) return;
+    try {
+      await invoke("update_block", { block });
+      editMsg.textContent = "saved";
+      refreshList();
+    } catch (e) {
+      editMsg.classList.add("error");
+      editMsg.textContent = String(e);
     }
   });
   return li;
