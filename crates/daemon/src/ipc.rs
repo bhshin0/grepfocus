@@ -137,6 +137,11 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             // appended and what `absorb_legacy_allowance` folded in.
             let mut allowance_used: Vec<AllowanceLedger> = Vec::new();
             let mut allowance: Vec<AllowanceStatus> = Vec::new();
+            // ACTIVE blocks first, and they win: a running block must be
+            // reported under its ACTIVATION SNAPSHOT (`ActiveBlock::policy()`),
+            // never the saved block's current policy. That is the doctrine
+            // `TakeBreak` enforces, and reporting the saved policy would
+            // describe a budget the daemon will not actually grant.
             for a in st.active.iter() {
                 let block_id = a.block.id;
                 let policy = a.policy();
@@ -154,6 +159,42 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                         .filter(|r| r.block_id == block_id && r.day == today)
                         .map(|r| r.secs)
                         .sum(),
+                });
+            }
+            // Then every SAVED block that did not already get an entry above.
+            //
+            // A rolling window's consumption OUTLIVES the run that spent it:
+            // take your minute, let the block expire, restart two minutes
+            // later, and the BreakRecord is still inside the trailing window —
+            // you genuinely have nothing left. Reporting only active blocks
+            // left a client with no way to know that, so an idle card could
+            // only show the configured budget, which reads as "your full
+            // minute is available" at the exact moment it is not.
+            //
+            // Every saved block gets an entry, not just the window ones. It is
+            // the predictable rule — the block list renders a card per saved
+            // block and wants a view for each — and it keeps the emptiness of
+            // `allowance` meaning "this daemon predates the field" rather than
+            // "this block happens not to qualify", which is what the client's
+            // fallback path keys off. The cost is bounded: an AllowanceStatus
+            // is a handful of integers against a `Status` that already clones
+            // every ActiveBlock whole, domains and app matchers included.
+            //
+            // There is EXACTLY ONE entry per block id. Saved block ids are
+            // unique, so skipping the ids the active loop already emitted is
+            // sufficient, and it is the active snapshot that survives.
+            for b in st.blocks.iter() {
+                if allowance.iter().any(|a| a.block_id == b.id) {
+                    continue;
+                }
+                // No snapshot exists for a block that is not running, so the
+                // saved policy is the only answer — and the right one: it is
+                // what the block WOULD activate under.
+                let policy = b.policy();
+                allowance.push(AllowanceStatus {
+                    block_id: b.id,
+                    view: evaluate_allowance(&policy, &st.breaks, b.id, now, today),
+                    policy,
                 });
             }
             let cached = daemon.license.lock().await;
@@ -1343,7 +1384,7 @@ mod tests {
             other => panic!("expected Status, got {other:?}"),
         };
 
-        // One entry per ACTIVE block in both shapes.
+        // Two active blocks and no saved ones, so both shapes hold two rows.
         assert_eq!(allowance.len(), 2);
         assert_eq!(allowance_used.len(), 2);
 
@@ -1369,10 +1410,10 @@ mod tests {
         assert_eq!(u2.used_secs, 105);
     }
 
-    // Records belonging to blocks that are NOT active are excluded from both
-    // shapes, as the pre-policy `active_ids` filter did.
+    // Records belonging to a block that is neither active NOR saved — a
+    // deleted block's leftover history — produce no entry in either shape.
     #[tokio::test]
-    async fn status_ignores_history_for_inactive_blocks() {
+    async fn status_ignores_history_for_unknown_blocks() {
         let daemon = test_daemon();
         let today = scheduler::local_day();
         {
@@ -1402,6 +1443,123 @@ mod tests {
             }
             other => panic!("expected Status, got {other:?}"),
         }
+    }
+
+    // THE DEFECT THIS EXISTS TO PREVENT: a rolling window spent during an
+    // earlier run is still spent after that run ends, because the record is
+    // still inside the trailing window. Reporting only active blocks left a
+    // client able to show nothing but the configured budget for an idle card —
+    // "your full minute is available" at the moment it is not. A saved,
+    // INACTIVE block therefore gets an entry, and it reports the depletion.
+    #[tokio::test]
+    async fn status_reports_a_saved_inactive_block_with_a_spent_window() {
+        let daemon = test_daemon();
+        let now = now_unix();
+        let today = scheduler::local_day();
+        let policy = AllowancePolicy::RollingWindow {
+            secs: 60,
+            window_secs: 600,
+        };
+        {
+            let mut st = daemon.state.lock().await;
+            st.blocks.push(blk_with_policy(11, policy.clone()));
+            // The whole minute, taken 120s ago: the block has since expired,
+            // but the record has not left the 600s window.
+            st.breaks.push(BreakRecord {
+                block_id: 11,
+                start_unix: now - 120,
+                secs: 60,
+                day: today,
+            });
+        }
+        let (allowance, allowance_used) = match dispatch(Request::GetStatus {}, &daemon).await {
+            Response::Status {
+                allowance,
+                allowance_used,
+                ..
+            } => (allowance, allowance_used),
+            other => panic!("expected Status, got {other:?}"),
+        };
+        assert_eq!(allowance.len(), 1);
+        let a = &allowance[0];
+        assert_eq!(a.block_id, 11);
+        assert_eq!(a.policy, policy);
+        assert_eq!(a.view.budget_secs, 60);
+        // The point: remaining is BELOW the budget for a block that is not
+        // running at all.
+        assert!(a.view.remaining_secs < a.view.budget_secs);
+        assert_eq!(a.view.remaining_secs, 0);
+        assert_eq!(a.view.next_free_unix, Some(now - 120 + 600));
+        assert_eq!(a.view.next_free_secs, 60);
+        // The deprecated shape is untouched: still one row per ACTIVE block,
+        // and there are none.
+        assert!(allowance_used.is_empty());
+    }
+
+    // Every saved block gets an entry, whatever its policy — the predictable
+    // rule, so a client can render a view for each card it draws instead of
+    // guessing why one is missing.
+    #[tokio::test]
+    async fn status_reports_every_saved_block_including_unspent_ones() {
+        let daemon = test_daemon();
+        {
+            let mut st = daemon.state.lock().await;
+            st.blocks
+                .push(blk_with_policy(1, AllowancePolicy::PerDay { secs: 600 }));
+            st.blocks
+                .push(blk_with_policy(2, AllowancePolicy::Disabled));
+            st.blocks
+                .push(blk_with_policy(3, AllowancePolicy::PerBreak { secs: 300 }));
+        }
+        let allowance = match dispatch(Request::GetStatus {}, &daemon).await {
+            Response::Status { allowance, .. } => allowance,
+            other => panic!("expected Status, got {other:?}"),
+        };
+        assert_eq!(allowance.len(), 3);
+        let mut ids: Vec<u64> = allowance.iter().map(|a| a.block_id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    // EXACTLY ONE entry per block id, and for an active block it is the
+    // ACTIVATION SNAPSHOT that survives — never the saved block's current
+    // policy, which is the doctrine `TakeBreak` enforces. Block 5 is saved with
+    // a generous per-day budget but was activated under a snapshot that
+    // disables breaks entirely; the saved-block pass must not overwrite it.
+    #[tokio::test]
+    async fn status_reports_one_entry_per_block_with_the_snapshot_winning() {
+        let daemon = test_daemon();
+        {
+            let mut st = daemon.state.lock().await;
+            st.blocks
+                .push(blk_with_policy(5, AllowancePolicy::PerDay { secs: 900 }));
+            st.blocks
+                .push(blk_with_policy(6, AllowancePolicy::PerDay { secs: 600 }));
+            let mut a = active_with_policy(5, AllowancePolicy::PerDay { secs: 900 });
+            a.allowance = Some(AllowancePolicy::Disabled);
+            st.active.push(a);
+        }
+        let (allowance, allowance_used) = match dispatch(Request::GetStatus {}, &daemon).await {
+            Response::Status {
+                allowance,
+                allowance_used,
+                ..
+            } => (allowance, allowance_used),
+            other => panic!("expected Status, got {other:?}"),
+        };
+        // Two blocks, two entries — the active one is not emitted twice.
+        assert_eq!(allowance.len(), 2);
+        assert_eq!(allowance.iter().filter(|a| a.block_id == 5).count(), 1);
+
+        let a5 = allowance.iter().find(|a| a.block_id == 5).unwrap();
+        assert_eq!(a5.policy, AllowancePolicy::Disabled);
+        assert_eq!(a5.view.budget_secs, 0);
+        let a6 = allowance.iter().find(|a| a.block_id == 6).unwrap();
+        assert_eq!(a6.policy, AllowancePolicy::PerDay { secs: 600 });
+
+        // The legacy shape still names only the active block.
+        assert_eq!(allowance_used.len(), 1);
+        assert_eq!(allowance_used[0].block_id, 5);
     }
 
     // TakeBreak reads the ACTIVATION SNAPSHOT, never the embedded block. Here

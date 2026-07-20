@@ -421,17 +421,26 @@ pub struct AllowanceView {
     pub next_free_secs: u64,
 }
 
-/// One active block's allowance, as reported by `GetStatus`.
+/// One block's allowance, as reported by `GetStatus` — one entry per block id,
+/// active or not.
+///
+/// Inactive blocks are included because a rolling window's consumption outlives
+/// the run that spent it: a block can be stopped and restarted and still have
+/// nothing available, which a client cannot infer from the configured budget
+/// alone.
 ///
 /// The daemon computes this so raw break history never reaches a client and
 /// window arithmetic is never reimplemented outside core. It supersedes the
 /// deprecated `Response::Status::allowance_used`, which is a bare per-day
-/// counter and cannot express a rolling window at all.
+/// counter, is emitted only for active blocks, and cannot express a rolling
+/// window at all.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllowanceStatus {
     pub block_id: u64,
-    /// The ACTIVATION SNAPSHOT's policy, not the saved block's — what the
-    /// running block will actually be granted under.
+    /// For an ACTIVE block, the activation snapshot's policy — what the running
+    /// block will actually be granted under, not the (editable) saved config.
+    /// For an inactive block there is no snapshot, so this is the saved
+    /// block's policy: what it would activate under.
     pub policy: AllowancePolicy,
     /// Flattened, so the view's fields sit directly alongside `block_id` and
     /// `policy` on the wire rather than nested under a `view` key.
@@ -1126,10 +1135,13 @@ pub enum Response {
         /// clients must read `allowance`. Do not remove.
         #[serde(default)]
         allowance_used: Vec<AllowanceLedger>,
-        /// Per-active-block allowance under the block's activation-snapshot
-        /// policy. `#[serde(default)]` matters in the other direction too: a
-        /// NEW client talking to an OLD daemon must get an empty vec and fall
-        /// back to `allowance_used`, not a parse error.
+        /// One entry per SAVED block, plus any active block (there is exactly
+        /// one entry per block id). An active block reports its
+        /// activation-snapshot policy; an inactive one reports its saved
+        /// policy, so a client can see that a rolling window spent during an
+        /// earlier run is still depleted. `#[serde(default)]` matters in the
+        /// other direction too: a NEW client talking to an OLD daemon must get
+        /// an empty vec and fall back to `allowance_used`, not a parse error.
         #[serde(default)]
         allowance: Vec<AllowanceStatus>,
         /// Whether a license token is stored — even one that is currently
