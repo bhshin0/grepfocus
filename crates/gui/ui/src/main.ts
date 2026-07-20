@@ -293,22 +293,34 @@ async function refreshList() {
   listMsg.textContent = "";
   listEl.innerHTML = "";
   try {
-    // Status comes along for the ride purely to know which blocks are ACTIVE:
-    // the daemon refuses UpdateBlock on a running block, so those cards render
-    // their edit form disabled rather than letting the user fill it in and
-    // then meet a refusal. A failed status read is not fatal here — fall back
-    // to no active blocks and let the daemon have the last word on save.
+    // Status carries two things the cards need, off ONE round trip.
+    //
+    // Which blocks are ACTIVE: the daemon refuses UpdateBlock on a running
+    // block, so those cards render their edit form disabled rather than
+    // letting the user fill it in and then meet a refusal.
+    //
+    // And the live allowance per block: a rolling window spent during an
+    // earlier run is still spent, so the configured budget alone would tell
+    // an idle card's reader they have their full minute when they have none.
+    // The daemon emits one entry per saved block for exactly this.
+    //
+    // A failed status read is not fatal here — fall back to no active blocks
+    // and no allowance views (each card then renders its static policy
+    // summary) and let the daemon have the last word on save.
     //
     // Schedules ride along for the same reason they now live inside the cards:
     // a schedule has no meaning apart from the block it drives. Storage is
     // still one flat list keyed by `block_id`, so grouping happens here.
-    const [blocks, active, schedules] = await Promise.all([
+    const [blocks, status, schedules] = await Promise.all([
       invoke<Block[]>("list_blocks"),
-      invoke<Status>("get_status")
-        .then((s) => new Set(s.active.map((a) => a.block.id)))
-        .catch(() => new Set<number>()),
+      invoke<Status>("get_status").catch(() => null),
       invoke<Schedule[]>("list_schedules"),
     ]);
+    const active = new Set((status?.active ?? []).map((a) => a.block.id));
+    // Absent on an OLD daemon that predates the field, in which case this map
+    // stays empty and every card falls back to its static summary.
+    const allowanceByBlock = new Map<number, AllowanceStatus>();
+    for (const v of status?.allowance ?? []) allowanceByBlock.set(v.block_id, v);
     if (blocks.length === 0) {
       listEl.appendChild(emptyLi('No saved blocks yet. Create one in "New block".'));
       return;
@@ -320,7 +332,9 @@ async function refreshList() {
       else byBlock.set(s.block_id, [s]);
     }
     for (const b of blocks) {
-      listEl.appendChild(renderBlockCard(b, active.has(b.id), byBlock.get(b.id) ?? []));
+      listEl.appendChild(
+        renderBlockCard(b, active.has(b.id), byBlock.get(b.id) ?? [], allowanceByBlock.get(b.id)),
+      );
     }
   } catch (e) {
     listMsg.classList.add("error");
@@ -374,7 +388,44 @@ function blockPolicy(b: Block): AllowancePolicy {
     : { kind: "none" };
 }
 
-function renderBlockCard(b: Block, isActive: boolean, schedules: Schedule[]): HTMLLIElement {
+/// The live half of a card's allowance line: what is ACTUALLY available right
+/// now, appended after `policyNote`'s budget summary.
+///
+/// Only `rolling_window` gets one. A window's consumption outlives the run
+/// that spent it — stop the block, restart it, and the record is still inside
+/// the trailing window — so the budget alone misdescribes the block whenever
+/// anything has been spent. The other kinds need nothing: `per_day` is a
+/// day-scoped counter the reader already understands, `per_break` never
+/// depletes, and `none` has no allowance to report.
+///
+/// Empty when the window is untouched: the budget summary is already the whole
+/// truth, and repeating it as "1 min available now" is noise on every card.
+function liveAllowanceNote(av: AllowanceStatus | undefined): string {
+  if (!av || av.policy.kind !== "rolling_window") return "";
+  if (av.remaining_secs >= av.budget_secs) return "";
+  // Whole minutes, matching the break control's denomination: a sub-minute
+  // remainder cannot be spent and so reads as exhausted, exactly as the active
+  // banner's counter does.
+  const remainingMin = Math.floor(av.remaining_secs / 60);
+  const nextFreeMin = Math.max(1, Math.round(av.next_free_secs / 60));
+  // `next_free_unix` is ABSOLUTE, so it is rendered straight through
+  // `fmtClock` with no `activeServerSkew` correction — see that function.
+  const at = av.next_free_unix != null ? ` at ${fmtClock(av.next_free_unix)}` : "";
+  if (remainingMin <= 0) {
+    return av.next_free_unix != null
+      ? ` · none available — ${nextFreeMin} min returns${at}`
+      : " · none available right now";
+  }
+  const more = av.next_free_unix != null ? ` · +${nextFreeMin} min${at}` : "";
+  return ` · ${remainingMin} min available now${more}`;
+}
+
+function renderBlockCard(
+  b: Block,
+  isActive: boolean,
+  schedules: Schedule[],
+  allowance?: AllowanceStatus,
+): HTMLLIElement {
   const li = document.createElement("li");
   li.className = "block-card";
   li.innerHTML = `
@@ -434,7 +485,7 @@ function renderBlockCard(b: Block, isActive: boolean, schedules: Schedule[]): HT
     if (a.kind === "basename") return a.name;
     return `cmdline:${a.contains}`;
   });
-  const allowanceNote = policyNote(blockPolicy(b));
+  const allowanceNote = policyNote(blockPolicy(b)) + liveAllowanceNote(allowance);
   li.querySelector(".meta")!.textContent =
     `${b.domains.length} domain(s), ${b.apps.length} app(s)${allowanceNote}${LOCK_NOTE[b.lock]} — ${[...b.domains, ...apps].join(", ") || "(empty)"}`;
   const dur = li.querySelector<HTMLInputElement>(".duration")!;
