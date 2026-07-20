@@ -36,7 +36,7 @@ const MSG_USAGE_STATS: &str = "Usage stats are a premium feature. \
 const MSG_POMODORO: &str = "Pomodoro sessions are a premium feature. \
      Enter a license key in Settings, or get one from the GrepFocus store.";
 
-/// The settings-lock refusal, shared by `gate_config` and `break_gate`:
+/// The settings-lock refusal, shared by `gate_config` and `lock_gate`:
 /// password-locked breaks deliberately reuse the settings-unlock discipline
 /// (same window, same copy), so the GUI's existing unlock dialog flow just
 /// works for them.
@@ -369,13 +369,13 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                     let password_set = st.password_hash.is_some();
                     let unlocked = *daemon.unlocked_until.lock().await >= now;
                     let mut pending = daemon.break_challenges.lock().await;
-                    if let Some(msg) = break_gate(
+                    if let Some(msg) = lock_gate(LockContext {
                         lock,
                         password_set,
                         unlocked,
-                        challenge.as_deref(),
-                        pending.get(&block_id).map(String::as_str),
-                    ) {
+                        challenge: challenge.as_deref(),
+                        pending: pending.get(&block_id).map(String::as_str),
+                    }) {
                         // A refused break is a temptation the tool caught — a
                         // strong akrasia signal worth recording. `msg` is a
                         // 'static gate string (no borrow of `pending`), so we
@@ -901,7 +901,7 @@ fn license_status_fields(
 /// The 1-block cap counts SAVED blocks and gates only NEW adds — a downgrade
 /// deletes nothing and existing blocks stay startable, there is just no room
 /// for more. Saving app matchers additionally needs `app_blocking`, and a
-/// non-`Normal` lock mode additionally needs `lock_modes`. The cap error
+/// non-`Unlocked` lock mode additionally needs `lock_modes`. The cap error
 /// wins when several apply: it is the one the user must resolve first.
 fn gate_add_block(
     unlimited: bool,
@@ -917,7 +917,7 @@ fn gate_add_block(
     if !app_blocking && !new_apps.is_empty() {
         return Some(MSG_APP_BLOCKING);
     }
-    if !lock_modes && lock != LockMode::Normal {
+    if !lock_modes && lock != LockMode::Unlocked {
         return Some(MSG_LOCK_MODES);
     }
     None
@@ -941,37 +941,52 @@ fn update_needs_app_license(saved: &[AppMatcher], updated: &[AppMatcher]) -> boo
 ///
 /// Mirrors `update_needs_app_license`'s grandfathering rule: keeping the
 /// SAVED premium lock is allowed (editing a grandfathered block's domains
-/// must not brick it), and clearing back to `Normal` is always allowed
+/// must not brick it), and clearing back to `Unlocked` is always allowed
 /// (removing configuration is free). Only INTRODUCING a premium lock, or
 /// switching between premium locks, is a premium action.
 fn update_needs_lock_license(saved: LockMode, updated: LockMode) -> bool {
-    updated != LockMode::Normal && updated != saved
+    updated != LockMode::Unlocked && updated != saved
+}
+
+/// Everything `lock_gate` needs to decide a TakeBreak, in one struct rather
+/// than a positional argument list.
+///
+/// The shape is deliberate: a planned `TimeLock { secs }` variant will need
+/// `now` and the activation's `started_at_unix` to answer "has the lock
+/// expired yet?", and a struct makes that a field addition instead of a
+/// second churn across every call site and every gate test.
+struct LockContext<'a> {
+    /// The ACTIVE record's activation snapshot — never `st.blocks`.
+    lock: LockMode,
+    /// Whether a settings password is configured at all.
+    password_set: bool,
+    /// Whether the settings unlock window is currently open (mirrors
+    /// `gate_config`'s check).
+    unlocked: bool,
+    /// The user's typed challenge response, if any.
+    challenge: Option<&'a str>,
+    /// The challenge the daemon issued and is waiting on, if any.
+    pending: Option<&'a str>,
 }
 
 /// The whole TakeBreak lock-mode decision, pure so the full safety-critical
 /// matrix — accept cases included — is unit-testable (the dispatch accept
 /// path runs into `state::save`, which needs the real state dir).
 ///
-/// `active_lock` MUST be the ACTIVE record's activation snapshot, never the
+/// `ctx.lock` MUST be the ACTIVE record's activation snapshot, never the
 /// saved block's current mode. Returns `Some(user-facing error)` to refuse
 /// the break, `None` to let it proceed. Deliberately license-free: the mode
 /// was licensed when the block was saved — a downgrade must not block
 /// breaks.
-fn break_gate(
-    active_lock: LockMode,
-    password_set: bool,
-    unlocked: bool,
-    challenge: Option<&str>,
-    pending: Option<&str>,
-) -> Option<&'static str> {
-    match active_lock {
-        LockMode::Normal => None,
+fn lock_gate(ctx: LockContext<'_>) -> Option<&'static str> {
+    match ctx.lock {
+        LockMode::Unlocked => None,
         LockMode::PasswordBreaks => {
-            if !password_set {
+            if !ctx.password_set {
                 // A lock with no key is a lie: refusing is the honest
                 // failure, and the block keeps enforcing.
                 Some(MSG_BREAK_NEEDS_PASSWORD)
-            } else if !unlocked {
+            } else if !ctx.unlocked {
                 // The settings-lock error, verbatim (see MSG_SETTINGS_LOCKED):
                 // password-locked breaks reuse the existing unlock
                 // discipline, so the GUI's unlock dialog flow just works.
@@ -985,7 +1000,7 @@ fn break_gate(
             // a paste or the terminal must not fail the user — but
             // case-SENSITIVE: retyping the exact case is part of the
             // friction the mode exists to provide.
-            match (challenge, pending) {
+            match (ctx.challenge, ctx.pending) {
                 (Some(c), Some(p)) if c.trim() == p => None,
                 _ => Some(MSG_BREAK_CHALLENGE_MISMATCH),
             }
@@ -1378,12 +1393,12 @@ mod tests {
             domains: vec!["example.com".into()],
             apps,
             allowance_secs_per_day: 0,
-            lock: LockMode::Normal,
+            lock: LockMode::Unlocked,
         }
     }
 
     /// An active record for lock-mode tests: `lock` is the activation
-    /// snapshot (what `break_gate` must consult), mirrored onto the embedded
+    /// snapshot (what `lock_gate` must consult), mirrored onto the embedded
     /// block for realism.
     fn active_with_lock(block_id: u64, lock: LockMode, allowance: u64) -> ActiveBlock {
         let mut b = blk(block_id, vec![]);
@@ -1442,50 +1457,50 @@ mod tests {
         }
     }
 
-    use LockMode::{ChallengeBreaks, Normal, PasswordBreaks};
+    use LockMode::{ChallengeBreaks, PasswordBreaks, Unlocked};
 
     #[test]
     fn gate_add_block_matrix() {
         let apps = vec![steam()];
         // Free tier: the FIRST block is fine…
-        assert_eq!(gate_add_block(false, false, false, 0, &[], Normal), None);
+        assert_eq!(gate_add_block(false, false, false, 0, &[], Unlocked), None);
         // …the second (and any later) add hits the cap, with the exact copy.
         assert_eq!(
-            gate_add_block(false, false, false, 1, &[], Normal),
+            gate_add_block(false, false, false, 1, &[], Unlocked),
             Some(MSG_BLOCK_CAP)
         );
         assert_eq!(
-            gate_add_block(false, false, false, 7, &[], Normal),
+            gate_add_block(false, false, false, 7, &[], Unlocked),
             Some(MSG_BLOCK_CAP)
         );
         // Licensed: many adds fine, apps fine.
-        assert_eq!(gate_add_block(true, true, true, 100, &apps, Normal), None);
+        assert_eq!(gate_add_block(true, true, true, 100, &apps, Unlocked), None);
         // Free tier: apps rejected even on the very first block.
         assert_eq!(
-            gate_add_block(false, false, false, 0, &apps, Normal),
+            gate_add_block(false, false, false, 0, &apps, Unlocked),
             Some(MSG_APP_BLOCKING)
         );
         // Both violations at once: the cap error wins.
         assert_eq!(
-            gate_add_block(false, false, false, 1, &apps, Normal),
+            gate_add_block(false, false, false, 1, &apps, Unlocked),
             Some(MSG_BLOCK_CAP)
         );
         // The features gate independently.
         assert_eq!(
-            gate_add_block(false, true, false, 1, &apps, Normal),
+            gate_add_block(false, true, false, 1, &apps, Unlocked),
             Some(MSG_BLOCK_CAP)
         );
         assert_eq!(
-            gate_add_block(true, false, false, 1, &apps, Normal),
+            gate_add_block(true, false, false, 1, &apps, Unlocked),
             Some(MSG_APP_BLOCKING)
         );
-        assert_eq!(gate_add_block(true, false, false, 1, &[], Normal), None);
+        assert_eq!(gate_add_block(true, false, false, 1, &[], Unlocked), None);
     }
 
     #[test]
     fn gate_add_block_lock_modes() {
         let apps = vec![steam()];
-        // Free tier: any non-Normal lock is rejected with the exact copy,
+        // Free tier: any non-Unlocked lock is rejected with the exact copy,
         // even on the very first block.
         assert_eq!(
             gate_add_block(false, false, false, 0, &[], PasswordBreaks),
@@ -1528,16 +1543,16 @@ mod tests {
     fn update_needs_lock_license_matrix() {
         // Keeping what is saved never needs the license — the grandfathering
         // rule: editing a downgraded block's domains must not brick it…
-        assert!(!update_needs_lock_license(Normal, Normal));
+        assert!(!update_needs_lock_license(Unlocked, Unlocked));
         assert!(!update_needs_lock_license(PasswordBreaks, PasswordBreaks));
         assert!(!update_needs_lock_license(ChallengeBreaks, ChallengeBreaks));
-        // …and clearing back to Normal is always allowed (removing
+        // …and clearing back to Unlocked is always allowed (removing
         // configuration is free).
-        assert!(!update_needs_lock_license(PasswordBreaks, Normal));
-        assert!(!update_needs_lock_license(ChallengeBreaks, Normal));
+        assert!(!update_needs_lock_license(PasswordBreaks, Unlocked));
+        assert!(!update_needs_lock_license(ChallengeBreaks, Unlocked));
         // Introducing a premium lock needs the license…
-        assert!(update_needs_lock_license(Normal, PasswordBreaks));
-        assert!(update_needs_lock_license(Normal, ChallengeBreaks));
+        assert!(update_needs_lock_license(Unlocked, PasswordBreaks));
+        assert!(update_needs_lock_license(Unlocked, ChallengeBreaks));
         // …as does switching between premium locks.
         assert!(update_needs_lock_license(PasswordBreaks, ChallengeBreaks));
         assert!(update_needs_lock_license(ChallengeBreaks, PasswordBreaks));
@@ -1702,104 +1717,120 @@ mod tests {
         assert!(!ledger.iter().any(|l| l.day == 41));
     }
 
-    // ── break_gate(): the full lock-mode decision table ─────────────────────
+    // ── lock_gate(): the full lock-mode decision table ─────────────────────
 
-    #[test]
-    fn break_gate_normal_always_allows() {
-        for password_set in [false, true] {
-            for unlocked in [false, true] {
-                assert_eq!(break_gate(Normal, password_set, unlocked, None, None), None);
-            }
-        }
-        // Even a stray challenge on a Normal block is ignored.
-        assert_eq!(break_gate(Normal, false, false, Some("x"), None), None);
+    /// Positional shorthand for `lock_gate`, so the decision table below reads
+    /// as a table. New `LockContext` fields get a default here, not a rewrite
+    /// of every row.
+    fn gate(
+        lock: LockMode,
+        password_set: bool,
+        unlocked: bool,
+        challenge: Option<&str>,
+        pending: Option<&str>,
+    ) -> Option<&'static str> {
+        lock_gate(LockContext {
+            lock,
+            password_set,
+            unlocked,
+            challenge,
+            pending,
+        })
     }
 
     #[test]
-    fn break_gate_password_mode_matrix() {
+    fn lock_gate_unlocked_always_allows() {
+        for password_set in [false, true] {
+            for unlocked in [false, true] {
+                assert_eq!(gate(Unlocked, password_set, unlocked, None, None), None);
+            }
+        }
+        // Even a stray challenge on an Unlocked block is ignored.
+        assert_eq!(gate(Unlocked, false, false, Some("x"), None), None);
+    }
+
+    #[test]
+    fn lock_gate_password_mode_matrix() {
         // No password set: the lock has no key — the honest failure is to
         // refuse, and the block keeps enforcing. This wins over `unlocked`.
         assert_eq!(
-            break_gate(PasswordBreaks, false, false, None, None),
+            gate(PasswordBreaks, false, false, None, None),
             Some(MSG_BREAK_NEEDS_PASSWORD)
         );
         assert_eq!(
-            break_gate(PasswordBreaks, false, true, None, None),
+            gate(PasswordBreaks, false, true, None, None),
             Some(MSG_BREAK_NEEDS_PASSWORD)
         );
         // Password set, no unlock window: the settings-lock error, verbatim,
         // so the GUI's existing unlock dialog flow handles it.
         assert_eq!(
-            break_gate(PasswordBreaks, true, false, None, None),
+            gate(PasswordBreaks, true, false, None, None),
             Some(MSG_SETTINGS_LOCKED)
         );
         // Password set + active unlock window: the break proceeds.
-        assert_eq!(break_gate(PasswordBreaks, true, true, None, None), None);
+        assert_eq!(gate(PasswordBreaks, true, true, None, None), None);
         // Challenge strings are irrelevant to this mode.
+        assert_eq!(gate(PasswordBreaks, true, true, Some("x"), Some("y")), None);
         assert_eq!(
-            break_gate(PasswordBreaks, true, true, Some("x"), Some("y")),
-            None
-        );
-        assert_eq!(
-            break_gate(PasswordBreaks, true, false, Some("y"), Some("y")),
+            gate(PasswordBreaks, true, false, Some("y"), Some("y")),
             Some(MSG_SETTINGS_LOCKED)
         );
     }
 
     #[test]
-    fn break_gate_challenge_mode_matrix() {
+    fn lock_gate_challenge_mode_matrix() {
         let pend = Some("Abc23");
         // Missing response.
         assert_eq!(
-            break_gate(ChallengeBreaks, false, false, None, pend),
+            gate(ChallengeBreaks, false, false, None, pend),
             Some(MSG_BREAK_CHALLENGE_MISMATCH)
         );
         // No pending challenge issued (never requested, or a daemon restart
         // dropped it — fails safe either way).
         assert_eq!(
-            break_gate(ChallengeBreaks, false, false, Some("Abc23"), None),
+            gate(ChallengeBreaks, false, false, Some("Abc23"), None),
             Some(MSG_BREAK_CHALLENGE_MISMATCH)
         );
         assert_eq!(
-            break_gate(ChallengeBreaks, false, false, None, None),
+            gate(ChallengeBreaks, false, false, None, None),
             Some(MSG_BREAK_CHALLENGE_MISMATCH)
         );
         // Wrong response; comparison is case-SENSITIVE (the friction is the
         // point) and never prefix-lenient.
         assert_eq!(
-            break_gate(ChallengeBreaks, false, false, Some("abc23"), pend),
+            gate(ChallengeBreaks, false, false, Some("abc23"), pend),
             Some(MSG_BREAK_CHALLENGE_MISMATCH)
         );
         assert_eq!(
-            break_gate(ChallengeBreaks, false, false, Some("Abc2"), pend),
+            gate(ChallengeBreaks, false, false, Some("Abc2"), pend),
             Some(MSG_BREAK_CHALLENGE_MISMATCH)
         );
         assert_eq!(
-            break_gate(ChallengeBreaks, false, false, Some("Abc234"), pend),
+            gate(ChallengeBreaks, false, false, Some("Abc234"), pend),
             Some(MSG_BREAK_CHALLENGE_MISMATCH)
         );
         // Exact match proceeds; password/unlock state is irrelevant here.
         assert_eq!(
-            break_gate(ChallengeBreaks, false, false, Some("Abc23"), pend),
+            gate(ChallengeBreaks, false, false, Some("Abc23"), pend),
             None
         );
         assert_eq!(
-            break_gate(ChallengeBreaks, true, false, Some("Abc23"), pend),
+            gate(ChallengeBreaks, true, false, Some("Abc23"), pend),
             None
         );
         // The response is TRIMMED before comparing — a trailing newline from
         // a paste must not fail the user…
         assert_eq!(
-            break_gate(ChallengeBreaks, false, false, Some("Abc23\n"), pend),
+            gate(ChallengeBreaks, false, false, Some("Abc23\n"), pend),
             None
         );
         assert_eq!(
-            break_gate(ChallengeBreaks, false, false, Some("  Abc23 "), pend),
+            gate(ChallengeBreaks, false, false, Some("  Abc23 "), pend),
             None
         );
         // …but interior whitespace is a mismatch.
         assert_eq!(
-            break_gate(ChallengeBreaks, false, false, Some("Abc 23"), pend),
+            gate(ChallengeBreaks, false, false, Some("Abc 23"), pend),
             Some(MSG_BREAK_CHALLENGE_MISMATCH)
         );
     }
@@ -1856,7 +1887,7 @@ mod tests {
         update.lock = ChallengeBreaks;
         let resp = dispatch(Request::UpdateBlock { block: update }, &daemon).await;
         assert_eq!(err_msg(resp), MSG_LOCK_MODES);
-        assert_eq!(daemon.state.lock().await.blocks[0].lock, Normal);
+        assert_eq!(daemon.state.lock().await.blocks[0].lock, Unlocked);
     }
 
     #[tokio::test]
@@ -1896,7 +1927,7 @@ mod tests {
         daemon.state.lock().await.blocks.push(saved);
         let resp = dispatch(
             Request::UpdateBlock {
-                block: blk(1, vec![]), // lock: Normal
+                block: blk(1, vec![]), // lock: Unlocked
             },
             &daemon,
         )
@@ -1910,7 +1941,7 @@ mod tests {
     // accept paths, the active record carries allowance 0: passing the mode
     // gate then fails on compute_grant's environment-independent "no break
     // allowance" error — proof the gate was cleared without touching the
-    // real state dir. The full accept matrix lives on `break_gate` above.
+    // real state dir. The full accept matrix lives on `lock_gate` above.
 
     fn take_break(block_id: u64, challenge: Option<&str>) -> Request {
         Request::TakeBreak {
@@ -2059,7 +2090,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_break_challenge_requires_challenge_mode() {
-        for mode in [Normal, PasswordBreaks] {
+        for mode in [Unlocked, PasswordBreaks] {
             let daemon = test_daemon();
             daemon
                 .state
@@ -2206,7 +2237,7 @@ mod tests {
             originator: Originator::Pomodoro,
             break_until_unix: None,
             apps_enforced: false,
-            lock: LockMode::Normal,
+            lock: LockMode::Unlocked,
         }
     }
 
@@ -2299,7 +2330,7 @@ mod tests {
         {
             let mut st = daemon.state.lock().await;
             st.blocks.push(blk(1, vec![]));
-            st.active.push(active_with_lock(1, LockMode::Normal, 0));
+            st.active.push(active_with_lock(1, LockMode::Unlocked, 0));
         }
         let resp = dispatch(start_pomodoro(1, 1500, 300, 4), &daemon).await;
         assert_eq!(err_msg(resp), "block 1 is already active");

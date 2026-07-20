@@ -505,7 +505,7 @@ mod tests {
             domains: vec!["example.com".into()],
             apps: vec![],
             allowance_secs_per_day: 0,
-            lock: LockMode::Normal,
+            lock: LockMode::Unlocked,
         }
     }
 
@@ -536,7 +536,7 @@ mod tests {
             originator: Originator::Manual,
             break_until_unix: None,
             apps_enforced: false,
-            lock: LockMode::Normal,
+            lock: LockMode::Unlocked,
         }
     }
 
@@ -548,7 +548,7 @@ mod tests {
             originator: Originator::Schedule { schedule_id },
             break_until_unix: None,
             apps_enforced: false,
-            lock: LockMode::Normal,
+            lock: LockMode::Unlocked,
         }
     }
 
@@ -991,7 +991,7 @@ mod tests {
         assert_eq!(st.active.len(), 1);
         assert_eq!(st.active[0].lock, LockMode::ChallengeBreaks);
 
-        // And a Normal block snapshots Normal.
+        // And an Unlocked block snapshots Unlocked.
         let mut st = State::default();
         st.blocks.push(block(0));
         st.schedules.push(s(540, 60, DAY_MON));
@@ -1003,7 +1003,7 @@ mod tests {
             &all_gates(),
             &mut HashSet::new()
         ));
-        assert_eq!(st.active[0].lock, LockMode::Normal);
+        assert_eq!(st.active[0].lock, LockMode::Unlocked);
     }
 
     // ── pomodoro: advance_pomodoro (B2.c) ───────────────────────────────────
@@ -1016,7 +1016,7 @@ mod tests {
             originator: Originator::Pomodoro,
             break_until_unix: None,
             apps_enforced: false,
-            lock: LockMode::Normal,
+            lock: LockMode::Unlocked,
         }
     }
 

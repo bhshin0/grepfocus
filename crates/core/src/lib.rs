@@ -22,8 +22,8 @@ pub struct Block {
     #[serde(default)]
     pub allowance_secs_per_day: u64,
     /// How taking a break is locked down while this block is active.
-    /// Non-`Normal` modes are premium, gated when the block is saved.
-    /// Defaults to `Normal` for records written before this field existed.
+    /// Non-`Unlocked` modes are premium, gated when the block is saved.
+    /// Defaults to `Unlocked` for records written before this field existed.
     #[serde(default)]
     pub lock: LockMode,
 }
@@ -35,16 +35,22 @@ pub struct Block {
 /// request fail and hides the break row in the GUI entirely — so there is
 /// deliberately no redundant `NoBreaks` variant here. Do not re-add one.
 ///
-/// Every non-`Normal` mode is a premium feature
+/// Every non-`Unlocked` mode is a premium feature
 /// (`license::features::LOCK_MODES`), enforced when the block is SAVED, not
 /// when it runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LockMode {
-    /// Breaks work as configured (subject to the daily allowance). The only
-    /// mode the free tier can save.
+    /// No lock: breaks work as configured (subject to the daily allowance).
+    /// The only mode the free tier can save.
+    ///
+    /// The wire value stays `"normal"` — released daemons deserialize
+    /// `LockMode` as a bare string with no unknown-variant fallback, so a
+    /// state file saying `"unlocked"` would be unreadable to them, and an
+    /// unreadable-but-verified state file is fatal at startup.
     #[default]
-    Normal,
+    #[serde(rename = "normal")]
+    Unlocked,
     /// A break requires the settings password (an active unlock window).
     PasswordBreaks,
     /// A break requires retyping a random challenge string the daemon issues.
@@ -102,7 +108,7 @@ pub struct ActiveBlock {
     /// block — exactly like `apps_enforced`. A mid-block edit or license
     /// change must never soften a running block's break rules; snapshotting
     /// can only ever make a running block *stricter than the current
-    /// config*, which is the safe direction. Defaults to `Normal` for old
+    /// config*, which is the safe direction. Defaults to `Unlocked` for old
     /// records written before this field existed.
     #[serde(default)]
     pub lock: LockMode,
@@ -790,11 +796,13 @@ mod tests {
         ));
     }
 
-    // Pin LockMode's snake_case wire values.
+    // Pin LockMode's snake_case wire values. `Unlocked` is deliberately
+    // pinned to `"normal"`: the variant was renamed, the wire value was not,
+    // because released daemons cannot parse an unknown variant.
     #[test]
     fn lock_mode_serializes_snake_case() {
         for (mode, wire) in [
-            (LockMode::Normal, r#""normal""#),
+            (LockMode::Unlocked, r#""normal""#),
             (LockMode::PasswordBreaks, r#""password_breaks""#),
             (LockMode::ChallengeBreaks, r#""challenge_breaks""#),
         ] {
@@ -804,9 +812,9 @@ mod tests {
     }
 
     // Old state.json compat: Block and ActiveBlock records written before
-    // `lock` existed default to Normal.
+    // `lock` existed default to Unlocked.
     #[test]
-    fn block_and_active_block_without_lock_default_to_normal() {
+    fn block_and_active_block_without_lock_default_to_unlocked() {
         let block_json = r#"{
             "id": 1,
             "name": "reddit",
@@ -815,7 +823,7 @@ mod tests {
             "allowance_secs_per_day": 600
         }"#;
         let b: Block = serde_json::from_str(block_json).unwrap();
-        assert_eq!(b.lock, LockMode::Normal);
+        assert_eq!(b.lock, LockMode::Unlocked);
 
         let active_json = format!(
             r#"{{
@@ -825,7 +833,7 @@ mod tests {
             }}"#
         );
         let a: ActiveBlock = serde_json::from_str(&active_json).unwrap();
-        assert_eq!(a.lock, LockMode::Normal);
+        assert_eq!(a.lock, LockMode::Unlocked);
     }
 
     // ── usage stats (B2.b) ──────────────────────────────────────────────────

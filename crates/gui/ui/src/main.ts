@@ -6,8 +6,10 @@ type AppMatcher =
   | { kind: "cmdline"; contains: string };
 
 /// Mirrors core's `LockMode` (snake_case on the wire). How taking a break on
-/// this block is locked down; every mode but "normal" is premium, enforced by
-/// the daemon when the block is SAVED.
+/// this block is locked down; every mode but unlocked is premium, enforced by
+/// the daemon when the block is SAVED. The unlocked variant is spelled
+/// `"normal"` on the wire for compatibility with released daemons — the Rust
+/// variant was renamed, the wire value deliberately was not.
 type LockMode = "normal" | "password_breaks" | "challenge_breaks";
 
 interface Block {
@@ -155,6 +157,7 @@ newForm.addEventListener("submit", async (ev) => {
       .filter(Boolean),
     apps: parseAppLines(String(fd.get("apps") ?? "")),
     allowance_secs_per_day: Math.max(0, Math.floor(Number(fd.get("allowance_minutes") ?? 0))) * 60,
+    // `"normal"` is the wire spelling of the unlocked mode (see `LockMode`).
     lock: String(fd.get("lock") ?? "normal") as LockMode,
   };
   if (!block.name) {
@@ -385,8 +388,9 @@ function renderActive(s: Status) {
         const left = row.querySelector<HTMLSpanElement>(".break-left")!;
 
         // Branch on the ACTIVE record's lock snapshot (`a.lock`), never on
-        // `a.block.lock`: the snapshot is what the daemon's break_gate
+        // `a.block.lock`: the snapshot is what the daemon's lock_gate
         // enforces, and a mid-block edit must not soften a running block.
+        // `"normal"` is the wire spelling of unlocked (see `LockMode`).
         if (a.lock !== "normal") {
           const badge = document.createElement("span");
           badge.className = "break-lock";

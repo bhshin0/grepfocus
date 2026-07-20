@@ -169,7 +169,7 @@ async fn unlock(password: String) -> Result<(), String> {
 /// Take a break on an active block. `challenge` is the user's typed response
 /// for a `ChallengeBreaks` block and `None` for every other mode — the daemon
 /// decides whether one was required, and verifies it. The frontend omits the
-/// argument entirely for normal breaks (Tauri maps a missing arg to `None`).
+/// argument entirely for unlocked breaks (Tauri maps a missing arg to `None`).
 #[tauri::command]
 async fn take_break(block_id: u64, secs: u64, challenge: Option<String>) -> Result<(), String> {
     match client::call(Request::TakeBreak {

@@ -280,14 +280,14 @@ mod tests {
                     name: "steam".into(),
                 }],
                 allowance_secs_per_day: 0,
-                lock: LockMode::Normal,
+                lock: LockMode::Unlocked,
             },
             started_at_unix: 0,
             ends_at_unix: u64::MAX,
             originator: Originator::Manual,
             break_until_unix,
             apps_enforced,
-            lock: LockMode::Normal,
+            lock: LockMode::Unlocked,
         }
     }
 

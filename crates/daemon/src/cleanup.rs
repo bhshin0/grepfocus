@@ -492,7 +492,7 @@ mod tests {
             domains: vec!["reddit.com".into()],
             apps: vec![],
             allowance_secs_per_day: 0,
-            lock: LockMode::Normal,
+            lock: LockMode::Unlocked,
         };
         let st = State {
             next_id: 2,
@@ -504,7 +504,7 @@ mod tests {
                 originator: Originator::Manual,
                 break_until_unix: None,
                 apps_enforced: false,
-                lock: LockMode::Normal,
+                lock: LockMode::Unlocked,
             }],
             ..Default::default()
         };
