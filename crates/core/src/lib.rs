@@ -4,6 +4,8 @@
 //! the byte length of the payload, followed by the JSON payload itself.
 //! Both directions use the same framing.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 pub mod hmac_sig;
@@ -283,15 +285,62 @@ pub struct BreakRecord {
 /// time, so retention can prune anything older with no policy able to notice.
 pub const MAX_ALLOWANCE_WINDOW_SECS: u64 = 24 * 3600;
 
-/// Hard cap on retained [`BreakRecord`]s, mirroring [`UsageStats::SESSIONS_CAP`].
+/// Hard cap on retained [`BreakRecord`]s **per block**, mirroring
+/// [`UsageStats::SESSIONS_CAP`].
 ///
 /// History is one row per break, not one per block per day, so this is only
 /// reachable by a non-GUI client spamming 1-second breaks. Dropping the oldest
 /// rows LOOSENS enforcement (forgotten spend reads as unspent), so this is a
 /// memory backstop, not a policy — the real bound is the window filter.
+///
+/// The cap is applied PER BLOCK rather than to the history as a whole, because
+/// a global cap makes one block's churn evict another block's spend. A
+/// `PerBreak` block never depletes, so a scripted client can loop 1-second
+/// breaks against it forever; under a global cap those rows push a *different*
+/// block's exhausted `PerDay` records out of the file, and that block silently
+/// gets its budget back. Blockwise, the blast radius of the loosening is the
+/// block that caused it.
+///
+/// The overall bound is therefore `BREAKS_CAP × (distinct block ids present)`.
+/// That is still a bound: block ids in history only come from blocks the user
+/// created, so the multiplier grows by deliberate UI action, whereas the row
+/// count per block grows as fast as a client can call `take_break`. The
+/// unbounded axis is the one that is capped.
 pub const BREAKS_CAP: usize = 4000;
 
-/// Drop break records no policy can still see, then enforce [`BREAKS_CAP`].
+/// What a [`prune_breaks`] pass removed, split by REASON.
+///
+/// The split is the point. Window pruning is routine and expected — records
+/// aged out of every policy's reach. Cap eviction is not: it drops records a
+/// policy could still have counted, which hands allowance back. The caller
+/// (the daemon) logs the second and ignores the first, and it can only do that
+/// if the two arrive separately. Kept `tracing`-free so core stays pure: this
+/// type is the arithmetic, the logging happens where the logger lives.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PruneOutcome {
+    /// Records dropped because no policy could still see them. Harmless.
+    pub window_dropped: usize,
+    /// `(block_id, evicted)` for every block that overflowed [`BREAKS_CAP`],
+    /// ascending by id. Non-empty means enforcement was loosened for those
+    /// blocks and somebody should hear about it.
+    pub cap_evicted: Vec<(u64, usize)>,
+}
+
+impl PruneOutcome {
+    /// Total records the CAP evicted, across all blocks.
+    pub fn cap_evicted_total(&self) -> usize {
+        self.cap_evicted.iter().map(|(_, n)| n).sum()
+    }
+
+    /// Whether this pass removed anything at all — i.e. whether the state
+    /// needs saving.
+    pub fn removed_any(&self) -> bool {
+        self.window_dropped > 0 || !self.cap_evicted.is_empty()
+    }
+}
+
+/// Drop break records no policy can still see, then enforce [`BREAKS_CAP`]
+/// per block. Reports what each half removed.
 ///
 /// A record is retained when it is either still relevant to a per-day policy
 /// (`day == today`) or still inside the longest permitted trailing window.
@@ -299,13 +348,54 @@ pub const BREAKS_CAP: usize = 4000;
 /// (early-morning breaks late in the day), and yesterday's rows can still be
 /// inside it (a break just before local midnight).
 ///
-/// Pure — `now` and `today` are supplied by the caller.
-pub fn prune_breaks(breaks: &mut Vec<BreakRecord>, now: u64, today: i64, max_window: u64) {
+/// Relative order is preserved, and within a block the OLDEST rows are the
+/// ones evicted — records are appended in start order, so position is age.
+///
+/// Pure — `now` and `today` are supplied by the caller, and nothing here logs.
+pub fn prune_breaks(
+    breaks: &mut Vec<BreakRecord>,
+    now: u64,
+    today: i64,
+    max_window: u64,
+) -> PruneOutcome {
     let horizon = now.saturating_sub(max_window);
+    let before = breaks.len();
     breaks.retain(|r| r.day == today || r.start_unix > horizon);
-    if breaks.len() > BREAKS_CAP {
-        let overflow = breaks.len() - BREAKS_CAP;
-        breaks.drain(0..overflow);
+    let window_dropped = before - breaks.len();
+
+    // How many rows each block has left, and hence how many of its oldest
+    // must go. Two passes rather than one so the eviction budget is known
+    // before any row is examined for removal.
+    let mut per_block: HashMap<u64, usize> = HashMap::new();
+    for r in breaks.iter() {
+        *per_block.entry(r.block_id).or_default() += 1;
+    }
+    let mut to_evict: HashMap<u64, usize> = per_block
+        .into_iter()
+        .filter(|&(_, n)| n > BREAKS_CAP)
+        .map(|(id, n)| (id, n - BREAKS_CAP))
+        .collect();
+    if to_evict.is_empty() {
+        return PruneOutcome {
+            window_dropped,
+            cap_evicted: Vec::new(),
+        };
+    }
+
+    let mut cap_evicted: Vec<(u64, usize)> = to_evict.iter().map(|(&id, &n)| (id, n)).collect();
+    cap_evicted.sort_unstable();
+
+    breaks.retain(|r| match to_evict.get_mut(&r.block_id) {
+        Some(left) if *left > 0 => {
+            *left -= 1;
+            false
+        }
+        _ => true,
+    });
+
+    PruneOutcome {
+        window_dropped,
+        cap_evicted,
     }
 }
 
@@ -417,9 +507,32 @@ pub fn evaluate_allowance(
                     }
                 }
             }
+            let remaining_secs = secs.saturating_sub(used);
+            // Clamp to what the policy is actually WITHHOLDING right now:
+            // `budget - remaining`, i.e. `min(used, budget)`. Nothing can
+            // "return" that the policy is not currently taking away — after
+            // the oldest records age out, remaining is still capped at the
+            // budget, so the most it can ever rise by is the gap below it.
+            //
+            // The raw sum of expiring records can exceed that gap, and this is
+            // reachable in practice: a block spends 900s under
+            // `PerDay { 900 }`, the user then edits it to
+            // `RollingWindow { secs: 300, window_secs: 3600 }` and it restarts
+            // inside the hour. The 900s record is in the new window, so the
+            // untrimmed figure claims 15 minutes return against a 5-minute
+            // budget, and the GUI renders that verbatim. Under a stable policy
+            // this is unreachable (grants are capped at `remaining` and
+            // records only ever leave the window) — but a policy edit between
+            // runs is a supported thing to do, so the ceiling is enforced
+            // rather than assumed.
+            //
+            // `budget - remaining` is chosen over the looser `budget` because
+            // it is also correct in the ordinary case: with 100s spent of a
+            // 300s budget, at most 100s can come back, never 300s.
+            let next_free_secs = next_free_secs.min(secs.saturating_sub(remaining_secs));
             AllowanceView {
                 budget_secs: secs,
-                remaining_secs: secs.saturating_sub(used),
+                remaining_secs,
                 next_free_unix,
                 next_free_secs,
             }
@@ -1557,10 +1670,14 @@ mod tests {
             // Neither: dropped.
             brk(1, now - 50_000, 60, 41),
         ];
-        prune_breaks(&mut breaks, now, 42, window);
+        let out = prune_breaks(&mut breaks, now, 42, window);
         assert_eq!(breaks.len(), 2);
         assert_eq!(breaks[0].day, 42);
         assert_eq!(breaks[1].start_unix, now - 60);
+        // Window pruning only — nothing was evicted by the cap.
+        assert_eq!(out.window_dropped, 1);
+        assert!(out.cap_evicted.is_empty());
+        assert!(out.removed_any());
     }
 
     #[test]
@@ -1569,10 +1686,99 @@ mod tests {
         let mut breaks: Vec<BreakRecord> = (0..BREAKS_CAP as u64 + 10)
             .map(|i| brk(1, now - 100 + i, 1, 42))
             .collect();
-        prune_breaks(&mut breaks, now, 42, MAX_ALLOWANCE_WINDOW_SECS);
+        let out = prune_breaks(&mut breaks, now, 42, MAX_ALLOWANCE_WINDOW_SECS);
         assert_eq!(breaks.len(), BREAKS_CAP);
         // The ten oldest went; the front is now the eleventh record.
         assert_eq!(breaks[0].start_unix, now - 100 + 10);
+        // And the cap half of the pass is reported, attributed to its block.
+        assert_eq!(out.window_dropped, 0);
+        assert_eq!(out.cap_evicted, vec![(1, 10)]);
+        assert_eq!(out.cap_evicted_total(), 10);
+    }
+
+    /// The reviewer's trigger, verbatim: a `PerBreak` block never depletes, so
+    /// a scripted client can loop 1-second breaks against it forever. Under a
+    /// GLOBAL cap those rows evicted a second block's exhausted `PerDay`
+    /// history and that block silently got its 900s back. Blockwise, block 2
+    /// is untouched and stays at `remaining 0`.
+    #[test]
+    fn cap_eviction_is_per_block_and_cannot_free_another_blocks_budget() {
+        let now = 1_000_000u64;
+        let today = 42i64;
+
+        let mut breaks = vec![
+            // Block 2 spends its whole per-day budget, first and therefore
+            // oldest — exactly the position a global drop-oldest reaches.
+            brk(2, now - 5_000, 900, today),
+        ];
+        // Block 1 then floods history well past the cap.
+        breaks.extend((0..BREAKS_CAP as u64 + 100).map(|i| brk(1, now - 3_000 + i, 1, today)));
+
+        let out = prune_breaks(&mut breaks, now, today, MAX_ALLOWANCE_WINDOW_SECS);
+
+        // Only block 1 was evicted, and only down to the cap.
+        assert_eq!(out.cap_evicted, vec![(1, 100)]);
+        assert_eq!(out.window_dropped, 0);
+
+        // Block 2's record survived, so its budget is still spent.
+        let view = evaluate_allowance(
+            &AllowancePolicy::PerDay { secs: 900 },
+            &breaks,
+            2,
+            now,
+            today,
+        );
+        assert_eq!(view.remaining_secs, 0);
+        assert_eq!(breaks.iter().filter(|r| r.block_id == 2).count(), 1);
+        assert_eq!(
+            breaks.iter().filter(|r| r.block_id == 1).count(),
+            BREAKS_CAP
+        );
+    }
+
+    /// The reviewer's second trigger: a block spends 900s under
+    /// `PerDay { 900 }`, is then edited to `RollingWindow { 300, 3600 }` and
+    /// restarts inside the hour. The 900s record is in the new window, so the
+    /// unclamped `next_free_secs` claimed 15 minutes would return against a
+    /// 5-minute budget.
+    #[test]
+    fn rolling_next_free_secs_cannot_exceed_what_the_policy_withholds() {
+        let now = 10_000u64;
+        let today = 42i64;
+        let breaks = vec![brk(1, now, 900, today)];
+
+        let view = evaluate_allowance(
+            &AllowancePolicy::RollingWindow {
+                secs: 300,
+                window_secs: 3600,
+            },
+            &breaks,
+            1,
+            now,
+            today,
+        );
+        assert_eq!(view.budget_secs, 300);
+        assert_eq!(view.remaining_secs, 0);
+        assert_eq!(view.next_free_unix, Some(now + 3600));
+        // Clamped to `budget - remaining`: the whole budget returns, no more.
+        assert_eq!(view.next_free_secs, 300);
+        assert!(view.next_free_secs <= view.budget_secs);
+
+        // The ordinary case is clamped by CONSUMPTION, not by the budget:
+        // 100s spent of 300s can only ever hand back 100s.
+        let breaks = vec![brk(1, now, 100, today)];
+        let view = evaluate_allowance(
+            &AllowancePolicy::RollingWindow {
+                secs: 300,
+                window_secs: 3600,
+            },
+            &breaks,
+            1,
+            now,
+            today,
+        );
+        assert_eq!(view.remaining_secs, 200);
+        assert_eq!(view.next_free_secs, 100);
     }
 
     // Old state.json compat: state carrying only legacy allowance rows and no

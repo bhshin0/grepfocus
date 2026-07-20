@@ -19,7 +19,7 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
 use grepfocus_core::license::features;
 use grepfocus_core::{
     day_set, now_unix, prune_breaks, ActiveBlock, FocusSession, Origin, Originator, PomodoroPhase,
-    PomodoroSession, Schedule, State, UsageStats, MAX_ALLOWANCE_WINDOW_SECS,
+    PomodoroSession, Schedule, State, UsageStats, BREAKS_CAP, MAX_ALLOWANCE_WINDOW_SECS,
 };
 use tracing::{error, info, warn};
 
@@ -391,11 +391,29 @@ fn reconcile(
     // to hand back a fresh per-day budget, and a reducer that filters by day
     // itself simply cannot over-credit whether the tick fired or not.
     // Needs a save, but not a re-apply on its own.
-    let before = st.breaks.len();
-    prune_breaks(&mut st.breaks, now_unix, today, MAX_ALLOWANCE_WINDOW_SECS);
-    let breaks_pruned = st.breaks.len() != before;
+    let pruned = prune_breaks(&mut st.breaks, now_unix, today, MAX_ALLOWANCE_WINDOW_SECS);
+    // Window pruning is routine and silent. Cap eviction is not: it drops
+    // records a policy could still have counted, so the affected block gets
+    // some of its budget handed back. That is a deliberate memory backstop,
+    // but it is a LOOSENING of enforcement, so it must never happen quietly —
+    // in practice it means something is calling `take_break` in a loop.
+    if !pruned.cap_evicted.is_empty() {
+        let blocks = pruned
+            .cap_evicted
+            .iter()
+            .map(|(id, n)| format!("{id}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        warn!(
+            evicted = pruned.cap_evicted_total(),
+            per_block = %blocks,
+            cap = BREAKS_CAP,
+            "break history hit the per-block cap; oldest records dropped and \
+             their spend no longer counts against the allowance"
+        );
+    }
 
-    changed || breaks_pruned
+    changed || pruned.removed_any()
 }
 
 /// Split `active` into `(kept, dropped)` by `keep`. A partition rather than a
