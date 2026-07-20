@@ -9,8 +9,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use grepfocus_core::license::{self, LicenseClaims};
 use grepfocus_core::{
-    now_unix, ActiveBlock, AllowanceLedger, AppMatcher, LockMode, Originator, PomodoroPhase,
-    PomodoroSession, PomodoroStatus, Request, Response, Schedule, State,
+    compute_grant, evaluate_allowance, now_unix, ActiveBlock, AllowanceLedger, AllowanceStatus,
+    AppMatcher, BreakRecord, LockMode, Originator, PomodoroPhase, PomodoroSession, PomodoroStatus,
+    Request, Response, Schedule, State,
 };
 use nix::unistd::Group;
 use tokio::net::{UnixListener, UnixStream};
@@ -126,14 +127,35 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             let password_set = st.password_hash.is_some();
             let unlocked = !password_set || *daemon.unlocked_until.lock().await >= now;
             let today = scheduler::local_day();
-            let active_ids: std::collections::HashSet<u64> =
-                st.active.iter().map(|a| a.block.id).collect();
-            let allowance_used: Vec<AllowanceLedger> = st
-                .allowance
-                .iter()
-                .filter(|l| l.day == today && active_ids.contains(&l.block_id))
-                .cloned()
-                .collect();
+            // Both allowance shapes come from the SAME break history, so they
+            // can never disagree. The new one carries the policy and the full
+            // view; the legacy one is derived — today's rows summed per active
+            // block — solely so a GUI built against a pre-policy daemon keeps
+            // rendering the identical remaining minutes it always did. For a
+            // PerDay block the derived `used_secs` is exactly what the old
+            // counter held, because that counter is what `record_break`
+            // appended and what `absorb_legacy_allowance` folded in.
+            let mut allowance_used: Vec<AllowanceLedger> = Vec::new();
+            let mut allowance: Vec<AllowanceStatus> = Vec::new();
+            for a in st.active.iter() {
+                let block_id = a.block.id;
+                let policy = a.block.policy();
+                allowance.push(AllowanceStatus {
+                    block_id,
+                    view: evaluate_allowance(&policy, &st.breaks, block_id, now, today),
+                    policy,
+                });
+                allowance_used.push(AllowanceLedger {
+                    block_id,
+                    day: today,
+                    used_secs: st
+                        .breaks
+                        .iter()
+                        .filter(|r| r.block_id == block_id && r.day == today)
+                        .map(|r| r.secs)
+                        .sum(),
+                });
+            }
             let cached = daemon.license.lock().await;
             let lic = license_status_fields(
                 cached.as_ref(),
@@ -154,6 +176,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 password_set,
                 unlocked,
                 allowance_used,
+                allowance,
                 license_present: lic.present,
                 license_valid: lic.valid,
                 license_kind: lic.kind,
@@ -334,7 +357,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             {
                 let mut st = daemon.state.lock().await;
 
-                let (allowance, ends_at, lock) =
+                let (policy, ends_at, lock) =
                     match st.active.iter().find(|a| a.block.id == block_id) {
                         Some(a) => {
                             // A pomodoro session owns this block's break
@@ -349,7 +372,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                             if a.break_until_unix.is_some_and(|t| t > now) {
                                 return err("this block is already on a break");
                             }
-                            (a.block.allowance_secs_per_day, a.ends_at_unix, a.lock)
+                            (a.block.policy(), a.ends_at_unix, a.lock)
                         }
                         None => return err(format!("block {block_id} is not active")),
                     };
@@ -400,26 +423,24 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                     }
                 }
 
-                // How much has already been spent today on this block.
-                let used: u64 = st
-                    .allowance
-                    .iter()
-                    .filter(|l| l.block_id == block_id && l.day == today)
-                    .map(|l| l.used_secs)
-                    .sum();
-                let grant = match compute_grant(allowance, used, ends_at, now, secs) {
-                    Ok(g) => g,
-                    Err(msg) => return err(msg),
-                };
+                // The grant is core's reduction of break HISTORY under the
+                // policy — no per-day counter is read or maintained here any
+                // more. `st.breaks` is passed whole; each policy filters it
+                // for itself (PerBreak looks at none of it).
+                let grant =
+                    match compute_grant(&policy, &st.breaks, block_id, ends_at, now, today, secs) {
+                        Ok(g) => g,
+                        Err(msg) => return err(msg),
+                    };
 
-                // Mutate break state + ledger, keeping enough to roll back if
+                // Mutate break state + history, keeping enough to roll back if
                 // the save fails. Every active entry for the block is flagged
                 // so a duplicate entry (however it arose) can't keep enforcing.
-                let prev_ledger = st.allowance.clone();
+                let prev_breaks = st.breaks.clone();
                 for a in st.active.iter_mut().filter(|a| a.block.id == block_id) {
                     a.break_until_unix = Some(now + grant);
                 }
-                record_break(&mut st.allowance, block_id, today, grant);
+                record_break(&mut st.breaks, block_id, now, today, grant);
                 // Record the break in usage stats, riding this same save. Not
                 // rolled back if the save below fails: the phantom increment
                 // is bounded (per-day counters only, no enforcement effect)
@@ -431,7 +452,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                     for a in st.active.iter_mut().filter(|a| a.block.id == block_id) {
                         a.break_until_unix = None;
                     }
-                    st.allowance = prev_ledger;
+                    st.breaks = prev_breaks;
                     return err(format!("save failed: {e}"));
                 }
                 info!(block_id, grant, "break started");
@@ -1082,53 +1103,20 @@ fn validate_pomodoro_bounds(focus_secs: u64, break_secs: u64, cycles: u32) -> Op
     None
 }
 
-/// Compute the grantable break length (seconds) for a TakeBreak request, capped
-/// by both the remaining daily allowance and the block's remaining time. Pure,
-/// so the accounting can be unit-tested without a live daemon.
+/// Append one break to history.
 ///
-/// Returns a user-facing error string when: no allowance is configured, the
-/// allowance is exhausted for today, the block has already ended, or the
-/// computed grant is zero.
-fn compute_grant(
-    allowance: u64,
-    used_today: u64,
-    ends_at: u64,
-    now: u64,
-    requested: u64,
-) -> Result<u64, &'static str> {
-    if allowance == 0 {
-        return Err("this block has no break allowance");
-    }
-    let remaining = allowance.saturating_sub(used_today);
-    if remaining == 0 {
-        return Err("no break allowance left today");
-    }
-    // A break can never outlive the block, so never charge for time past its end.
-    if ends_at <= now {
-        return Err("this block has already ended");
-    }
-    let grant = requested.min(remaining).min(ends_at - now);
-    if grant == 0 {
-        return Err("break length must be at least 1 second");
-    }
-    Ok(grant)
-}
-
-/// Record `grant` seconds of break against `block_id` for `today`, first
-/// dropping ledger rows from other days (the daily allowance reset).
-fn record_break(ledger: &mut Vec<AllowanceLedger>, block_id: u64, today: i64, grant: u64) {
-    ledger.retain(|l| l.day == today);
-    match ledger
-        .iter_mut()
-        .find(|l| l.block_id == block_id && l.day == today)
-    {
-        Some(l) => l.used_secs += grant,
-        None => ledger.push(AllowanceLedger {
-            block_id,
-            day: today,
-            used_secs: grant,
-        }),
-    }
+/// A pure append: unlike the per-day counter it replaces, it does NOT prune.
+/// Retention is `reconcile`'s job (`prune_breaks` on the tick), and the daily
+/// reset is now the reducers' `day == today` filter rather than a side effect
+/// of pruning — so a daemon that missed every midnight tick still cannot
+/// over-credit a per-day budget.
+fn record_break(breaks: &mut Vec<BreakRecord>, block_id: u64, now: u64, today: i64, grant: u64) {
+    breaks.push(BreakRecord {
+        block_id,
+        start_unix: now,
+        secs: grant,
+        day: today,
+    });
 }
 
 #[cfg(test)]
@@ -1136,83 +1124,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn grant_errors_without_allowance() {
-        assert_eq!(
-            compute_grant(0, 0, 2000, 1000, 60),
-            Err("this block has no break allowance")
-        );
-    }
-
-    #[test]
-    fn grant_errors_when_exhausted() {
-        assert_eq!(
-            compute_grant(600, 600, 2000, 1000, 60),
-            Err("no break allowance left today")
-        );
-        // Saturating: used beyond allowance still reads as exhausted.
-        assert_eq!(
-            compute_grant(600, 700, 2000, 1000, 60),
-            Err("no break allowance left today")
-        );
-    }
-
-    #[test]
-    fn grant_errors_when_block_ended() {
-        assert_eq!(
-            compute_grant(600, 0, 1000, 1000, 60),
-            Err("this block has already ended")
-        );
-        assert_eq!(
-            compute_grant(600, 0, 999, 1000, 60),
-            Err("this block has already ended")
-        );
-    }
-
-    #[test]
-    fn grant_errors_on_zero_request() {
-        assert_eq!(
-            compute_grant(600, 0, 2000, 1000, 0),
-            Err("break length must be at least 1 second")
-        );
-    }
-
-    #[test]
-    fn grant_capped_by_remaining_allowance() {
-        // remaining = 600 - 590 = 10; block time is ample.
-        assert_eq!(compute_grant(600, 590, 1_000_000, 1000, 100), Ok(10));
-    }
-
-    #[test]
-    fn grant_capped_by_remaining_block_time() {
-        // block ends in 5s; allowance is ample.
-        assert_eq!(compute_grant(600, 0, 1005, 1000, 100), Ok(5));
-    }
-
-    #[test]
-    fn grant_uses_request_when_smallest() {
-        assert_eq!(compute_grant(600, 0, 1_000_000, 1000, 30), Ok(30));
-    }
-
-    #[test]
-    fn record_break_adds_new_row() {
-        let mut ledger = vec![];
-        record_break(&mut ledger, 7, 42, 60);
-        assert_eq!(ledger.len(), 1);
-        assert_eq!(ledger[0].block_id, 7);
-        assert_eq!(ledger[0].day, 42);
-        assert_eq!(ledger[0].used_secs, 60);
-    }
-
-    #[test]
-    fn record_break_increments_existing_row() {
-        let mut ledger = vec![AllowanceLedger {
+    fn record_break_appends_rather_than_pruning() {
+        // The old per-day counter pruned other days and merged into one row.
+        // History does neither: an unrelated old record survives untouched and
+        // a second break on the same day is its own record, because a rolling
+        // window needs each break's own start time.
+        let mut breaks = vec![BreakRecord {
             block_id: 7,
-            day: 42,
-            used_secs: 60,
+            start_unix: 100,
+            secs: 60,
+            day: 41,
         }];
-        record_break(&mut ledger, 7, 42, 30);
-        assert_eq!(ledger.len(), 1);
-        assert_eq!(ledger[0].used_secs, 90);
+        record_break(&mut breaks, 7, 5_000, 42, 30);
+        record_break(&mut breaks, 7, 5_100, 42, 20);
+        assert_eq!(breaks.len(), 3);
+        assert_eq!(breaks[0].day, 41);
+        assert_eq!(
+            breaks[1],
+            BreakRecord {
+                block_id: 7,
+                start_unix: 5_000,
+                secs: 30,
+                day: 42,
+            }
+        );
+        assert_eq!(breaks[2].start_unix, 5_100);
     }
 
     // ── license_status_fields() ─────────────────────────────────────────────
@@ -1312,6 +1248,136 @@ mod tests {
         })
     }
 
+    /// An active record whose embedded block carries `policy`.
+    fn active_with_policy(block_id: u64, policy: AllowancePolicy) -> ActiveBlock {
+        let mut b = blk(block_id, vec![]);
+        b.set_policy(policy);
+        ActiveBlock {
+            block: b,
+            started_at_unix: 0,
+            ends_at_unix: u64::MAX,
+            originator: Originator::Manual,
+            break_until_unix: None,
+            apps_enforced: false,
+            lock: LockMode::Unlocked,
+        }
+    }
+
+    // GetStatus emits BOTH allowance shapes off the SAME break history, so the
+    // new `allowance` and the deprecated `allowance_used` can never disagree.
+    // Block 1 is per-day, block 2 rolling: the rolling block's derived legacy
+    // row is still just today's sum, which is exactly what a pre-policy GUI
+    // would have rendered for it.
+    #[tokio::test]
+    async fn status_emits_both_allowance_shapes_from_one_history() {
+        let daemon = test_daemon();
+        let now = now_unix();
+        let today = scheduler::local_day();
+        {
+            let mut st = daemon.state.lock().await;
+            st.active
+                .push(active_with_policy(1, AllowancePolicy::PerDay { secs: 600 }));
+            st.active.push(active_with_policy(
+                2,
+                AllowancePolicy::RollingWindow {
+                    secs: 300,
+                    window_secs: 3600,
+                },
+            ));
+            // Block 1: 120s spent today.
+            st.breaks.push(BreakRecord {
+                block_id: 1,
+                start_unix: now - 30,
+                secs: 120,
+                day: today,
+            });
+            // Block 2: 60s inside the window, plus 45s today but LONG outside
+            // it — the rolling view ignores the second, the per-day
+            // derivation counts both.
+            st.breaks.push(BreakRecord {
+                block_id: 2,
+                start_unix: now - 60,
+                secs: 60,
+                day: today,
+            });
+            st.breaks.push(BreakRecord {
+                block_id: 2,
+                start_unix: now - 7200,
+                secs: 45,
+                day: today,
+            });
+        }
+        let resp = dispatch(Request::GetStatus {}, &daemon).await;
+        let (allowance, allowance_used) = match resp {
+            Response::Status {
+                allowance,
+                allowance_used,
+                ..
+            } => (allowance, allowance_used),
+            other => panic!("expected Status, got {other:?}"),
+        };
+
+        // One entry per ACTIVE block in both shapes.
+        assert_eq!(allowance.len(), 2);
+        assert_eq!(allowance_used.len(), 2);
+
+        let a1 = allowance.iter().find(|a| a.block_id == 1).unwrap();
+        assert_eq!(a1.policy, AllowancePolicy::PerDay { secs: 600 });
+        assert_eq!(a1.view.budget_secs, 600);
+        assert_eq!(a1.view.remaining_secs, 480);
+        assert_eq!(a1.view.next_free_unix, None);
+
+        let a2 = allowance.iter().find(|a| a.block_id == 2).unwrap();
+        assert_eq!(a2.view.budget_secs, 300);
+        // Only the in-window record counts against the rolling budget.
+        assert_eq!(a2.view.remaining_secs, 240);
+        assert_eq!(a2.view.next_free_unix, Some(now - 60 + 3600));
+        assert_eq!(a2.view.next_free_secs, 60);
+
+        // The legacy shape is a plain per-day sum for both blocks, with
+        // today's day stamped on every row.
+        let u1 = allowance_used.iter().find(|l| l.block_id == 1).unwrap();
+        assert_eq!(u1.day, today);
+        assert_eq!(u1.used_secs, 120);
+        let u2 = allowance_used.iter().find(|l| l.block_id == 2).unwrap();
+        assert_eq!(u2.used_secs, 105);
+    }
+
+    // Records belonging to blocks that are NOT active are excluded from both
+    // shapes, as the pre-policy `active_ids` filter did.
+    #[tokio::test]
+    async fn status_ignores_history_for_inactive_blocks() {
+        let daemon = test_daemon();
+        let today = scheduler::local_day();
+        {
+            let mut st = daemon.state.lock().await;
+            st.active
+                .push(active_with_policy(1, AllowancePolicy::PerDay { secs: 600 }));
+            st.breaks.push(BreakRecord {
+                block_id: 99,
+                start_unix: now_unix() - 30,
+                secs: 120,
+                day: today,
+            });
+        }
+        let resp = dispatch(Request::GetStatus {}, &daemon).await;
+        match resp {
+            Response::Status {
+                allowance,
+                allowance_used,
+                ..
+            } => {
+                assert_eq!(allowance.len(), 1);
+                assert_eq!(allowance[0].block_id, 1);
+                assert_eq!(allowance[0].view.remaining_secs, 600);
+                assert_eq!(allowance_used.len(), 1);
+                assert_eq!(allowance_used[0].block_id, 1);
+                assert_eq!(allowance_used[0].used_secs, 0);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
     /// The KAT fixture minted by the real web-side signer (see
     /// crates/core/tests/license_kat.rs for provenance/regeneration).
     fn kat() -> serde_json::Value {
@@ -1384,7 +1450,7 @@ mod tests {
     // `update_needs_app_license`) instead — except where a later,
     // environment-independent error proves the gate was passed.
 
-    use grepfocus_core::{Block, DAY_MON};
+    use grepfocus_core::{AllowancePolicy, Block, DAY_MON};
 
     fn blk(id: u64, apps: Vec<AppMatcher>) -> Block {
         Block {
@@ -1689,33 +1755,6 @@ mod tests {
         *daemon.license.lock().await = Some(claims("perpetual", None));
         let resp = dispatch(Request::AddSchedule { schedule: sched(5) }, &daemon).await;
         assert_eq!(err_msg(resp), "no block with id 5");
-    }
-
-    #[test]
-    fn record_break_prunes_other_days_keeps_other_blocks() {
-        let mut ledger = vec![
-            // yesterday → pruned
-            AllowanceLedger {
-                block_id: 7,
-                day: 41,
-                used_secs: 60,
-            },
-            // today, different block → kept
-            AllowanceLedger {
-                block_id: 9,
-                day: 42,
-                used_secs: 15,
-            },
-        ];
-        record_break(&mut ledger, 7, 42, 30);
-        assert_eq!(ledger.len(), 2);
-        assert!(ledger
-            .iter()
-            .any(|l| l.block_id == 9 && l.day == 42 && l.used_secs == 15));
-        assert!(ledger
-            .iter()
-            .any(|l| l.block_id == 7 && l.day == 42 && l.used_secs == 30));
-        assert!(!ledger.iter().any(|l| l.day == 41));
     }
 
     // ── lock_gate(): the full lock-mode decision table ─────────────────────

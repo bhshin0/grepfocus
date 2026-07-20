@@ -117,7 +117,8 @@ pub fn load_in(dir: &Path, key: &[u8]) -> anyhow::Result<State> {
             // never corruption — do not fall through to the legacy branch and
             // end up reporting it as one.
             return serde_json::from_slice::<State>(body)
-                .map_err(|e| anyhow::Error::new(UnparseableState(e)));
+                .map_err(|e| anyhow::Error::new(UnparseableState(e)))
+                .map(absorbed);
         }
     }
 
@@ -126,8 +127,9 @@ pub fn load_in(dir: &Path, key: &[u8]) -> anyhow::Result<State> {
     // too, so genuine corruption still surfaces as an error.
     if let Ok(mac) = fs::read(dir.join(STATE_MAC_SIDECAR)) {
         if hmac_sig::verify(&raw, key, &mac) {
-            return serde_json::from_slice(&raw)
+            return serde_json::from_slice::<State>(&raw)
                 .map_err(|e| anyhow::Error::new(UnparseableState(e)))
+                .map(absorbed)
                 .context("parsing legacy state.json");
         }
     }
@@ -135,6 +137,19 @@ pub fn load_in(dir: &Path, key: &[u8]) -> anyhow::Result<State> {
     Err(anyhow!(
         "state.json failed HMAC verification (new and legacy formats)"
     ))
+}
+
+/// Fold any legacy per-day allowance ledger rows into break history, once, on
+/// the way out of every successful load.
+///
+/// Applied at the load boundary rather than at each read site so the rest of
+/// the daemon only ever sees one ledger — `State::breaks`. The legacy vec is
+/// drained, so the next save writes it empty and this is a no-op forever
+/// after; `absorb_legacy_allowance` is itself idempotent, so calling it on a
+/// state that has already been migrated costs nothing.
+fn absorbed(mut state: State) -> State {
+    state.absorb_legacy_allowance();
+    state
 }
 
 /// Persist state atomically. Caller must hold the runtime state lock.
@@ -187,7 +202,7 @@ pub fn save_in(dir: &Path, state: &State, key: &[u8]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grepfocus_core::{Block, LockMode};
+    use grepfocus_core::{AllowanceLedger, Block, LockMode};
 
     fn sample_state() -> State {
         State {
@@ -233,6 +248,46 @@ mod tests {
         assert!(!dir.path().join(STATE_MAC_SIDECAR).exists());
         let raw = fs::read(dir.path().join(STATE_JSON)).unwrap();
         assert!(raw.len() > 32);
+    }
+
+    // Upgrading over a state file written by a pre-policy daemon: the legacy
+    // per-day rows must arrive as break history, with their `day` intact, so a
+    // block that is MID-BLOCK across the upgrade sees the same spend it saw
+    // before. The legacy vec is drained, so the next save writes it empty.
+    #[test]
+    fn load_absorbs_legacy_allowance_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = b"absorb-legacy-key-0123456789abcd";
+        let mut st = sample_state();
+        st.allowance = vec![
+            AllowanceLedger {
+                block_id: 1,
+                day: 20_000,
+                used_secs: 300,
+            },
+            AllowanceLedger {
+                block_id: 2,
+                day: 19_999,
+                used_secs: 120,
+            },
+        ];
+        save_in(dir.path(), &st, key).unwrap();
+
+        let loaded = load_in(dir.path(), key).unwrap();
+        assert!(loaded.allowance.is_empty(), "legacy vec must be drained");
+        assert_eq!(loaded.breaks.len(), 2);
+        let r = loaded.breaks.iter().find(|r| r.block_id == 1).unwrap();
+        assert_eq!(r.day, 20_000);
+        assert_eq!(r.secs, 300);
+        // start_unix 0 keeps folded rows out of every rolling window while
+        // their day still counts against a per-day budget.
+        assert_eq!(r.start_unix, 0);
+
+        // Idempotent across a save/load cycle: no duplicate history.
+        save_in(dir.path(), &loaded, key).unwrap();
+        let again = load_in(dir.path(), key).unwrap();
+        assert_eq!(again.breaks.len(), 2);
+        assert!(again.allowance.is_empty());
     }
 
     #[test]

@@ -310,6 +310,24 @@ pub struct AllowanceView {
     pub next_free_secs: u64,
 }
 
+/// One active block's allowance, as reported by `GetStatus`.
+///
+/// The daemon computes this so raw break history never reaches a client and
+/// window arithmetic is never reimplemented outside core. It supersedes the
+/// deprecated `Response::Status::allowance_used`, which is a bare per-day
+/// counter and cannot express a rolling window at all.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowanceStatus {
+    pub block_id: u64,
+    /// The ACTIVATION SNAPSHOT's policy, not the saved block's — what the
+    /// running block will actually be granted under.
+    pub policy: AllowancePolicy,
+    /// Flattened, so the view's fields sit directly alongside `block_id` and
+    /// `policy` on the wire rather than nested under a `view` key.
+    #[serde(flatten)]
+    pub view: AllowanceView,
+}
+
 /// Reduce break history under a policy. Pure: `now` and `today` are supplied
 /// by the caller, exactly as `reconcile` already does.
 ///
@@ -966,10 +984,20 @@ pub enum Response {
         /// set, or an unlock window is active).
         #[serde(default)]
         unlocked: bool,
-        /// Today's break-allowance ledger entries for the active blocks, so the
-        /// client can show remaining allowance per block.
+        /// DEPRECATED: today's break-allowance ledger entries for the active
+        /// blocks. Superseded by `allowance`, which carries the policy and a
+        /// full [`AllowanceView`]; this is now DERIVED from break history
+        /// (today's rows summed per active block) purely so a client built
+        /// against a pre-policy daemon keeps rendering identical numbers. New
+        /// clients must read `allowance`. Do not remove.
         #[serde(default)]
         allowance_used: Vec<AllowanceLedger>,
+        /// Per-active-block allowance under the block's activation-snapshot
+        /// policy. `#[serde(default)]` matters in the other direction too: a
+        /// NEW client talking to an OLD daemon must get an empty vec and fall
+        /// back to `allowance_used`, not a parse error.
+        #[serde(default)]
+        allowance: Vec<AllowanceStatus>,
         /// Whether a license token is stored — even one that is currently
         /// invalid or expired (`license_present && !license_valid` is how
         /// the GUI can tell "trial expired" from "never licensed").
@@ -1090,6 +1118,64 @@ mod tests {
             }
             other => panic!("expected Status, got {other:?}"),
         }
+    }
+
+    // New GUI → OLD daemon: a Status frame without `allowance` must still
+    // deserialize to an empty vec, so the client can fall back to the
+    // deprecated `allowance_used` instead of failing the whole read.
+    #[test]
+    fn status_without_allowance_still_deserializes() {
+        let old = r#"{
+            "result": "status",
+            "active": [],
+            "now_unix": 1752192000,
+            "password_set": false,
+            "unlocked": true,
+            "allowance_used": [{"block_id": 7, "day": 20000, "used_secs": 120}]
+        }"#;
+        let resp: Response = serde_json::from_str(old).unwrap();
+        match resp {
+            Response::Status {
+                allowance,
+                allowance_used,
+                ..
+            } => {
+                assert!(allowance.is_empty());
+                assert_eq!(allowance_used.len(), 1);
+                assert_eq!(allowance_used[0].used_secs, 120);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    // Pin the FLATTENED field names: the view's fields must sit directly
+    // alongside block_id/policy, not nested under a "view" key. A client reads
+    // `s.remaining_secs`, so renaming or nesting them is a wire break.
+    #[test]
+    fn allowance_status_flattens_the_view() {
+        let s = AllowanceStatus {
+            block_id: 7,
+            policy: AllowancePolicy::RollingWindow {
+                secs: 300,
+                window_secs: 3600,
+            },
+            view: AllowanceView {
+                budget_secs: 300,
+                remaining_secs: 120,
+                next_free_unix: Some(1752192000),
+                next_free_secs: 180,
+            },
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["block_id"], 7);
+        assert_eq!(json["policy"]["kind"], "rolling_window");
+        assert_eq!(json["budget_secs"], 300);
+        assert_eq!(json["remaining_secs"], 120);
+        assert_eq!(json["next_free_unix"], 1752192000u64);
+        assert_eq!(json["next_free_secs"], 180);
+        assert!(json.get("view").is_none(), "view must be flattened");
+        let back: AllowanceStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(back, s);
     }
 
     // Pin the wire name: `#[serde(tag = "method", rename_all = "snake_case")]`
@@ -2062,6 +2148,7 @@ mod tests {
             password_set: false,
             unlocked: true,
             allowance_used: vec![],
+            allowance: vec![],
             license_present: true,
             license_valid: true,
             license_kind: Some("perpetual".into()),

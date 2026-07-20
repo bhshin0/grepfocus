@@ -18,8 +18,8 @@ use std::time::Duration;
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
 use grepfocus_core::license::features;
 use grepfocus_core::{
-    day_set, now_unix, ActiveBlock, FocusSession, Origin, Originator, PomodoroPhase,
-    PomodoroSession, Schedule, State, UsageStats,
+    day_set, now_unix, prune_breaks, ActiveBlock, FocusSession, Origin, Originator, PomodoroPhase,
+    PomodoroSession, Schedule, State, UsageStats, MAX_ALLOWANCE_WINDOW_SECS,
 };
 use tracing::{error, info, warn};
 
@@ -226,7 +226,7 @@ fn advance_pomodoro(
 }
 
 /// Bring `st.active` into agreement with wall-clock expiry and the schedule
-/// table, and prune stale allowance-ledger entries. Pure over its inputs (no
+/// table, and prune unreachable break history. Pure over its inputs (no
 /// clock, no IO) so it can be unit-tested. Returns whether anything changed and
 /// the state therefore needs persisting.
 ///
@@ -240,8 +240,9 @@ fn advance_pomodoro(
 ///    `gates.app_blocking` into `apps_enforced`.
 /// 4. Clear breaks that have elapsed (enforcement resumes).
 ///
-/// It also prunes allowance-ledger rows from days other than `today`, and
-/// `skipped_fires` entries whose window has passed.
+/// It also prunes break-history records no allowance policy can still see
+/// (retention only — the daily reset lives in the reducers' `day == today`
+/// filter), and `skipped_fires` entries whose window has passed.
 fn reconcile(
     st: &mut State,
     now_unix: u64,
@@ -379,13 +380,19 @@ fn reconcile(
         }
     }
 
-    // Prune break-allowance ledger entries from previous days (resets the
-    // daily allowance). This needs a save but not a re-apply on its own.
-    let before = st.allowance.len();
-    st.allowance.retain(|l| l.day == today);
-    let ledger_pruned = st.allowance.len() != before;
+    // Retention on break history: drop records no policy can still see. This
+    // is purely a memory bound — the DAILY RESET now lives in the reducers'
+    // `day == today` filter, not here. That is strictly more robust than the
+    // old "prune everything from previous days" scheme: a daemon that was
+    // asleep or stopped across midnight used to depend on this tick running
+    // to hand back a fresh per-day budget, and a reducer that filters by day
+    // itself simply cannot over-credit whether the tick fired or not.
+    // Needs a save, but not a re-apply on its own.
+    let before = st.breaks.len();
+    prune_breaks(&mut st.breaks, now_unix, today, MAX_ALLOWANCE_WINDOW_SECS);
+    let breaks_pruned = st.breaks.len() != before;
 
-    changed || ledger_pruned
+    changed || breaks_pruned
 }
 
 /// Split `active` into `(kept, dropped)` by `keep`. A partition rather than a
@@ -454,7 +461,7 @@ fn compute_window_end_unix(s: &Schedule, now: &DateTime<Local>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grepfocus_core::{AllowanceLedger, Block, LockMode, DAY_MON};
+    use grepfocus_core::{Block, BreakRecord, LockMode, DAY_MON};
 
     fn s(start: u16, dur: u16, days: u8) -> Schedule {
         Schedule {
@@ -744,20 +751,33 @@ mod tests {
     }
 
     #[test]
-    fn prunes_old_allowance_rows() {
+    fn prunes_break_history_on_the_tick() {
         let now_l = t(9, 30, chrono::Weekday::Mon);
         let now = unix(&now_l);
         let today = day_of(&now_l);
         let mut st = State::default();
-        st.allowance.push(AllowanceLedger {
+        // Older than the longest permitted window AND from another day: the
+        // only combination no policy can still see.
+        st.breaks.push(BreakRecord {
             block_id: 0,
+            start_unix: now - MAX_ALLOWANCE_WINDOW_SECS - 60,
+            secs: 100,
             day: today - 1,
-            used_secs: 100,
         });
-        st.allowance.push(AllowanceLedger {
+        // Yesterday but still inside the window (a break just before local
+        // midnight) — a rolling policy still counts it, so it must survive.
+        st.breaks.push(BreakRecord {
             block_id: 0,
+            start_unix: now - 60,
+            secs: 50,
+            day: today - 1,
+        });
+        // Today's own row, kept by the day condition regardless of age.
+        st.breaks.push(BreakRecord {
+            block_id: 0,
+            start_unix: now - MAX_ALLOWANCE_WINDOW_SECS - 30,
+            secs: 25,
             day: today,
-            used_secs: 50,
         });
         let changed = reconcile(
             &mut st,
@@ -767,9 +787,36 @@ mod tests {
             &all_gates(),
             &mut HashSet::new(),
         );
+        // Pruning alone contributes to `changed`, exactly as the ledger
+        // retain used to, so the tick still persists the shrunken history.
         assert!(changed);
-        assert_eq!(st.allowance.len(), 1);
-        assert_eq!(st.allowance[0].day, today);
+        assert_eq!(st.breaks.len(), 2);
+        assert!(st.breaks.iter().any(|r| r.secs == 50));
+        assert!(st.breaks.iter().any(|r| r.secs == 25));
+    }
+
+    #[test]
+    fn reconcile_reports_unchanged_when_nothing_is_pruned() {
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let today = day_of(&now_l);
+        let mut st = State::default();
+        st.breaks.push(BreakRecord {
+            block_id: 0,
+            start_unix: now - 60,
+            secs: 50,
+            day: today,
+        });
+        let changed = reconcile(
+            &mut st,
+            now,
+            &now_l,
+            today,
+            &all_gates(),
+            &mut HashSet::new(),
+        );
+        assert!(!changed);
+        assert_eq!(st.breaks.len(), 1);
     }
 
     // ── session recording (B2.b) ────────────────────────────────────────────

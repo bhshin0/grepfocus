@@ -120,6 +120,11 @@ async fn get_status() -> Result<StatusOut, String> {
             license_expires_at,
             licensed_features,
             pomodoro,
+            // The new `allowance` field is deliberately not surfaced yet: this
+            // GUI still renders from the deprecated `allowance_used`, which
+            // the daemon keeps emitting with identical numbers. Wiring
+            // `StatusOut.allowance` through is its own change.
+            ..
         } => Ok(StatusOut {
             active,
             now_unix,
