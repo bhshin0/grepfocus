@@ -288,6 +288,182 @@ pub fn prune_breaks(breaks: &mut Vec<BreakRecord>, now: u64, today: i64, max_win
     }
 }
 
+/// What a policy currently grants a block: the reduction of break history
+/// under an [`AllowancePolicy`], at one instant.
+///
+/// Computed by [`evaluate_allowance`] and shared by every consumer, so the
+/// status read and the break grant can never disagree about what is left.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowanceView {
+    /// The policy's budget per its own period. `0` means breaks are off.
+    pub budget_secs: u64,
+    /// How much of that budget is available right now.
+    pub remaining_secs: u64,
+    /// When more allowance appears, for the policies where that is a knowable
+    /// instant. `None` for `Disabled`, for `PerDay` (local midnight — the
+    /// client says "tomorrow" without needing a timestamp) and for `PerBreak`
+    /// (which never depletes).
+    pub next_free_unix: Option<u64>,
+    /// How much allowance returns at `next_free_unix`, ties summed. `0`
+    /// whenever `next_free_unix` is `None`. Required to render "3 min now,
+    /// 2 more at 10:14" — the instant alone cannot say how much.
+    pub next_free_secs: u64,
+}
+
+/// Reduce break history under a policy. Pure: `now` and `today` are supplied
+/// by the caller, exactly as `reconcile` already does.
+///
+/// Lives in core rather than the daemon because the status read needs the same
+/// arithmetic as the break grant — the [`UsageStats::compute_streak`]
+/// precedent for pure reducers over persisted history.
+pub fn evaluate_allowance(
+    policy: &AllowancePolicy,
+    breaks: &[BreakRecord],
+    block_id: u64,
+    now: u64,
+    today: i64,
+) -> AllowanceView {
+    match *policy {
+        AllowancePolicy::Disabled => AllowanceView::default(),
+
+        AllowancePolicy::PerDay { secs } => {
+            let used: u64 = breaks
+                .iter()
+                .filter(|r| r.block_id == block_id && r.day == today)
+                .map(|r| r.secs)
+                .sum();
+            AllowanceView {
+                budget_secs: secs,
+                remaining_secs: secs.saturating_sub(used),
+                next_free_unix: None,
+                next_free_secs: 0,
+            }
+        }
+
+        // Consults no history at all: every break is the same size, and the
+        // friction that makes that meaningful is the LOCK, not the budget.
+        AllowancePolicy::PerBreak { secs } => AllowanceView {
+            budget_secs: secs,
+            remaining_secs: secs,
+            next_free_unix: None,
+            next_free_secs: 0,
+        },
+
+        AllowancePolicy::RollingWindow { secs, window_secs } => {
+            // Saturating: a backwards clock jump must not underflow into a
+            // horizon near u64::MAX, which would count nothing and hand out
+            // free allowance.
+            let horizon = now.saturating_sub(window_secs);
+            // Strict `>`: a record sitting exactly on the boundary has left
+            // the window. This is also what keeps legacy `start_unix == 0`
+            // rows (see `State::absorb_legacy_allowance`) out of every window.
+            let counted = breaks
+                .iter()
+                .filter(|r| r.block_id == block_id && r.start_unix > horizon);
+
+            let mut used = 0u64;
+            let mut next_free_unix: Option<u64> = None;
+            let mut next_free_secs = 0u64;
+            for r in counted {
+                used = used.saturating_add(r.secs);
+                // The oldest counted record is the first to age out, and it
+                // frees its own `secs` when it does. Ties sum.
+                let expires = r.start_unix.saturating_add(window_secs);
+                match next_free_unix {
+                    Some(e) if e < expires => {}
+                    Some(e) if e == expires => next_free_secs += r.secs,
+                    _ => {
+                        next_free_unix = Some(expires);
+                        next_free_secs = r.secs;
+                    }
+                }
+            }
+            AllowanceView {
+                budget_secs: secs,
+                remaining_secs: secs.saturating_sub(used),
+                next_free_unix,
+                next_free_secs,
+            }
+        }
+    }
+}
+
+/// Compute the grantable break length (seconds) for a break request, capped by
+/// both the policy's remaining allowance and the block's remaining time.
+///
+/// The four checks run in this order deliberately: it is the order the daily
+/// allowance has always used, so the accept path and every error string stay
+/// byte-identical for `PerDay` blocks.
+pub fn compute_grant(
+    policy: &AllowancePolicy,
+    breaks: &[BreakRecord],
+    block_id: u64,
+    ends_at: u64,
+    now: u64,
+    today: i64,
+    requested: u64,
+) -> Result<u64, &'static str> {
+    let view = evaluate_allowance(policy, breaks, block_id, now, today);
+    if view.budget_secs == 0 {
+        return Err("this block has no break allowance");
+    }
+    if view.remaining_secs == 0 {
+        // Deliberately clock-free wording on the rolling arm: saying "until
+        // 10:14" here would drag `chrono::Local` into a pure helper. The
+        // client formats `AllowanceView::next_free_unix` itself.
+        return Err(match policy {
+            AllowancePolicy::RollingWindow { .. } => {
+                "no break allowance left in the current window"
+            }
+            _ => "no break allowance left today",
+        });
+    }
+    // A break can never outlive the block, so never charge for time past its end.
+    if ends_at <= now {
+        return Err("this block has already ended");
+    }
+    let grant = requested.min(view.remaining_secs).min(ends_at - now);
+    if grant == 0 {
+        return Err("break length must be at least 1 second");
+    }
+    Ok(grant)
+}
+
+/// Reject policies that cannot mean anything useful, returning a user-facing
+/// message. `None` means the policy is saveable.
+pub fn validate_policy(p: &AllowancePolicy) -> Option<&'static str> {
+    match *p {
+        AllowancePolicy::Disabled => None,
+        AllowancePolicy::PerDay { secs } | AllowancePolicy::PerBreak { secs } => {
+            // A zero budget on a policy that claims to grant breaks is a
+            // configuration mistake; "no breaks" has its own kind.
+            if secs == 0 {
+                return Some("break allowance must be at least 1 second — choose \"no breaks\" to disable breaks entirely");
+            }
+            if secs > 24 * 3600 {
+                return Some("break allowance cannot exceed 24 hours");
+            }
+            None
+        }
+        AllowancePolicy::RollingWindow { secs, window_secs } => {
+            if secs == 0 {
+                return Some("break allowance must be at least 1 second — choose \"no breaks\" to disable breaks entirely");
+            }
+            // Bounded above by how far break history is retained, and below by
+            // a minute so the window is something a person can perceive.
+            if !(60..=MAX_ALLOWANCE_WINDOW_SECS).contains(&window_secs) {
+                return Some("break window must be between 1 minute and 24 hours");
+            }
+            // A budget larger than its own window can never bind — the window
+            // would expire before the budget could be spent.
+            if secs > window_secs {
+                return Some("break allowance cannot exceed its own window");
+            }
+            None
+        }
+    }
+}
+
 /// A recurring weekly schedule that automatically activates a block during a
 /// daily time window on selected weekdays.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1252,6 +1428,350 @@ mod tests {
         assert_eq!(st.allowance.len(), 1);
         st.absorb_legacy_allowance();
         assert_eq!(st.breaks, vec![brk(1, 0, 300, 42)]);
+    }
+
+    // ── allowance reducers ──────────────────────────────────────────────────
+
+    const HOUR: u64 = 3600;
+
+    fn rolling(secs: u64, window_secs: u64) -> AllowancePolicy {
+        AllowancePolicy::RollingWindow { secs, window_secs }
+    }
+
+    #[test]
+    fn evaluate_disabled_is_all_zero() {
+        let v = evaluate_allowance(&AllowancePolicy::Disabled, &[], 1, 1000, 42);
+        assert_eq!(v, AllowanceView::default());
+        assert_eq!(v.next_free_unix, None);
+    }
+
+    #[test]
+    fn evaluate_per_day_sums_todays_rows_for_this_block() {
+        let breaks = vec![
+            brk(1, 1000, 120, 42),
+            brk(1, 2000, 60, 42),
+            brk(1, 500, 999, 41),  // yesterday
+            brk(2, 1000, 999, 42), // another block
+        ];
+        let v = evaluate_allowance(&AllowancePolicy::PerDay { secs: 600 }, &breaks, 1, 5000, 42);
+        assert_eq!(v.budget_secs, 600);
+        assert_eq!(v.remaining_secs, 420);
+        assert_eq!(v.next_free_unix, None);
+        assert_eq!(v.next_free_secs, 0);
+    }
+
+    #[test]
+    fn evaluate_per_day_saturates_when_overspent() {
+        let breaks = vec![brk(1, 1000, 900, 42)];
+        let v = evaluate_allowance(&AllowancePolicy::PerDay { secs: 600 }, &breaks, 1, 5000, 42);
+        assert_eq!(v.remaining_secs, 0);
+    }
+
+    // PerBreak never reduces: ten recorded breaks change nothing.
+    #[test]
+    fn evaluate_per_break_ignores_history() {
+        let policy = AllowancePolicy::PerBreak { secs: 300 };
+        let empty = evaluate_allowance(&policy, &[], 1, 1000, 42);
+        let breaks: Vec<BreakRecord> = (0..10).map(|i| brk(1, 1000 + i * 60, 300, 42)).collect();
+        let after = evaluate_allowance(&policy, &breaks, 1, 10_000, 42);
+        assert_eq!(empty, after);
+        assert_eq!(after.budget_secs, 300);
+        assert_eq!(after.remaining_secs, 300);
+        assert_eq!(after.next_free_unix, None);
+    }
+
+    // The window boundary is strict: a record at exactly `now - window` has
+    // left, one a second later has not.
+    #[test]
+    fn evaluate_rolling_boundary_is_exclusive() {
+        let now = 100_000u64;
+        let at_boundary = vec![brk(1, now - HOUR, 300, 42)];
+        let v = evaluate_allowance(&rolling(300, HOUR), &at_boundary, 1, now, 42);
+        assert_eq!(v.remaining_secs, 300, "boundary record has left the window");
+        assert_eq!(v.next_free_unix, None);
+
+        let just_inside = vec![brk(1, now - HOUR + 1, 300, 42)];
+        let v = evaluate_allowance(&rolling(300, HOUR), &just_inside, 1, now, 42);
+        assert_eq!(v.remaining_secs, 0);
+        assert_eq!(v.next_free_unix, Some(now + 1));
+        assert_eq!(v.next_free_secs, 300);
+    }
+
+    #[test]
+    fn evaluate_rolling_next_free_sums_ties() {
+        let now = 100_000u64;
+        let breaks = vec![
+            brk(1, now - 1800, 60, 42),
+            brk(1, now - 1800, 90, 42), // same instant: ties sum
+            brk(1, now - 600, 30, 42),  // later, so not the next to free
+        ];
+        let v = evaluate_allowance(&rolling(300, HOUR), &breaks, 1, now, 42);
+        assert_eq!(v.remaining_secs, 300 - 180);
+        assert_eq!(v.next_free_unix, Some(now - 1800 + HOUR));
+        assert_eq!(v.next_free_secs, 150);
+    }
+
+    // A folded legacy ledger row (`start_unix == 0`) must never count against
+    // a window it carries no timing for — but it still counts for the day.
+    #[test]
+    fn evaluate_legacy_zero_start_counts_per_day_only() {
+        let breaks = vec![brk(1, 0, 300, 42)];
+        let v = evaluate_allowance(&rolling(300, HOUR), &breaks, 1, 100_000, 42);
+        assert_eq!(v.remaining_secs, 300, "never counts against a window");
+        assert_eq!(v.next_free_unix, None);
+
+        let v = evaluate_allowance(
+            &AllowancePolicy::PerDay { secs: 600 },
+            &breaks,
+            1,
+            100_000,
+            42,
+        );
+        assert_eq!(v.remaining_secs, 300, "but does count for the day");
+    }
+
+    // Over a FIXED history, used can only fall as now advances — records age
+    // out of the window and never back into it.
+    #[test]
+    fn evaluate_rolling_usage_is_monotone_in_now() {
+        let base = 100_000u64;
+        let breaks = vec![
+            brk(1, base, 60, 42),
+            brk(1, base + 600, 60, 42),
+            brk(1, base + 1200, 60, 42),
+        ];
+        let policy = rolling(600, HOUR);
+        // Start at the newest record, so every later `now` only ages rows out.
+        let start = base + 1200;
+        let mut last_used = u64::MAX;
+        for step in 0..40u64 {
+            let v = evaluate_allowance(&policy, &breaks, 1, start + step * 120, 42);
+            let used = v.budget_secs - v.remaining_secs;
+            assert!(
+                used <= last_used,
+                "used rose at step {step}: {last_used} -> {used}"
+            );
+            last_used = used;
+        }
+        assert_eq!(last_used, 0, "everything eventually ages out");
+    }
+
+    // A clock rolled back before the window length must saturate, not
+    // underflow into a horizon that counts nothing.
+    #[test]
+    fn evaluate_rolling_survives_a_clock_rollback() {
+        let breaks = vec![brk(1, 10, 300, 42)];
+        let v = evaluate_allowance(&rolling(300, HOUR), &breaks, 1, 100, 42);
+        assert_eq!(v.remaining_secs, 0, "rollback must not free allowance");
+        assert_eq!(v.next_free_unix, Some(10 + HOUR));
+    }
+
+    // ── compute_grant (ported from the daemon, against the new signature) ────
+
+    #[test]
+    fn grant_errors_without_allowance() {
+        assert_eq!(
+            compute_grant(&AllowancePolicy::Disabled, &[], 1, 2000, 1000, 42, 60),
+            Err("this block has no break allowance")
+        );
+    }
+
+    #[test]
+    fn grant_errors_when_exhausted_per_day() {
+        let policy = AllowancePolicy::PerDay { secs: 600 };
+        let breaks = vec![brk(1, 100, 600, 42)];
+        assert_eq!(
+            compute_grant(&policy, &breaks, 1, 2000, 1000, 42, 60),
+            Err("no break allowance left today")
+        );
+        // Saturating: spent beyond the budget still reads as exhausted.
+        let breaks = vec![brk(1, 100, 700, 42)];
+        assert_eq!(
+            compute_grant(&policy, &breaks, 1, 2000, 1000, 42, 60),
+            Err("no break allowance left today")
+        );
+    }
+
+    // The rolling exhaustion message is its own string, and deliberately
+    // carries no wall-clock time.
+    #[test]
+    fn grant_errors_when_exhausted_in_window() {
+        let breaks = vec![brk(1, 900, 300, 42)];
+        assert_eq!(
+            compute_grant(&rolling(300, HOUR), &breaks, 1, 5000, 1000, 42, 60),
+            Err("no break allowance left in the current window")
+        );
+    }
+
+    #[test]
+    fn grant_errors_when_block_ended() {
+        let policy = AllowancePolicy::PerDay { secs: 600 };
+        assert_eq!(
+            compute_grant(&policy, &[], 1, 1000, 1000, 42, 60),
+            Err("this block has already ended")
+        );
+        assert_eq!(
+            compute_grant(&policy, &[], 1, 999, 1000, 42, 60),
+            Err("this block has already ended")
+        );
+        // Same on the other kinds.
+        assert_eq!(
+            compute_grant(&rolling(300, HOUR), &[], 1, 999, 1000, 42, 60),
+            Err("this block has already ended")
+        );
+        assert_eq!(
+            compute_grant(
+                &AllowancePolicy::PerBreak { secs: 300 },
+                &[],
+                1,
+                999,
+                1000,
+                42,
+                60
+            ),
+            Err("this block has already ended")
+        );
+    }
+
+    #[test]
+    fn grant_errors_on_zero_request() {
+        for policy in [
+            AllowancePolicy::PerDay { secs: 600 },
+            rolling(300, HOUR),
+            AllowancePolicy::PerBreak { secs: 300 },
+        ] {
+            assert_eq!(
+                compute_grant(&policy, &[], 1, 2000, 1000, 42, 0),
+                Err("break length must be at least 1 second"),
+                "for {policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grant_capped_by_remaining_allowance() {
+        // remaining = 600 - 590 = 10; block time is ample.
+        let breaks = vec![brk(1, 100, 590, 42)];
+        assert_eq!(
+            compute_grant(
+                &AllowancePolicy::PerDay { secs: 600 },
+                &breaks,
+                1,
+                1_000_000,
+                1000,
+                42,
+                100
+            ),
+            Ok(10)
+        );
+        // Same cap through the window arm.
+        let breaks = vec![brk(1, 900, 290, 42)];
+        assert_eq!(
+            compute_grant(&rolling(300, HOUR), &breaks, 1, 1_000_000, 1000, 42, 100),
+            Ok(10)
+        );
+    }
+
+    #[test]
+    fn grant_capped_by_remaining_block_time() {
+        // block ends in 5s; allowance is ample.
+        assert_eq!(
+            compute_grant(
+                &AllowancePolicy::PerDay { secs: 600 },
+                &[],
+                1,
+                1005,
+                1000,
+                42,
+                100
+            ),
+            Ok(5)
+        );
+    }
+
+    #[test]
+    fn grant_uses_request_when_smallest() {
+        assert_eq!(
+            compute_grant(
+                &AllowancePolicy::PerDay { secs: 600 },
+                &[],
+                1,
+                1_000_000,
+                1000,
+                42,
+                30
+            ),
+            Ok(30)
+        );
+    }
+
+    // PerBreak grants the same amount however much history there is.
+    #[test]
+    fn grant_per_break_is_unaffected_by_history() {
+        let policy = AllowancePolicy::PerBreak { secs: 300 };
+        let breaks: Vec<BreakRecord> = (0..10).map(|i| brk(1, 1000 + i, 300, 42)).collect();
+        assert_eq!(
+            compute_grant(&policy, &breaks, 1, 1_000_000, 5000, 42, 300),
+            Ok(300)
+        );
+    }
+
+    // ── validate_policy ─────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_policy_accepts_sane_policies() {
+        for p in [
+            AllowancePolicy::Disabled,
+            AllowancePolicy::PerDay { secs: 1 },
+            AllowancePolicy::PerDay { secs: 24 * 3600 },
+            AllowancePolicy::PerBreak { secs: 300 },
+            rolling(1, 60),
+            rolling(300, HOUR),
+            rolling(MAX_ALLOWANCE_WINDOW_SECS, MAX_ALLOWANCE_WINDOW_SECS),
+        ] {
+            assert_eq!(validate_policy(&p), None, "should accept {p:?}");
+        }
+    }
+
+    #[test]
+    fn validate_policy_rejects_zero_budgets() {
+        for p in [
+            AllowancePolicy::PerDay { secs: 0 },
+            AllowancePolicy::PerBreak { secs: 0 },
+            rolling(0, HOUR),
+        ] {
+            let msg = validate_policy(&p).unwrap_or_else(|| panic!("should reject {p:?}"));
+            assert!(msg.contains("no breaks"), "steer to \"no breaks\": {msg}");
+        }
+    }
+
+    #[test]
+    fn validate_policy_rejects_out_of_range_budgets_and_windows() {
+        assert_eq!(
+            validate_policy(&AllowancePolicy::PerDay {
+                secs: 24 * 3600 + 1
+            }),
+            Some("break allowance cannot exceed 24 hours")
+        );
+        assert_eq!(
+            validate_policy(&AllowancePolicy::PerBreak {
+                secs: 24 * 3600 + 1
+            }),
+            Some("break allowance cannot exceed 24 hours")
+        );
+        assert_eq!(
+            validate_policy(&rolling(30, 59)),
+            Some("break window must be between 1 minute and 24 hours")
+        );
+        assert_eq!(
+            validate_policy(&rolling(30, MAX_ALLOWANCE_WINDOW_SECS + 1)),
+            Some("break window must be between 1 minute and 24 hours")
+        );
+        // A budget bigger than its own window can never bind.
+        assert_eq!(
+            validate_policy(&rolling(3601, HOUR)),
+            Some("break allowance cannot exceed its own window")
+        );
     }
 
     // ── usage stats (B2.b) ──────────────────────────────────────────────────
