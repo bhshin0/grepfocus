@@ -194,7 +194,14 @@ details[open] summary { margin-bottom: 10px; }
 /* Per-card edit form: set it off from the card's action row above it. */
 .block-card details.edit { margin-top: 8px; border-top: 1px solid var(--border); }
 
-#schedule-list { list-style: none; padding: 0; display: grid; gap: 10px; margin-bottom: 16px; }
+/* Nested schedules: same treatment as the edit disclosure beside it. */
+.block-card details.sched { margin-top: 8px; border-top: 1px solid var(--border); }
+.block-card .sched-list { list-style: none; padding: 0; display: grid; gap: 10px; margin: 0 0 10px; }
+.block-card .sched-count { color: var(--muted); font-size: 13px; }
+
+/* The schedule dialog carries a day picker and a handful of inputs; give it
+   the block form's width rather than the 360px default. */
+#schedule-dialog { max-width: 460px; }
 form label > input[type="checkbox"] { width: auto; margin-right: 6px; }
 
 /* Settings: lock state */

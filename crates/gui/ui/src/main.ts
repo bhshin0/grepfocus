@@ -132,7 +132,6 @@ tabs.forEach((btn) => {
     if (target === "new") refreshLockWarning();
     if (target === "list") refreshList();
     if (target === "status") refreshStatus();
-    if (target === "schedules") refreshSchedules();
     if (target === "pomodoro") refreshPomodoro();
     if (target === "stats") refreshStats();
     if (target === "settings") refreshSettings();
@@ -299,17 +298,30 @@ async function refreshList() {
     // their edit form disabled rather than letting the user fill it in and
     // then meet a refusal. A failed status read is not fatal here — fall back
     // to no active blocks and let the daemon have the last word on save.
-    const [blocks, active] = await Promise.all([
+    //
+    // Schedules ride along for the same reason they now live inside the cards:
+    // a schedule has no meaning apart from the block it drives. Storage is
+    // still one flat list keyed by `block_id`, so grouping happens here.
+    const [blocks, active, schedules] = await Promise.all([
       invoke<Block[]>("list_blocks"),
       invoke<Status>("get_status")
         .then((s) => new Set(s.active.map((a) => a.block.id)))
         .catch(() => new Set<number>()),
+      invoke<Schedule[]>("list_schedules"),
     ]);
     if (blocks.length === 0) {
       listEl.appendChild(emptyLi('No saved blocks yet. Create one in "New block".'));
       return;
     }
-    for (const b of blocks) listEl.appendChild(renderBlockCard(b, active.has(b.id)));
+    const byBlock = new Map<number, Schedule[]>();
+    for (const s of schedules) {
+      const list = byBlock.get(s.block_id);
+      if (list) list.push(s);
+      else byBlock.set(s.block_id, [s]);
+    }
+    for (const b of blocks) {
+      listEl.appendChild(renderBlockCard(b, active.has(b.id), byBlock.get(b.id) ?? []));
+    }
   } catch (e) {
     listMsg.classList.add("error");
     listMsg.textContent = String(e);
@@ -362,7 +374,7 @@ function blockPolicy(b: Block): AllowancePolicy {
     : { kind: "none" };
 }
 
-function renderBlockCard(b: Block, isActive: boolean): HTMLLIElement {
+function renderBlockCard(b: Block, isActive: boolean, schedules: Schedule[]): HTMLLIElement {
   const li = document.createElement("li");
   li.className = "block-card";
   li.innerHTML = `
@@ -372,6 +384,7 @@ function renderBlockCard(b: Block, isActive: boolean): HTMLLIElement {
       <input type="number" class="duration" min="1" value="30" /> min
       <button class="start-btn">Start</button>
       <button class="delete-btn">Delete</button>
+      <span class="sched-count"></span>
     </div>
     <details class="edit">
       <summary>Edit</summary>
@@ -408,6 +421,11 @@ function renderBlockCard(b: Block, isActive: boolean): HTMLLIElement {
         <button type="submit" class="save-btn">Save changes</button>
         <p class="msg edit-msg"></p>
       </form>
+    </details>
+    <details class="sched">
+      <summary class="sched-summary"></summary>
+      <ul class="sched-list"></ul>
+      <button type="button" class="add-sched-btn ghost">+ Add schedule</button>
     </details>
   `;
   li.querySelector("h3")!.textContent = b.name;
@@ -486,7 +504,39 @@ function renderBlockCard(b: Block, isActive: boolean): HTMLLIElement {
       editMsg.textContent = String(e);
     }
   });
+
+  // ── Schedules ──
+  // Rendered for EVERY block, licensed or not. Schedules are premium, but the
+  // gate is the daemon's (`MSG_SCHEDULES` on add/update); hiding the control
+  // would leave a free user unable to see what the feature even is, and
+  // pre-emptively disabling the button would duplicate a decision the daemon
+  // owns. The dialog carries the hint; the daemon carries the refusal.
+  const schedCount = li.querySelector<HTMLElement>(".sched-count")!;
+  // Sits beside Delete because `DeleteBlock` refuses a block a schedule
+  // references — nesting is what finally makes that constraint legible before
+  // the user clicks rather than after.
+  schedCount.textContent = schedules.length > 0 ? `· ${scheduleCountLabel(schedules)}` : "";
+  li.querySelector<HTMLElement>(".sched-summary")!.textContent =
+    `Schedules (${schedules.length})`;
+  const schedList = li.querySelector<HTMLUListElement>(".sched-list")!;
+  if (schedules.length === 0) {
+    schedList.appendChild(emptyLi("No schedules for this block yet."));
+  } else {
+    for (const s of schedules) schedList.appendChild(renderScheduleRow(s));
+  }
+  li.querySelector<HTMLButtonElement>(".add-sched-btn")!.addEventListener("click", () => {
+    openScheduleDialog({ mode: "add", blockId: b.id }, b.name);
+  });
   return li;
+}
+
+/// "1 schedule" / "3 schedules", with the disabled ones called out — a block
+/// referenced only by disabled schedules still cannot be deleted.
+function scheduleCountLabel(schedules: Schedule[]): string {
+  const n = schedules.length;
+  const off = schedules.filter((s) => !s.enabled).length;
+  const base = `${n} schedule${n === 1 ? "" : "s"}`;
+  return off > 0 ? `${base} (${off} disabled)` : base;
 }
 
 // ─── Status (now a list of active blocks) ──────────────────────────────────
@@ -927,51 +977,25 @@ challengeDialog.addEventListener("cancel", (ev) => {
 
 const DAY_LABEL = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
-const schedListEl = document.querySelector<HTMLUListElement>("#schedule-list")!;
+const schedDialog = document.querySelector<HTMLDialogElement>("#schedule-dialog")!;
 const schedForm = document.querySelector<HTMLFormElement>("#schedule-form")!;
 const schedMsg = document.querySelector<HTMLParagraphElement>("#schedule-msg")!;
-const schedDetails = document.querySelector<HTMLDetailsElement>("#schedule-form-details")!;
 const schedCancel = document.querySelector<HTMLButtonElement>("#schedule-cancel")!;
-const schedBlockSelect = schedForm.querySelector<HTMLSelectElement>('select[name="block_id"]')!;
+const schedTitle = document.querySelector<HTMLElement>("#schedule-dialog-title")!;
+const schedBlockLine = document.querySelector<HTMLElement>("#schedule-dialog-block")!;
 
-async function refreshSchedules() {
-  schedMsg.classList.remove("error");
-  schedMsg.textContent = "";
-  schedListEl.innerHTML = "";
-  try {
-    const [schedules, blocks] = await Promise.all([
-      invoke<Schedule[]>("list_schedules"),
-      invoke<Block[]>("list_blocks"),
-    ]);
-    // Populate block <select>
-    schedBlockSelect.innerHTML = "";
-    if (blocks.length === 0) {
-      const opt = document.createElement("option");
-      opt.disabled = true;
-      opt.textContent = "(create a block first)";
-      schedBlockSelect.appendChild(opt);
-    }
-    for (const b of blocks) {
-      const opt = document.createElement("option");
-      opt.value = String(b.id);
-      opt.textContent = b.name;
-      schedBlockSelect.appendChild(opt);
-    }
-    if (schedules.length === 0) {
-      schedListEl.appendChild(emptyLi("No schedules yet. Add one below."));
-      return;
-    }
-    const blockNames = new Map(blocks.map((b) => [b.id, b.name] as const));
-    for (const s of schedules) {
-      schedListEl.appendChild(renderScheduleCard(s, blockNames.get(s.block_id) ?? `#${s.block_id}`));
-    }
-  } catch (e) {
-    schedMsg.classList.add("error");
-    schedMsg.textContent = String(e);
-  }
-}
+/// Why the dialog was opened. This replaces the old `id === 0` sentinel: add
+/// and edit are different intents, and reading them back out of a form field
+/// meant the wire value and the control flow were the same variable. `id`
+/// survives as a hidden input purely as `update_schedule`'s wire value.
+type SchedIntent = { mode: "add"; blockId: number } | { mode: "edit"; sched: Schedule };
 
-function renderScheduleCard(s: Schedule, blockName: string): HTMLLIElement {
+/// The intent the currently-open dialog was opened with. Null when closed.
+let schedIntent: SchedIntent | null = null;
+
+/// One schedule inside its block's card. This is the old standalone schedule
+/// card minus the block-name prefix, which nesting makes redundant.
+function renderScheduleRow(s: Schedule): HTMLLIElement {
   const li = document.createElement("li");
   li.className = `block-card${s.enabled ? "" : " disabled"}`;
   const days: string[] = [];
@@ -991,68 +1015,103 @@ function renderScheduleCard(s: Schedule, blockName: string): HTMLLIElement {
     </div>
   `;
   li.querySelector("h3")!.textContent = s.name + (s.enabled ? "" : "  (disabled)");
-  li.querySelector(".meta")!.textContent = `${blockName} · ${days.join(", ") || "no days"} · ${start}–${end}`;
+  li.querySelector(".meta")!.textContent =
+    `${days.join(", ") || "no days"} · ${start}–${end}`;
   const toggle = li.querySelector<HTMLButtonElement>(".toggle-btn")!;
   toggle.textContent = s.enabled ? "Disable" : "Enable";
+  // Row actions report into the block list's message line, not the dialog's:
+  // the dialog is closed while a row is being toggled or deleted.
   toggle.addEventListener("click", async () => {
+    listMsg.classList.remove("error");
     if (!(await ensureUnlocked())) return;
     try {
       await invoke("update_schedule", { schedule: { ...s, enabled: !s.enabled } });
-      refreshSchedules();
+      refreshList();
     } catch (e) {
-      schedMsg.classList.add("error");
-      schedMsg.textContent = String(e);
+      listMsg.classList.add("error");
+      listMsg.textContent = String(e);
     }
   });
   li.querySelector<HTMLButtonElement>(".edit-btn")!.addEventListener("click", () => {
-    loadIntoForm(s);
+    openScheduleDialog({ mode: "edit", sched: s });
   });
   li.querySelector<HTMLButtonElement>(".delete-btn")!.addEventListener("click", async () => {
+    listMsg.classList.remove("error");
     if (!(await ensureUnlocked())) return;
     try {
       await invoke("delete_schedule", { id: s.id });
-      refreshSchedules();
+      refreshList();
     } catch (e) {
-      schedMsg.classList.add("error");
-      schedMsg.textContent = String(e);
+      listMsg.classList.add("error");
+      listMsg.textContent = String(e);
     }
   });
   return li;
 }
 
-function loadIntoForm(s: Schedule) {
-  schedDetails.open = true;
-  (schedForm.querySelector('input[name="id"]') as HTMLInputElement).value = String(s.id);
-  (schedForm.querySelector('input[name="name"]') as HTMLInputElement).value = s.name;
-  schedBlockSelect.value = String(s.block_id);
-  schedForm.querySelectorAll<HTMLInputElement>('input[name="day"]').forEach((cb) => {
-    cb.checked = (s.days & (1 << Number(cb.value))) !== 0;
-  });
-  (schedForm.querySelector('input[name="start_time"]') as HTMLInputElement).value =
-    `${String(Math.floor(s.start_minute / 60)).padStart(2, "0")}:${String(s.start_minute % 60).padStart(2, "0")}`;
-  (schedForm.querySelector('input[name="duration_hours"]') as HTMLInputElement).value = String(
-    Math.round((s.duration_minutes / 60) * 100) / 100,
-  );
-  (schedForm.querySelector('input[name="enabled"]') as HTMLInputElement).checked = s.enabled;
-}
-
-function resetForm() {
+/// Open the shared dialog on an explicit intent. Every open starts from the
+/// markup defaults via `form.reset()` — the dialog outlives the card that
+/// opened it, so without that a second open would inherit whatever the first
+/// left behind (a previous block's days, or an edit's name on a fresh add).
+///
+/// `blockName` is cosmetic, and only known when adding: the edit path already
+/// has the schedule and the card above it says which block this is.
+function openScheduleDialog(intent: SchedIntent, blockName?: string) {
+  schedIntent = intent;
   schedForm.reset();
-  (schedForm.querySelector('input[name="id"]') as HTMLInputElement).value = "";
-  schedDetails.open = false;
   schedMsg.classList.remove("error");
   schedMsg.textContent = "";
+  const idInput = schedForm.querySelector<HTMLInputElement>('input[name="id"]')!;
+  const nameInput = schedForm.querySelector<HTMLInputElement>('input[name="name"]')!;
+
+  if (intent.mode === "edit") {
+    const s = intent.sched;
+    schedTitle.textContent = "Edit schedule";
+    schedBlockLine.textContent = "";
+    schedBlockLine.hidden = true;
+    idInput.value = String(s.id);
+    nameInput.value = s.name;
+    // Bit d = day d, 0 = Sunday … 6 = Saturday.
+    schedForm.querySelectorAll<HTMLInputElement>('input[name="day"]').forEach((cb) => {
+      cb.checked = (s.days & (1 << Number(cb.value))) !== 0;
+    });
+    schedForm.querySelector<HTMLInputElement>('input[name="start_time"]')!.value =
+      `${String(Math.floor(s.start_minute / 60)).padStart(2, "0")}:${String(s.start_minute % 60).padStart(2, "0")}`;
+    schedForm.querySelector<HTMLInputElement>('input[name="duration_hours"]')!.value = String(
+      Math.round((s.duration_minutes / 60) * 100) / 100,
+    );
+    schedForm.querySelector<HTMLInputElement>('input[name="enabled"]')!.checked = s.enabled;
+  } else {
+    schedTitle.textContent = "New schedule";
+    schedBlockLine.textContent = blockName ? `Block: ${blockName}` : "";
+    schedBlockLine.hidden = !blockName;
+    // reset() already restored the markup defaults; `id` has no wire meaning
+    // on an add, and the daemon assigns the real one.
+    idInput.value = "";
+  }
+  schedDialog.showModal();
+  nameInput.focus();
 }
 
-schedCancel.addEventListener("click", resetForm);
+function closeScheduleDialog() {
+  schedIntent = null;
+  if (schedDialog.open) schedDialog.close();
+}
+
+schedCancel.addEventListener("click", closeScheduleDialog);
+// Esc-dismissal → cancel, same as the unlock and challenge dialogs.
+schedDialog.addEventListener("cancel", (ev) => {
+  ev.preventDefault();
+  closeScheduleDialog();
+});
 
 schedForm.addEventListener("submit", async (ev) => {
   ev.preventDefault();
+  const intent = schedIntent;
+  if (!intent) return;
   schedMsg.classList.remove("error");
   schedMsg.textContent = "";
   const fd = new FormData(schedForm);
-  const idRaw = String(fd.get("id") ?? "");
-  const id = idRaw === "" ? 0 : Number(idRaw);
   let days = 0;
   schedForm.querySelectorAll<HTMLInputElement>('input[name="day"]:checked').forEach((cb) => {
     days |= 1 << Number(cb.value);
@@ -1061,14 +1120,15 @@ schedForm.addEventListener("submit", async (ev) => {
   const [hh, mm] = time.split(":").map((n) => parseInt(n, 10));
   const start_minute = (hh || 0) * 60 + (mm || 0);
   const duration_minutes = Math.round(Number(fd.get("duration_hours") ?? 0) * 60);
-  const block_id = Number(schedBlockSelect.value);
-  const enabled = (schedForm.querySelector('input[name="enabled"]') as HTMLInputElement).checked;
+  const enabled = schedForm.querySelector<HTMLInputElement>('input[name="enabled"]')!.checked;
   const name = String(fd.get("name") ?? "").trim();
 
+  // The block is whichever card opened the dialog — never a user choice, which
+  // is why there is no block <select> any more. On an edit it must not move.
   const schedule: Schedule = {
-    id,
+    id: intent.mode === "edit" ? intent.sched.id : 0,
     name,
-    block_id,
+    block_id: intent.mode === "edit" ? intent.sched.block_id : intent.blockId,
     days,
     start_minute,
     duration_minutes,
@@ -1076,14 +1136,18 @@ schedForm.addEventListener("submit", async (ev) => {
   };
   if (!(await ensureUnlocked())) return;
   try {
-    if (id === 0) {
+    // Branch on the intent, not on `id === 0`: the mode is known at open time
+    // and does not need to be inferred from a field's contents.
+    if (intent.mode === "add") {
       await invoke("add_schedule", { schedule });
     } else {
       await invoke("update_schedule", { schedule });
     }
-    resetForm();
-    refreshSchedules();
+    closeScheduleDialog();
+    refreshList();
   } catch (e) {
+    // Premium refusals (`MSG_SCHEDULES`) land here verbatim, with the dialog
+    // still open so the entered schedule is not lost.
     schedMsg.classList.add("error");
     schedMsg.textContent = String(e);
   }
