@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use grepfocus_core::{
-    ActiveBlock, AllowanceLedger, Block, DayStat, FocusSession, LifetimeTotals, PomodoroStatus,
-    Request, Response, Schedule,
+    ActiveBlock, AllowanceLedger, AllowanceStatus, Block, DayStat, FocusSession, LifetimeTotals,
+    PomodoroStatus, Request, Response, Schedule,
 };
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -28,6 +28,21 @@ async fn list_blocks() -> Result<Vec<Block>, String> {
 async fn add_block(block: Block) -> Result<u64, String> {
     match client::call(Request::AddBlock { block }).await? {
         Response::Added { id } => Ok(id),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+/// Save an edited block. The daemon refuses this while the block is ACTIVE
+/// ("cannot edit a block while it is active") so that a running block's
+/// allowance and lock cannot be softened mid-flight; the frontend disables its
+/// edit form for active blocks rather than inviting that refusal. It also
+/// normalizes the allowance policy and its legacy mirror on save, so a client
+/// frame need only be coherent, not canonical.
+#[tauri::command]
+async fn update_block(block: Block) -> Result<(), String> {
+    match client::call(Request::UpdateBlock { block }).await? {
+        Response::Ok {} => Ok(()),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),
     }
@@ -94,6 +109,12 @@ struct StatusOut {
     now_unix: u64,
     password_set: bool,
     unlocked: bool,
+    /// Per-active-block allowance: the policy plus the reduction of break
+    /// history under it. The path the frontend reads.
+    allowance: Vec<AllowanceStatus>,
+    /// DEPRECATED, still carried: a bare per-day counter that cannot express a
+    /// rolling window. Kept so the frontend has a fallback when talking to a
+    /// daemon old enough not to emit `allowance` at all.
     allowance_used: Vec<AllowanceLedger>,
     license_present: bool,
     license_valid: bool,
@@ -112,6 +133,7 @@ async fn get_status() -> Result<StatusOut, String> {
             now_unix,
             password_set,
             unlocked,
+            allowance,
             allowance_used,
             license_present,
             license_valid,
@@ -120,16 +142,12 @@ async fn get_status() -> Result<StatusOut, String> {
             license_expires_at,
             licensed_features,
             pomodoro,
-            // The new `allowance` field is deliberately not surfaced yet: this
-            // GUI still renders from the deprecated `allowance_used`, which
-            // the daemon keeps emitting with identical numbers. Wiring
-            // `StatusOut.allowance` through is its own change.
-            ..
         } => Ok(StatusOut {
             active,
             now_unix,
             password_set,
             unlocked,
+            allowance,
             allowance_used,
             license_present,
             license_valid,
@@ -480,6 +498,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_blocks,
             add_block,
+            update_block,
             delete_block,
             start_block,
             get_status,

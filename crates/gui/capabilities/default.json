@@ -11,6 +11,7 @@
     "notification:default",
     "allow-list-blocks",
     "allow-add-block",
+    "allow-update-block",
     "allow-delete-block",
     "allow-start-block",
     "allow-get-status",

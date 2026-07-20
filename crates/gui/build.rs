@@ -3,6 +3,7 @@ fn main() {
         tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(&[
             "list_blocks",
             "add_block",
+            "update_block",
             "delete_block",
             "start_block",
             "get_status",
