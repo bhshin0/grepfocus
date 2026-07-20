@@ -139,7 +139,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             let mut allowance: Vec<AllowanceStatus> = Vec::new();
             for a in st.active.iter() {
                 let block_id = a.block.id;
-                let policy = a.block.policy();
+                let policy = a.policy();
                 allowance.push(AllowanceStatus {
                     block_id,
                     view: evaluate_allowance(&policy, &st.breaks, block_id, now, today),
@@ -315,6 +315,11 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                     // check here — the lock was licensed when it was SAVED;
                     // a lapsed license must not weaken a running block.
                     lock: block.lock,
+                    // Snapshot the allowance policy for the same reason and
+                    // by the same doctrine: a mid-block edit must never
+                    // change the budget a running block has already been
+                    // spending against.
+                    allowance: Some(block.policy()),
                     block,
                     started_at_unix: now,
                     ends_at_unix: now.saturating_add(duration_secs),
@@ -372,7 +377,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                             if a.break_until_unix.is_some_and(|t| t > now) {
                                 return err("this block is already on a break");
                             }
-                            (a.block.policy(), a.ends_at_unix, a.lock)
+                            (a.policy(), a.ends_at_unix, a.lock)
                         }
                         None => return err(format!("block {block_id} is not active")),
                     };
@@ -788,6 +793,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 });
                 st.active.push(ActiveBlock {
                     lock: block.lock,
+                    allowance: Some(block.policy()),
                     block,
                     started_at_unix: now,
                     ends_at_unix: now.saturating_add(span),
@@ -1251,7 +1257,7 @@ mod tests {
     /// An active record whose embedded block carries `policy`.
     fn active_with_policy(block_id: u64, policy: AllowancePolicy) -> ActiveBlock {
         let mut b = blk(block_id, vec![]);
-        b.set_policy(policy);
+        b.set_policy(policy.clone());
         ActiveBlock {
             block: b,
             started_at_unix: 0,
@@ -1260,6 +1266,7 @@ mod tests {
             break_until_unix: None,
             apps_enforced: false,
             lock: LockMode::Unlocked,
+            allowance: Some(policy),
         }
     }
 
@@ -1378,6 +1385,52 @@ mod tests {
         }
     }
 
+    // TakeBreak reads the ACTIVATION SNAPSHOT, never the embedded block. Here
+    // the snapshot says "no breaks" while the embedded block says 600s/day —
+    // the divergence a relaxed mid-block edit would produce. The refusal is
+    // `compute_grant`'s environment-independent "no allowance" error, so this
+    // proves the read site without touching the real state dir.
+    #[tokio::test]
+    async fn take_break_reads_the_snapshot_not_the_embedded_block() {
+        let daemon = test_daemon();
+        {
+            let mut st = daemon.state.lock().await;
+            let mut a = active_with_policy(1, AllowancePolicy::PerDay { secs: 600 });
+            a.allowance = Some(AllowancePolicy::Disabled);
+            st.active.push(a);
+        }
+        let resp = dispatch(
+            Request::TakeBreak {
+                block_id: 1,
+                secs: 60,
+                challenge: None,
+            },
+            &daemon,
+        )
+        .await;
+        assert_eq!(err_msg(resp), "this block has no break allowance");
+    }
+
+    // GetStatus reads the snapshot too, so the status view and the grant can
+    // never disagree about which policy is in force.
+    #[tokio::test]
+    async fn status_reads_the_snapshot_not_the_embedded_block() {
+        let daemon = test_daemon();
+        {
+            let mut st = daemon.state.lock().await;
+            let mut a = active_with_policy(1, AllowancePolicy::PerDay { secs: 600 });
+            a.allowance = Some(AllowancePolicy::PerBreak { secs: 120 });
+            st.active.push(a);
+        }
+        match dispatch(Request::GetStatus {}, &daemon).await {
+            Response::Status { allowance, .. } => {
+                assert_eq!(allowance[0].policy, AllowancePolicy::PerBreak { secs: 120 });
+                assert_eq!(allowance[0].view.budget_secs, 120);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
     /// The KAT fixture minted by the real web-side signer (see
     /// crates/core/tests/license_kat.rs for provenance/regeneration).
     fn kat() -> serde_json::Value {
@@ -1477,6 +1530,7 @@ mod tests {
             ends_at_unix: u64::MAX,
             originator: Originator::Manual,
             break_until_unix: None,
+            allowance: None,
             apps_enforced: false,
             lock,
         }
@@ -2276,6 +2330,7 @@ mod tests {
             ends_at_unix: u64::MAX,
             originator: Originator::Pomodoro,
             break_until_unix: None,
+            allowance: None,
             apps_enforced: false,
             lock: LockMode::Unlocked,
         }

@@ -221,6 +221,27 @@ pub struct ActiveBlock {
     /// records written before this field existed.
     #[serde(default)]
     pub lock: LockMode,
+    /// The block's break-allowance policy, SNAPSHOTTED at activation from the
+    /// saved block — exactly like `apps_enforced` and `lock`. A mid-block edit
+    /// must never change a running block's break budget. `None` on records
+    /// written before this field existed; read via [`ActiveBlock::policy`],
+    /// which falls back to the embedded block.
+    #[serde(default)]
+    pub allowance: Option<AllowancePolicy>,
+}
+
+impl ActiveBlock {
+    /// The policy this running block is actually granted under.
+    ///
+    /// Prefers the activation snapshot and falls back to the embedded block's
+    /// own policy, which is what a record written before the snapshot existed
+    /// carries — and which, for such a record, IS the policy that was in force
+    /// at activation, since a block cannot be edited while active.
+    pub fn policy(&self) -> AllowancePolicy {
+        self.allowance
+            .clone()
+            .unwrap_or_else(|| self.block.policy())
+    }
 }
 
 fn default_originator() -> Originator {
@@ -1118,6 +1139,60 @@ mod tests {
             }
             other => panic!("expected Status, got {other:?}"),
         }
+    }
+
+    // Records written before the snapshot existed carry no `allowance`, and
+    // must fall back to the embedded block's policy — which for such a record
+    // IS what was in force at activation, since a block cannot be edited while
+    // active.
+    #[test]
+    fn active_block_without_allowance_falls_back_to_the_block() {
+        let old = r#"{
+            "block": {
+                "id": 1,
+                "name": "reddit",
+                "domains": ["reddit.com"],
+                "apps": [],
+                "allowance_secs_per_day": 600,
+                "lock": "normal"
+            },
+            "started_at_unix": 1000,
+            "ends_at_unix": 2000
+        }"#;
+        let a: ActiveBlock = serde_json::from_str(old).unwrap();
+        assert_eq!(a.allowance, None);
+        assert_eq!(a.policy(), AllowancePolicy::PerDay { secs: 600 });
+    }
+
+    // The snapshot WINS over the embedded block: that is the entire point.
+    // Editing the saved block cannot retroactively change the budget a
+    // running block has already been spending against.
+    #[test]
+    fn active_block_snapshot_beats_a_later_block_edit() {
+        let mut block = Block {
+            id: 1,
+            name: "reddit".into(),
+            domains: vec![],
+            apps: vec![],
+            allowance_secs_per_day: 0,
+            allowance: None,
+            lock: LockMode::Unlocked,
+        };
+        block.set_policy(AllowancePolicy::PerDay { secs: 600 });
+        let mut a = ActiveBlock {
+            allowance: Some(block.policy()),
+            block,
+            started_at_unix: 1000,
+            ends_at_unix: 2000,
+            originator: Originator::Manual,
+            break_until_unix: None,
+            apps_enforced: false,
+            lock: LockMode::Unlocked,
+        };
+        // Simulate a mid-block edit landing on the embedded block.
+        a.block.set_policy(AllowancePolicy::PerDay { secs: 36_000 });
+        assert_eq!(a.policy(), AllowancePolicy::PerDay { secs: 600 });
+        assert_eq!(a.block.policy(), AllowancePolicy::PerDay { secs: 36_000 });
     }
 
     // New GUI → OLD daemon: a Status frame without `allowance` must still

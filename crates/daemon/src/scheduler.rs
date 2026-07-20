@@ -354,6 +354,9 @@ fn reconcile(
             // never soften a running block's break rules. No license check —
             // the lock was licensed when it was SAVED.
             lock: block.lock,
+            // Snapshotted with it, same doctrine: a mid-block edit must never
+            // change the budget a running block has already spent against.
+            allowance: Some(block.policy()),
             block,
             started_at_unix: now_unix,
             ends_at_unix,
@@ -461,7 +464,7 @@ fn compute_window_end_unix(s: &Schedule, now: &DateTime<Local>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grepfocus_core::{Block, BreakRecord, LockMode, DAY_MON};
+    use grepfocus_core::{AllowancePolicy, Block, BreakRecord, LockMode, DAY_MON};
 
     fn s(start: u16, dur: u16, days: u8) -> Schedule {
         Schedule {
@@ -543,6 +546,7 @@ mod tests {
             ends_at_unix,
             originator: Originator::Manual,
             break_until_unix: None,
+            allowance: None,
             apps_enforced: false,
             lock: LockMode::Unlocked,
         }
@@ -555,6 +559,7 @@ mod tests {
             ends_at_unix,
             originator: Originator::Schedule { schedule_id },
             break_until_unix: None,
+            allowance: None,
             apps_enforced: false,
             lock: LockMode::Unlocked,
         }
@@ -748,6 +753,39 @@ mod tests {
         );
         assert!(!changed);
         assert_eq!(st.active[0].break_until_unix, Some(now + 30));
+    }
+
+    // Activation site 3 of 3: a schedule fire snapshots the saved block's
+    // allowance policy onto the new active record, like `lock` and
+    // `apps_enforced` beside it.
+    #[test]
+    fn schedule_fire_snapshots_the_allowance_policy() {
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let mut st = State::default();
+        let mut b = block(0);
+        b.set_policy(AllowancePolicy::RollingWindow {
+            secs: 300,
+            window_secs: 3600,
+        });
+        st.blocks.push(b);
+        st.schedules.push(s(540, 60, DAY_MON));
+        assert!(reconcile(
+            &mut st,
+            now,
+            &now_l,
+            day_of(&now_l),
+            &all_gates(),
+            &mut HashSet::new()
+        ));
+        assert_eq!(st.active.len(), 1);
+        assert_eq!(
+            st.active[0].allowance,
+            Some(AllowancePolicy::RollingWindow {
+                secs: 300,
+                window_secs: 3600,
+            })
+        );
     }
 
     #[test]
@@ -1063,6 +1101,7 @@ mod tests {
             ends_at_unix,
             originator: Originator::Pomodoro,
             break_until_unix: None,
+            allowance: None,
             apps_enforced: false,
             lock: LockMode::Unlocked,
         }

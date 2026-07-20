@@ -287,6 +287,7 @@ mod tests {
             ends_at_unix: u64::MAX,
             originator: Originator::Manual,
             break_until_unix,
+            allowance: None,
             apps_enforced,
             lock: LockMode::Unlocked,
         }
