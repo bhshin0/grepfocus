@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 
 mod auth;
 mod cleanup;
+mod dns;
 mod enforce;
 mod hosts;
 mod ipc;

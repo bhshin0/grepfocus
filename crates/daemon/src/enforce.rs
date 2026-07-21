@@ -23,7 +23,7 @@ use grepfocus_core::license::features;
 use grepfocus_core::{now_unix, ActiveBlock};
 use tracing::{debug, info, warn};
 
-use crate::{has_feature, hosts, nftables, Daemon};
+use crate::{dns, has_feature, hosts, nftables, Daemon};
 
 /// How long a live-system verification stays fresh. While a domain block is
 /// active, a memo-hit `sync` older than this re-probes the nft table and the
@@ -117,8 +117,21 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
             warn!("enforcement drift detected — re-applying");
         }
     }
+    // `applied` still holds the PREVIOUS union here — it is only replaced on
+    // the success branch below — so this is the last point at which we can
+    // tell a real enforcement change from a drift re-apply.
+    let changed = union_changed(applied.as_ref().map(|p| p.domains.as_slice()), &domains);
     match apply(&domains, tamper_protect) {
         Ok(nft_ok) => {
+            // Only after the change actually landed, and only when the set of
+            // blocked domains really moved: a drift re-apply rewrites
+            // /etc/hosts with an identical union, so no cached lookup can
+            // have gone stale and there is nothing to flush. Best-effort and
+            // infallible — see the dns module docs for what it can't fix
+            // (browsers cache DNS internally for about a minute).
+            if changed {
+                dns::flush_caches();
+            }
             *applied = Some(Applied {
                 domains,
                 verified_at: now,
@@ -145,6 +158,28 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
 /// so a stepped clock self-corrects within one interval.
 fn needs_probe(domains: &[String], verified_at: u64, now: u64) -> bool {
     !domains.is_empty() && now.abs_diff(verified_at) >= REVERIFY_SECS
+}
+
+/// Whether an apply is changing *what* is enforced, rather than re-asserting
+/// what already was. Decides one thing only: whether to flush the system DNS
+/// cache (`dns::flush_caches`), which is worth doing exactly when a name's
+/// resolution is about to change — a break starting or ending, a block
+/// starting or expiring.
+///
+/// A drift re-apply is deliberately excluded: it rewrites `/etc/hosts` with a
+/// byte-identical domain set, so no resolver answer can have gone stale and a
+/// flush would be pure cost. Since the periodic probe can re-apply as often as
+/// every `REVERIFY_SECS` while a block is active, treating drift as a change
+/// would flush the cache of a machine that is enforcing perfectly.
+///
+/// No memo (`None`) counts as a change. That is the first apply after daemon
+/// start or after a failed apply cleared the memo, and in neither case do we
+/// know what the resolver is holding — a daemon restarted across a break
+/// boundary is precisely the case where the cache is stale and nothing in
+/// memory says so. The cost of being wrong is one redundant flush per daemon
+/// start.
+fn union_changed(previous: Option<&[String]>, next: &[String]) -> bool {
+    previous.is_none_or(|prev| prev != next)
 }
 
 /// Deduplicated, sorted union of all domains across the active blocks that are
@@ -224,6 +259,28 @@ mod tests {
     fn empty_union_never_probes() {
         // Nothing enforced, nothing to verify — even arbitrarily stale.
         assert!(!needs_probe(&[], 0, u64::MAX));
+    }
+
+    /// The DNS flush must fire on every real transition — block start, block
+    /// expiry, break start, break end — and never on a drift re-apply, which
+    /// re-writes the same union.
+    #[test]
+    fn union_changed_only_on_real_transitions() {
+        let one = one_domain();
+        let two = vec!["news.example".to_string(), "reddit.com".to_string()];
+        // Drift re-apply: same union, nothing can have gone stale.
+        assert!(!union_changed(Some(&one), &one));
+        assert!(!union_changed(Some(&[]), &[]));
+        // Block start / break end (empty -> blocked) and the reverse.
+        assert!(union_changed(Some(&[]), &one));
+        assert!(union_changed(Some(&one), &[]));
+        // One of several blocks going on break, and coming back.
+        assert!(union_changed(Some(&two), &one));
+        assert!(union_changed(Some(&one), &two));
+        // No memo: daemon start, or a retry after a failed apply — we can't
+        // know what the resolver cached, so flush.
+        assert!(union_changed(None, &one));
+        assert!(union_changed(None, &[]));
     }
 
     #[test]
