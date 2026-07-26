@@ -10,8 +10,8 @@ use anyhow::Context;
 use grepfocus_core::license::{self, LicenseClaims};
 use grepfocus_core::{
     compute_grant, evaluate_allowance, now_unix, validate_policy, ActiveBlock, AllowanceLedger,
-    AllowanceStatus, AppMatcher, BreakRecord, LockMode, Originator, PomodoroPhase, PomodoroSession,
-    PomodoroStatus, Request, Response, Schedule, State,
+    AllowancePolicy, AllowanceStatus, AppMatcher, BreakRecord, LockMode, Originator, PomodoroPhase,
+    PomodoroSession, PomodoroStatus, Request, Response, Schedule, State,
 };
 use nix::unistd::Group;
 use tokio::net::{UnixListener, UnixStream};
@@ -492,12 +492,16 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 // The grant is core's reduction of break HISTORY under the
                 // policy — no per-day counter is read or maintained here any
                 // more. `st.breaks` is passed whole; each policy filters it
-                // for itself (PerBreak looks at none of it).
-                let grant =
-                    match compute_grant(&policy, &st.breaks, block_id, ends_at, now, today, secs) {
-                        Ok(g) => g,
-                        Err(msg) => return err(msg),
-                    };
+                // for itself (PerBreak looks at none of it). For a rolling
+                // window the daemon, not the client, sets the size (see
+                // effective_break_request): a rolling break is all-or-nothing.
+                let requested = effective_break_request(&policy, secs);
+                let grant = match compute_grant(
+                    &policy, &st.breaks, block_id, ends_at, now, today, requested,
+                ) {
+                    Ok(g) => g,
+                    Err(msg) => return err(msg),
+                };
 
                 // Mutate break state + history, keeping enough to roll back if
                 // the save fails. Every active entry for the block is flagged
@@ -1188,6 +1192,29 @@ fn validate_pomodoro_bounds(focus_secs: u64, break_secs: u64, cycles: u32) -> Op
     None
 }
 
+/// The break length the daemon will REQUEST for a `TakeBreak`, given the
+/// client's `secs`.
+///
+/// Honoured verbatim for every policy but `RollingWindow`, where the daemon
+/// overrides it with the policy's whole per-window budget: a rolling break is
+/// ALL-OR-NOTHING, decided here rather than by the client. A partial rolling
+/// break is a trap — after enforcement lifts, the browser keeps serving the
+/// blocked domain's cached DNS answer for up to ~60s, so a 30-second break can
+/// elapse before the site is even reachable and reads as broken. No external
+/// process can flush that cache, so the honest behaviour is to hand back the
+/// whole budget in one go.
+///
+/// This only sets the REQUEST. `compute_grant` still caps it by the remaining
+/// allowance and by the block's own remaining time (the `ends_at` cap), so a
+/// block with less time left than the budget grants — and therefore charges —
+/// only what fits. The math in `compute_grant` is untouched.
+fn effective_break_request(policy: &AllowancePolicy, requested: u64) -> u64 {
+    match *policy {
+        AllowancePolicy::RollingWindow { secs, .. } => secs,
+        _ => requested,
+    }
+}
+
 /// Append one break to history.
 ///
 /// A pure append: unlike the per-day counter it replaces, it does NOT prune.
@@ -1234,6 +1261,56 @@ mod tests {
             }
         );
         assert_eq!(breaks[2].start_unix, 5_100);
+    }
+
+    // ── rolling breaks are all-or-nothing ───────────────────────────────────
+
+    // A rolling window ignores the client's `secs` and requests the whole
+    // per-window budget; every other policy honours the client verbatim.
+    #[test]
+    fn effective_break_request_forces_full_budget_only_for_rolling() {
+        let rolling = grepfocus_core::AllowancePolicy::RollingWindow {
+            secs: 300,
+            window_secs: 3600,
+        };
+        for sent in [0, 1, 60, 300, 99_999] {
+            assert_eq!(effective_break_request(&rolling, sent), 300);
+        }
+        for policy in [
+            grepfocus_core::AllowancePolicy::PerDay { secs: 600 },
+            grepfocus_core::AllowancePolicy::PerBreak { secs: 300 },
+            grepfocus_core::AllowancePolicy::Disabled,
+        ] {
+            for sent in [0, 1, 120, 99_999] {
+                assert_eq!(effective_break_request(&policy, sent), sent);
+            }
+        }
+    }
+
+    // The whole point, composed with the unchanged compute_grant: a rolling
+    // TakeBreak grants the full budget no matter how small a `secs` the client
+    // sends, and a near-expiry block grants only what fits via compute_grant's
+    // existing ends_at cap.
+    #[test]
+    fn rolling_grants_full_budget_and_caps_at_block_end() {
+        let rolling = grepfocus_core::AllowancePolicy::RollingWindow {
+            secs: 300,
+            window_secs: 3600,
+        };
+        let now = 10_000u64;
+        let today = 0i64; // rolling ignores `day`; only start_unix matters
+
+        // Fresh window, block ends far beyond the budget: the client's tiny
+        // 60s is ignored and the whole 300s budget is granted.
+        let requested = effective_break_request(&rolling, 60);
+        let grant = compute_grant(&rolling, &[], 1, now + 100_000, now, today, requested).unwrap();
+        assert_eq!(grant, 300);
+
+        // Only 30s of block left: the forced full-budget request is capped by
+        // the ends_at cap, so it grants (and charges) only what fits.
+        let requested = effective_break_request(&rolling, 60);
+        let grant = compute_grant(&rolling, &[], 1, now + 30, now, today, requested).unwrap();
+        assert_eq!(grant, 30);
     }
 
     // ── license_status_fields() ─────────────────────────────────────────────

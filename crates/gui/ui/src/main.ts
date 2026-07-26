@@ -774,18 +774,35 @@ function renderActive(s: Status) {
         const remainingMin = Math.floor(av.remaining_secs / 60);
         const row = document.createElement("div");
         row.className = "break-row";
-        const defMin = Math.min(5, Math.max(1, remainingMin));
-        // `max` is clamped to what is actually left, not just the default
-        // value: a spinner that can be dialled up to a request the daemon is
-        // certain to refuse is a worse control than one that cannot.
-        row.innerHTML = `
-          <span class="break-budget"></span>
-          <input type="number" class="break-min" min="1" max="${Math.max(1, remainingMin)}" value="${defMin}" /> min
-          <button class="break-btn">Take a break</button>
-          <span class="break-left"></span>
-        `;
+        // A rolling break is ALL-OR-NOTHING: one click grants the whole
+        // available budget. It carries no minutes input, because a partial
+        // rolling break is eaten by the browser's own ~60s DNS cache and reads
+        // as broken — the daemon forces the request to the full budget anyway
+        // (see effective_break_request), so offering a smaller number would
+        // only mislead. `per_day` and `per_break` keep the minutes spinner.
+        const isRolling = av.policy.kind === "rolling_window";
+        if (isRolling) {
+          const takeMin = Math.max(1, remainingMin);
+          row.innerHTML = `
+            <span class="break-budget"></span>
+            <button class="break-btn">Take your ${takeMin} min break</button>
+            <span class="break-left"></span>
+          `;
+        } else {
+          const defMin = Math.min(5, Math.max(1, remainingMin));
+          // `max` is clamped to what is actually left, not just the default
+          // value: a spinner that can be dialled up to a request the daemon is
+          // certain to refuse is a worse control than one that cannot.
+          row.innerHTML = `
+            <span class="break-budget"></span>
+            <input type="number" class="break-min" min="1" max="${Math.max(1, remainingMin)}" value="${defMin}" /> min
+            <button class="break-btn">Take a break</button>
+            <span class="break-left"></span>
+          `;
+        }
         const btn = row.querySelector<HTMLButtonElement>(".break-btn")!;
-        const input = row.querySelector<HTMLInputElement>(".break-min")!;
+        // Null for a rolling row, which has no minutes input.
+        const input = row.querySelector<HTMLInputElement>(".break-min");
         const left = row.querySelector<HTMLSpanElement>(".break-left")!;
         row.querySelector<HTMLSpanElement>(".break-budget")!.textContent = budgetNote(av.policy);
 
@@ -817,7 +834,7 @@ function renderActive(s: Status) {
           // in minutes, so a sub-minute remainder cannot be spent through this
           // control and reads as exhausted. Matches the pre-policy behaviour.
           btn.disabled = true;
-          input.disabled = true;
+          if (input) input.disabled = true;
           left.textContent =
             av.policy.kind === "rolling_window" && av.next_free_unix != null
               ? `no break time left — ${nextFreeMin} min returns at ${fmtClock(av.next_free_unix)}`
@@ -832,8 +849,11 @@ function renderActive(s: Status) {
           left.textContent = `${remainingMin} min left today`;
         }
         btn.addEventListener("click", async () => {
-          const minutes = Math.max(1, parseInt(input.value, 10) || 1);
-          const secs = minutes * 60;
+          // Rolling: send the full remaining budget (honest — the daemon caps
+          // it either way). Others: whatever the minutes spinner holds.
+          const secs = isRolling
+            ? av.remaining_secs
+            : Math.max(1, parseInt(input!.value, 10) || 1) * 60;
 
           // Challenge-locked: the whole exchange happens in the dialog, which
           // sends its own take_break with the typed response.
@@ -868,6 +888,17 @@ function renderActive(s: Status) {
           }
           if (ok) refreshStatus();
         });
+
+        // One honest line about the lag: after a break lifts enforcement, the
+        // browser can keep serving the blocked domain's cached DNS answer for
+        // up to a minute, and no external process can flush it. Applies to
+        // every break policy, so it lives on every row.
+        const hint = document.createElement("span");
+        hint.className = "break-hint";
+        hint.textContent =
+          "A break can take up to a minute to take effect in a tab that's already open — reload the page if it doesn't.";
+        row.appendChild(hint);
+
         div.appendChild(row);
       }
     }
