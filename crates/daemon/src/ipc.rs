@@ -225,6 +225,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 license_expires_at: lic.expires_at,
                 licensed_features: lic.features,
                 pomodoro,
+                settings: st.settings.clone(),
             }
         }
 
@@ -919,6 +920,24 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 ));
             }
             info!("pomodoro stopped");
+            Response::Ok {}
+        }
+
+        // Replace the preferences wholesale, mutate-with-rollback like the
+        // other config arms. Settings-lock gated (a locked user must unlock
+        // to change preferences), but deliberately NOT license gated —
+        // preferences are free.
+        Request::SetSettings { settings } => {
+            let mut st = daemon.state.lock().await;
+            if let Some(resp) = gate_config(daemon, &st).await {
+                return resp;
+            }
+            let prev = st.settings.clone();
+            st.settings = settings;
+            if let Err(e) = state::save(&st, &daemon.key) {
+                st.settings = prev;
+                return err(format!("save failed: {e}"));
+            }
             Response::Ok {}
         }
     }
@@ -1761,6 +1780,28 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn set_settings_is_gated_by_the_settings_lock() {
+        // With a password set and no unlock window, SetSettings must be
+        // refused before any mutation — preferences are config, and the
+        // settings lock guards config changes. (It is NOT license gated.)
+        let daemon = test_daemon();
+        daemon.state.lock().await.password_hash =
+            Some("$argon2id$v=19$m=19456,t=2,p=1$abc$def".to_string());
+        let resp = dispatch(
+            Request::SetSettings {
+                settings: Settings {
+                    notifications: false,
+                },
+            },
+            &daemon,
+        )
+        .await;
+        assert!(err_msg(resp).contains("locked"));
+        // Refused before mutation: the default (notifications on) is intact.
+        assert!(daemon.state.lock().await.settings.notifications);
+    }
+
     // ── license gates ───────────────────────────────────────────────────────
     //
     // Rejections return before `state::save`, so they are fully testable
@@ -1769,7 +1810,7 @@ mod tests {
     // `update_needs_app_license`) instead — except where a later,
     // environment-independent error proves the gate was passed.
 
-    use grepfocus_core::{AllowancePolicy, Block, DAY_MON};
+    use grepfocus_core::{AllowancePolicy, Block, Settings, DAY_MON};
 
     fn blk(id: u64, apps: Vec<AppMatcher>) -> Block {
         Block {

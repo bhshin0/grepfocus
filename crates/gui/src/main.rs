@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use grepfocus_core::{
     ActiveBlock, AllowanceLedger, AllowanceStatus, Block, DayStat, FocusSession, LifetimeTotals,
-    PomodoroStatus, Request, Response, Schedule,
+    PomodoroStatus, Request, Response, Schedule, Settings,
 };
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -123,6 +123,9 @@ struct StatusOut {
     license_expires_at: Option<i64>,
     licensed_features: Vec<String>,
     pomodoro: Option<PomodoroStatus>,
+    /// Current cross-cutting preferences, so the frontend can render toggles
+    /// (e.g. the notifications checkbox) off the same status poll.
+    settings: Settings,
 }
 
 #[tauri::command]
@@ -142,6 +145,7 @@ async fn get_status() -> Result<StatusOut, String> {
             license_expires_at,
             licensed_features,
             pomodoro,
+            settings,
         } => Ok(StatusOut {
             active,
             now_unix,
@@ -156,6 +160,7 @@ async fn get_status() -> Result<StatusOut, String> {
             license_expires_at,
             licensed_features,
             pomodoro,
+            settings,
         }),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),
@@ -174,6 +179,18 @@ async fn set_password(old: Option<String>, new: Option<String>) -> Result<(), St
 #[tauri::command]
 async fn set_license(token: Option<String>) -> Result<(), String> {
     match client::call(Request::SetLicense { token }).await? {
+        Response::Ok {} => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+/// Replace the cross-cutting preferences. The daemon gates this behind the
+/// settings lock (so a locked user must unlock first) but never behind a
+/// license — preferences are free. A refusal surfaces to JS verbatim.
+#[tauri::command]
+async fn set_settings(settings: Settings) -> Result<(), String> {
+    match client::call(Request::SetSettings { settings }).await? {
         Response::Ok {} => Ok(()),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),
@@ -345,8 +362,10 @@ fn spawn_status_watcher(app: AppHandle) {
                 }
             }
 
-            let active = match client::call(Request::GetStatus {}).await {
-                Ok(Response::Status { active, .. }) => active,
+            let (active, settings) = match client::call(Request::GetStatus {}).await {
+                Ok(Response::Status {
+                    active, settings, ..
+                }) => (active, settings),
                 _ => {
                     // Daemon down / transient error. Surface it in the tooltip
                     // instead of leaving the stale "N active" text, but do NOT
@@ -372,15 +391,20 @@ fn spawn_status_watcher(app: AppHandle) {
                 let _ = tray.set_tooltip(Some(&tip));
             }
 
-            if let Some(prev_map) = &prev {
-                for (id, name) in &cur {
-                    if !prev_map.contains_key(id) {
-                        notify(&app, "Block started", name);
+            // Gate on the preference, but always update the baseline below —
+            // toggling notifications back on must not then replay every block
+            // that started or ended while they were off.
+            if settings.notifications {
+                if let Some(prev_map) = &prev {
+                    for (id, name) in &cur {
+                        if !prev_map.contains_key(id) {
+                            notify(&app, "Block started", name);
+                        }
                     }
-                }
-                for (id, name) in prev_map {
-                    if !cur.contains_key(id) {
-                        notify(&app, "Block ended", name);
+                    for (id, name) in prev_map {
+                        if !cur.contains_key(id) {
+                            notify(&app, "Block ended", name);
+                        }
                     }
                 }
             }
@@ -509,6 +533,7 @@ fn main() {
             delete_schedule,
             set_password,
             set_license,
+            set_settings,
             unlock,
             take_break,
             get_break_challenge,

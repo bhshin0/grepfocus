@@ -55,6 +55,11 @@ h2 { margin-top: 0; font-size: 16px; }
 
 form { display: grid; gap: 12px; max-width: 540px; }
 label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+/* A checkbox and its label sit inline, not stacked like the default grid
+   label above. Used by the settings preferences toggles. */
+label.checkbox-row { display: flex; align-items: center; gap: 8px; }
+label.checkbox-row > input[type="checkbox"] { width: auto; margin: 0; }
+#prefs { margin: 12px 0 20px; display: grid; gap: 6px; }
 input, textarea, select {
   font-family: inherit;
   font-size: 14px;

@@ -91,6 +91,13 @@ interface PomodoroStatus {
   cycles_total: number;
 }
 
+/// Mirrors core's `Settings`: cross-cutting preferences the daemon persists,
+/// echoed on every `Status`. `notifications` defaults ON server-side (a
+/// hand-written Default, so an upgrading user is never silently muted).
+interface Settings {
+  notifications: boolean;
+}
+
 interface Status {
   active: ActiveBlock[];
   now_unix: number;
@@ -107,6 +114,7 @@ interface Status {
   license_expires_at: number | null;
   licensed_features: string[];
   pomodoro: PomodoroStatus | null;
+  settings: Settings;
 }
 
 interface Schedule {
@@ -1212,6 +1220,8 @@ const pwMsg = document.querySelector<HTMLParagraphElement>("#password-msg")!;
 const oldPwLabel = document.querySelector<HTMLLabelElement>("#old-pw-label")!;
 const pwSubmit = document.querySelector<HTMLButtonElement>("#password-submit")!;
 const pwClear = document.querySelector<HTMLButtonElement>("#password-clear")!;
+const notificationsToggle = document.querySelector<HTMLInputElement>("#notifications-toggle")!;
+const prefsMsg = document.querySelector<HTMLParagraphElement>("#prefs-msg")!;
 
 const unlockDialog = document.querySelector<HTMLDialogElement>("#unlock-dialog")!;
 const unlockForm = document.querySelector<HTMLFormElement>("#unlock-form")!;
@@ -1281,8 +1291,13 @@ async function refreshSettings() {
   pwMsg.classList.remove("error");
   pwMsg.textContent = "";
   pwForm.reset();
+  prefsMsg.classList.remove("error");
+  prefsMsg.textContent = "";
   try {
     const s = await invoke<Status>("get_status");
+    // Reflect current preferences. Setting `.checked` in code does not fire a
+    // change event, so this can never re-trigger the write path below.
+    notificationsToggle.checked = s.settings.notifications;
     if (!s.password_set) {
       lockStateEl.textContent = "No settings password is set. Configuration can be changed freely.";
       lockStateEl.className = "lock-state";
@@ -1349,6 +1364,27 @@ pwClear.addEventListener("click", async () => {
   } catch (e) {
     pwMsg.classList.add("error");
     pwMsg.textContent = String(e);
+  }
+});
+
+// Apply-on-change, revert-on-refusal — the same shape the schedule Enable
+// toggle uses. The daemon gates SetSettings behind the settings lock, so a
+// cancelled unlock (or a refusal) puts the checkbox back to its prior value.
+notificationsToggle.addEventListener("change", async () => {
+  prefsMsg.classList.remove("error");
+  prefsMsg.textContent = "";
+  const desired = notificationsToggle.checked;
+  if (!(await ensureUnlocked())) {
+    notificationsToggle.checked = !desired;
+    return;
+  }
+  try {
+    await invoke("set_settings", { settings: { notifications: desired } });
+    prefsMsg.textContent = desired ? "notifications on" : "notifications off";
+  } catch (e) {
+    notificationsToggle.checked = !desired;
+    prefsMsg.classList.add("error");
+    prefsMsg.textContent = String(e);
   }
 });
 

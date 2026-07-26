@@ -22,6 +22,7 @@
     "allow-delete-schedule",
     "allow-set-password",
     "allow-set-license",
+    "allow-set-settings",
     "allow-unlock",
     "allow-take-break",
     "allow-get-break-challenge",

@@ -14,6 +14,7 @@ fn main() {
             "delete_schedule",
             "set_password",
             "set_license",
+            "set_settings",
             "unlock",
             "take_break",
             "get_break_challenge",

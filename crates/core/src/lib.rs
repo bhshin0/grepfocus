@@ -927,6 +927,35 @@ pub struct PomodoroStatus {
     pub cycles_total: u32,
 }
 
+/// Cross-cutting user preferences — the settings that are not per-block.
+///
+/// Persisted in [`State`] and echoed on `Status` so the GUI can render the
+/// current values without a second round trip. `#[serde(default)]` at the
+/// container level so a partial object (`{}`, or a future daemon's extra
+/// fields stripped) fills every missing field from [`Settings::default`]
+/// rather than from serde's per-field zero value — which for a `bool` would
+/// be `false`, the wrong default here (see the hand-written `Default`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// Desktop notifications (block start/end). Default ON, preserving
+    /// today's behaviour.
+    pub notifications: bool,
+}
+
+impl Default for Settings {
+    /// HAND-WRITTEN, deliberately not `#[derive(Default)]`: derive would give
+    /// `notifications: false`, silently disabling notifications for every
+    /// existing user the moment they upgrade to a daemon that reads this
+    /// field. The default must preserve the pre-settings behaviour, which was
+    /// notifications always on.
+    fn default() -> Self {
+        Self {
+            notifications: true,
+        }
+    }
+}
+
 /// Daemon-side persisted state.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
@@ -980,6 +1009,11 @@ pub struct State {
     /// restart (resumes on reload, like an in-flight block).
     #[serde(default)]
     pub pomodoro: Option<PomodoroSession>,
+    /// Cross-cutting user preferences. `serde(default)` so state written
+    /// before this field existed loads with the hand-written [`Settings`]
+    /// default (notifications on), never with a zeroed one.
+    #[serde(default)]
+    pub settings: Settings,
 }
 
 impl State {
@@ -1108,6 +1142,12 @@ pub enum Request {
     /// only during a break — refused while a focus interval is in progress.
     /// Ungated (like `TakeBreak`).
     StopPomodoro {},
+    /// Replace the cross-cutting user preferences wholesale. Subject to the
+    /// settings-lock discipline (like other config changes), but NOT license
+    /// gated — preferences are free.
+    SetSettings {
+        settings: Settings,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1173,6 +1213,13 @@ pub enum Response {
         /// session is running. Drives the GUI's Pomodoro banner/progress.
         #[serde(default)]
         pomodoro: Option<PomodoroStatus>,
+        /// Current cross-cutting preferences, so the GUI reads them off the
+        /// same status poll it already makes. `#[serde(default)]` in both
+        /// directions: an old daemon that never emits it leaves the client
+        /// with the hand-written default (notifications on), and a partial
+        /// object fills the same way.
+        #[serde(default)]
+        settings: Settings,
     },
     Added {
         id: u64,
@@ -1395,6 +1442,82 @@ mod tests {
 
         let json = serde_json::to_string(&Request::SetLicense { token: None }).unwrap();
         assert!(json.contains(r#""method":"set_license""#), "got {json}");
+    }
+
+    // ── settings ────────────────────────────────────────────────────────────
+
+    // The load-bearing default: notifications are ON. A #[derive(Default)]
+    // here would give `false` and silently mute every upgrading user.
+    #[test]
+    fn settings_default_has_notifications_on() {
+        assert!(Settings::default().notifications);
+    }
+
+    // Old state.json compat: a State written before `settings` existed must
+    // load with notifications ON, not the bool zero value.
+    #[test]
+    fn state_without_settings_defaults_notifications_on() {
+        let old = r#"{
+            "next_id": 1,
+            "blocks": [],
+            "active": []
+        }"#;
+        let st: State = serde_json::from_str(old).unwrap();
+        assert!(st.settings.notifications);
+    }
+
+    // A Status frame without `settings` (old daemon → new GUI) still
+    // deserializes, and the missing field fills to the ON default.
+    #[test]
+    fn status_without_settings_still_deserializes() {
+        let old = r#"{
+            "result": "status",
+            "active": [],
+            "now_unix": 1752192000,
+            "password_set": false,
+            "unlocked": true,
+            "allowance_used": []
+        }"#;
+        let resp: Response = serde_json::from_str(old).unwrap();
+        match resp {
+            Response::Status { settings, .. } => assert!(settings.notifications),
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    // A partial `{}` settings object fills `notifications` from the
+    // hand-written default (true), NOT from serde's per-field bool zero —
+    // this is what the container-level #[serde(default)] buys.
+    #[test]
+    fn partial_settings_object_fills_from_default() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(s.notifications);
+        // An explicit value is still honoured.
+        let s: Settings = serde_json::from_str(r#"{"notifications":false}"#).unwrap();
+        assert!(!s.notifications);
+    }
+
+    // Pin the SetSettings wire tag under the "method" discriminant.
+    #[test]
+    fn set_settings_wire_tag_round_trips() {
+        let req: Request =
+            serde_json::from_str(r#"{"method":"set_settings","settings":{"notifications":false}}"#)
+                .unwrap();
+        assert!(matches!(
+            req,
+            Request::SetSettings {
+                settings: Settings {
+                    notifications: false
+                }
+            }
+        ));
+        let json = serde_json::to_string(&Request::SetSettings {
+            settings: Settings {
+                notifications: true,
+            },
+        })
+        .unwrap();
+        assert!(json.contains(r#""method":"set_settings""#), "got {json}");
     }
 
     // ── lock modes (B2.a) ───────────────────────────────────────────────────
@@ -2455,6 +2578,7 @@ mod tests {
                 cycle_index: 1,
                 cycles_total: 4,
             }),
+            settings: Settings::default(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
