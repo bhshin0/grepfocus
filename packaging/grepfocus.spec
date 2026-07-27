@@ -12,7 +12,7 @@
 %global debug_package %{nil}
 
 Name:           grepfocus
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Website and app blocker for Linux
 
@@ -122,6 +122,14 @@ fi
 %dir %attr(0700,root,root) %{_sharedstatedir}/grepfocus
 
 %changelog
+* Sun Jul 26 2026 Bryan <bhshin@gmail.com> - 0.3.0-1
+- Break allowance is now a policy: none / per-day / per rolling window / per break
+- Rolling-window breaks are all-or-nothing (one break per window)
+- Schedules are edited inside each block card; the separate tab is gone
+- Settings toggle to mute block start/end notifications
+- Flush the system DNS cache when a block's enforcement changes
+- Refuse to start (rather than wipe) a state file that verifies but cannot parse
+
 * Sat Jul 18 2026 Bryan <bhshin@gmail.com> - 0.2.0-1
 - Relicense to PolyForm Shield 1.0.0 (source-available, noncompete)
 - Single binary: all premium features present, unlocked by a license key

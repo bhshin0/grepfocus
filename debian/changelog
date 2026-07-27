@@ -1,3 +1,14 @@
+grepfocus (0.3.0-1) unstable; urgency=medium
+
+  * Break allowance is now a policy: none / per-day / per rolling window / per break.
+  * Rolling-window breaks are all-or-nothing (one break per window).
+  * Schedules are edited inside each block card; the separate tab is gone.
+  * Settings toggle to mute block start/end notifications.
+  * Flush the system DNS cache when a block's enforcement changes.
+  * Refuse to start (rather than wipe) a state file that verifies but cannot parse.
+
+ -- Bryan <bhshin@gmail.com>  Sun, 26 Jul 2026 19:50:15 -0700
+
 grepfocus (0.2.0-1) unstable; urgency=medium
 
   * Relicense to PolyForm Shield 1.0.0 (source-available, noncompete).
