@@ -484,3 +484,97 @@ dialog .row { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
   cursor: not-allowed;
   opacity: 0.9;
 }
+
+/* ─── Week overview ──────────────────────────────────────────────────────── */
+
+/* One "hour" of column height; the 24h column is 24× this. A var so the grid
+   height is stated once and the axis and day columns cannot drift apart. */
+:root { --week-hour: 22px; }
+
+/* The grid scrolls sideways inside this box on a narrow window; the page body
+   never scrolls horizontally. */
+.week-scroll { overflow-x: auto; }
+
+/* A narrow time-axis column + 7 equal day columns. Header row (corner + day
+   names) and body row (axis + day columns) flow into the same 8 columns. */
+.week-grid {
+  display: grid;
+  grid-template-columns: 44px repeat(7, minmax(72px, 1fr));
+  gap: 4px;
+  min-width: 560px;
+}
+.week-head {
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  padding-bottom: 4px;
+}
+.week-axis {
+  position: relative;
+  height: calc(var(--week-hour) * 24);
+}
+.week-hour {
+  position: absolute;
+  right: 4px;
+  transform: translateY(-50%);
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.week-day {
+  position: relative;
+  height: calc(var(--week-hour) * 24);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+/* Absolutely positioned within its day column; fill + text colour are set
+   inline per block (see WEEK_PALETTE). */
+.week-window {
+  position: absolute;
+  overflow: hidden;
+  border-radius: 4px;
+  padding: 1px 4px;
+  font-size: 11px;
+  line-height: 1.25;
+  cursor: pointer;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+}
+/* Disabled schedules still occupy their slot and stay clickable, but read as
+   inactive — faded + dashed, matching .block-card.disabled in spirit. */
+.week-window.disabled {
+  opacity: 0.55;
+  border-style: dashed;
+}
+/* "Now" line across today's column. pointer-events:none so it never eats a
+   click meant for a window beneath it. */
+.week-now {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--danger);
+  pointer-events: none;
+  z-index: 2;
+}
+.week-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 14px;
+}
+.week-legend-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--fg);
+}
+.week-legend-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  display: inline-block;
+}

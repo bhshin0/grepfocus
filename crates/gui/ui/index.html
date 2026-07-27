@@ -13,6 +13,7 @@
         <button data-tab="status" class="active">Status</button>
         <button data-tab="new">New block</button>
         <button data-tab="list">Block list</button>
+        <button data-tab="week">Week</button>
         <button data-tab="pomodoro" id="pomodoro-tab-btn" hidden>Pomodoro</button>
         <button data-tab="stats" id="stats-tab-btn" hidden>Stats</button>
         <button data-tab="settings">Settings</button>
@@ -67,6 +68,12 @@
         <h2>Saved blocks</h2>
         <ul id="block-list"></ul>
         <p id="list-msg" class="msg"></p>
+      </section>
+
+      <section id="week" class="tab">
+        <h2>Week</h2>
+        <p class="hint">A read-only overview of every block's scheduled windows across the week. Click a window to edit that schedule.</p>
+        <div id="week-content"></div>
       </section>
 
       <section id="pomodoro" class="tab">

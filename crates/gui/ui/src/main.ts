@@ -139,6 +139,7 @@ tabs.forEach((btn) => {
     });
     if (target === "new") refreshLockWarning();
     if (target === "list") refreshList();
+    if (target === "week") refreshWeek();
     if (target === "status") refreshStatus();
     if (target === "pomodoro") refreshPomodoro();
     if (target === "stats") refreshStats();
@@ -1234,7 +1235,9 @@ schedForm.addEventListener("submit", async (ev) => {
       await invoke("update_schedule", { schedule });
     }
     closeScheduleDialog();
-    refreshList();
+    // Refresh both places a schedule shows: the per-block cards and, so an edit
+    // launched from the Week grid updates in place, the grid itself.
+    refreshSchedulesViews();
   } catch (e) {
     // Premium refusals (`MSG_SCHEDULES`) land here verbatim, with the dialog
     // still open so the entered schedule is not lost.
@@ -1242,6 +1245,189 @@ schedForm.addEventListener("submit", async (ev) => {
     schedMsg.textContent = String(e);
   }
 });
+
+/// After any schedule change, refresh both places schedules are shown: the
+/// per-block cards and the read-only Week grid, so an edit launched from the
+/// grid updates it in place rather than leaving a stale window behind.
+function refreshSchedulesViews() {
+  refreshList();
+  refreshWeek();
+}
+
+// ─── Week overview (read-only grid) ──────────────────────────────────────────
+
+const weekEl = document.querySelector<HTMLDivElement>("#week-content")!;
+
+/// Display columns run Mon→Sun for readability, but the wire bitmask is
+/// Sun-first (bit 0 = Sunday … bit 6 = Saturday, matching `DAY_LABEL`). This
+/// maps each display column to the bit it represents; `DAY_LABEL[bit]` then
+/// labels it, keeping the column order and the bit order from drifting apart.
+const DISPLAY_DAYS = [1, 2, 3, 4, 5, 6, 0];
+
+/// Per-block colours: eight distinct hues as {fill, text} pairs, indexed by
+/// `blockId % length`. Each fill is a light pastel with an explicit dark text
+/// colour, so the label reads on the window in BOTH light and dark themes —
+/// the window carries its own background, so no `prefers-color-scheme` branch
+/// is needed for it (unlike the CSS vars, which do have one). The legend below
+/// the grid disambiguates the rare case where two blocks share a palette slot.
+const WEEK_PALETTE: { fill: string; text: string }[] = [
+  { fill: "#cfe3ff", text: "#0b2a5b" },
+  { fill: "#cdefd6", text: "#0e3d20" },
+  { fill: "#ffe6b3", text: "#5a3d00" },
+  { fill: "#ffd6e7", text: "#5c1236" },
+  { fill: "#e2d5f8", text: "#331457" },
+  { fill: "#c9eef0", text: "#06393d" },
+  { fill: "#ffd9c2", text: "#5a2405" },
+  { fill: "#e4f0b8", text: "#35400a" },
+];
+
+/// Minutes-since-midnight → "HH:MM". A window's end can be exactly 1440 (a
+/// full-day span), rendered as "24:00" rather than wrapping to "00:00" so the
+/// end of the day is unambiguous.
+function fmtMinute(m: number): string {
+  const h = Math.floor(m / 60);
+  return `${String(h).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+}
+
+/// Rebuild the Week grid from scratch: one 7-day × 24-hour column set showing
+/// every schedule's windows, colour-coded per block. Read-only apart from
+/// click-to-edit. Mirrors `refreshList`'s fetch (degrade to empty on failure).
+async function refreshWeek() {
+  weekEl.innerHTML = "";
+  const [blocks, schedules] = await Promise.all([
+    invoke<Block[]>("list_blocks").catch(() => []),
+    invoke<Schedule[]>("list_schedules").catch(() => []),
+  ]);
+
+  if (schedules.length === 0) {
+    weekEl.appendChild(emptyDiv("No schedules yet — add one from a block's card."));
+    return;
+  }
+
+  const blockName = new Map<number, string>();
+  for (const b of blocks) blockName.set(b.id, b.name);
+
+  // Scroll the grid inside its own box: on a narrow window the grid scrolls
+  // sideways here, the page body never does.
+  const scroller = document.createElement("div");
+  scroller.className = "week-scroll";
+  const grid = document.createElement("div");
+  grid.className = "week-grid";
+
+  // Header row: an empty corner over the time axis, then one label per day
+  // column in display (Mon→Sun) order.
+  grid.appendChild(Object.assign(document.createElement("div"), { className: "week-corner" }));
+  for (const bit of DISPLAY_DAYS) {
+    const h = document.createElement("div");
+    h.className = "week-head";
+    h.textContent = DAY_LABEL[bit];
+    grid.appendChild(h);
+  }
+
+  // Time axis: an hour label every 3h (00, 03 … 21) to stay legible.
+  const axis = document.createElement("div");
+  axis.className = "week-axis";
+  for (let h = 0; h < 24; h += 3) {
+    const t = document.createElement("div");
+    t.className = "week-hour";
+    t.style.top = `${(h / 24) * 100}%`;
+    t.textContent = String(h).padStart(2, "0");
+    axis.appendChild(t);
+  }
+  grid.appendChild(axis);
+
+  const now = new Date();
+  const todayBit = now.getDay(); // 0 = Sun … 6 = Sat — matches the wire bitmask.
+  const nowMinutes = now.getHours() * 60 + now.getMinutes();
+  const usedBlockIds = new Set<number>();
+
+  for (const bit of DISPLAY_DAYS) {
+    const col = document.createElement("div");
+    col.className = "week-day";
+
+    // Every schedule firing on this weekday, earliest first.
+    const todays = schedules
+      .filter((s) => (s.days & (1 << bit)) !== 0)
+      .sort((a, b) => a.start_minute - b.start_minute);
+
+    // Lane assignment (greedy interval partition, per day column): drop each
+    // window into the first lane whose previous window has already ended
+    // (`prevEnd <= start`), else open a new lane. Windows in one lane never
+    // overlap, so laying the lanes side-by-side keeps every overlapping window
+    // visible instead of hidden behind another. `laneEnds[i]` is the end minute
+    // of the last window placed in lane i.
+    const laneEnds: number[] = [];
+    const laneOf = new Map<Schedule, number>();
+    for (const s of todays) {
+      const end = s.start_minute + s.duration_minutes;
+      let lane = laneEnds.findIndex((prevEnd) => prevEnd <= s.start_minute);
+      if (lane === -1) {
+        lane = laneEnds.length;
+        laneEnds.push(end);
+      } else {
+        laneEnds[lane] = end;
+      }
+      laneOf.set(s, lane);
+    }
+    const laneCount = Math.max(1, laneEnds.length);
+
+    for (const s of todays) {
+      usedBlockIds.add(s.block_id);
+      const lane = laneOf.get(s) ?? 0;
+      const win = document.createElement("div");
+      win.className = `week-window${s.enabled ? "" : " disabled"}`;
+      // Top/height from the day fraction; left/width from the lane split.
+      win.style.top = `${(s.start_minute / 1440) * 100}%`;
+      win.style.height = `${(s.duration_minutes / 1440) * 100}%`;
+      win.style.left = `${(lane * 100) / laneCount}%`;
+      win.style.width = `${100 / laneCount}%`;
+      const pal = WEEK_PALETTE[s.block_id % WEEK_PALETTE.length];
+      win.style.background = pal.fill;
+      win.style.color = pal.text;
+      const name = blockName.get(s.block_id) ?? `#${s.block_id}`;
+      const range = `${fmtMinute(s.start_minute)}–${fmtMinute(s.start_minute + s.duration_minutes)}`;
+      win.textContent = `${name} ${range}${s.enabled ? "" : " (off)"}`;
+      win.title = `${name} · ${DAY_LABEL[bit]} · ${range}${s.enabled ? "" : " (disabled)"}`;
+      // Reuse the exact edit entry point the block-card rows use — no new dialog.
+      win.addEventListener("click", () => {
+        openScheduleDialog({ mode: "edit", sched: s }, name);
+      });
+      col.appendChild(win);
+    }
+
+    // "Now" marker across today's column at the current local minute. A
+    // wall-clock week view wants the local clock — no `activeServerSkew`.
+    if (bit === todayBit) {
+      const line = document.createElement("div");
+      line.className = "week-now";
+      line.style.top = `${(nowMinutes / 1440) * 100}%`;
+      line.title = `Now — ${fmtMinute(nowMinutes)}`;
+      col.appendChild(line);
+    }
+
+    grid.appendChild(col);
+  }
+
+  scroller.appendChild(grid);
+  weekEl.appendChild(scroller);
+
+  // Legend: one chip per block that has at least one schedule, in config order.
+  const legend = document.createElement("div");
+  legend.className = "week-legend";
+  for (const b of blocks) {
+    if (!usedBlockIds.has(b.id)) continue;
+    const chip = document.createElement("span");
+    chip.className = "week-legend-chip";
+    const swatch = document.createElement("span");
+    swatch.className = "week-legend-swatch";
+    swatch.style.background = WEEK_PALETTE[b.id % WEEK_PALETTE.length].fill;
+    const label = document.createElement("span");
+    label.textContent = b.name;
+    chip.append(swatch, label);
+    legend.appendChild(chip);
+  }
+  weekEl.appendChild(legend);
+}
 
 // ─── Settings: password lock ────────────────────────────────────────────────
 
