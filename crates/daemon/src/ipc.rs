@@ -1404,6 +1404,7 @@ mod tests {
             key: b"ipc-test-key-0123456789abcdef012".to_vec(),
             unlocked_until: tokio::sync::Mutex::new(0),
             applied: tokio::sync::Mutex::new(None),
+            listener: tokio::sync::Mutex::new(None),
             license: tokio::sync::Mutex::new(None),
             break_challenges: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             app_kills_pending: std::sync::atomic::AtomicU64::new(0),
@@ -1869,6 +1870,7 @@ mod tests {
             Request::SetSettings {
                 settings: Settings {
                     notifications: false,
+                    instant_breaks: true,
                 },
             },
             &daemon,

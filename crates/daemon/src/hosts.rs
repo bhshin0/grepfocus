@@ -3,6 +3,15 @@
 //! The managed region is delimited by `HOSTS_BEGIN` / `HOSTS_END` markers.
 //! Any content outside that region is preserved verbatim.
 //!
+//! The address every blocked name is pointed at — the *sink IP* — is a
+//! parameter of `apply_block`, not a constant of this module. It is `0.0.0.0`
+//! as it always has been, except while the loopback proxy holds both ports,
+//! when it becomes `127.0.0.1` so a blocked connection is refused by our own
+//! listener; `enforce` owns that choice and this module only writes what it is
+//! handed. Both addresses block equally (nothing answers on either unless the
+//! proxy itself is listening), which is why the choice never belongs to
+//! enforcement.
+//!
 //! Degradation policy: the hosts CONTENT is the enforcement; the immutable
 //! bit is hardening on top. A `write_atomic` failure is fatal — it propagates,
 //! `enforce::sync` clears its memo, and the next 1s tick retries. A failed
@@ -12,6 +21,7 @@
 //! clear paths is likewise best-effort.
 
 use std::fs;
+use std::net::Ipv4Addr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::process::Command;
 
@@ -27,15 +37,21 @@ pub(crate) const HOSTS_MODE: u32 = 0o644;
 const HOSTS_ORIG_MODE: u32 = 0o600;
 
 /// Apply the block: remove any existing managed region, append a fresh one
-/// with all blocked domains, then — when `tamper_protect` (the premium
-/// `tamper_protection` feature) is granted — mark /etc/hosts immutable.
+/// pointing all blocked domains at `sink`, then — when `tamper_protect` (the
+/// premium `tamper_protection` feature) is granted — mark /etc/hosts
+/// immutable.
+///
+/// `sink` is chosen by `enforce::sink_ip` and is simply written here (see the
+/// module docs). Callers must pass the *current* sink on every apply,
+/// including a drift re-apply: the address is file content, so a stale one
+/// would be re-installed verbatim.
 ///
 /// The hosts CONTENT is free-tier enforcement; only the `chattr +i`
 /// hardening on top is license-gated. The pre-write `chattr -i` below stays
 /// unconditional regardless of license: it is the mechanical unlock needed
 /// to rewrite a possibly-still-locked file (e.g. locked by a previously
 /// licensed apply), not a license decision.
-pub fn apply_block(domains: &[String], tamper_protect: bool) -> anyhow::Result<()> {
+pub fn apply_block(domains: &[String], sink: Ipv4Addr, tamper_protect: bool) -> anyhow::Result<()> {
     chattr_immutable(HOSTS, false).ok(); // best-effort unlock if previously locked
     let original = fs::read_to_string(HOSTS).context("reading /etc/hosts")?;
     let stripped = strip_managed(&original);
@@ -50,7 +66,7 @@ pub fn apply_block(domains: &[String], tamper_protect: bool) -> anyhow::Result<(
             "{}\n{}\n{}{}\n",
             stripped.trim_end(),
             HOSTS_BEGIN,
-            render_block(domains),
+            render_block(domains, sink),
             HOSTS_END
         )
     };
@@ -134,16 +150,19 @@ pub(crate) fn contains_managed(s: &str) -> bool {
         .any(|line| line.trim_start().starts_with(HOSTS_BEGIN))
 }
 
-fn render_block(domains: &[String]) -> String {
+/// Render the managed region's body: one line per blocked name, plus the
+/// `www.` alias for any name that isn't already one, every line pointing at
+/// `sink`.
+fn render_block(domains: &[String], sink: Ipv4Addr) -> String {
     let mut out = String::from("\n");
     for d in domains {
         let d = d.trim();
         if d.is_empty() {
             continue;
         }
-        out.push_str(&format!("0.0.0.0 {}\n", d));
+        out.push_str(&format!("{} {}\n", sink, d));
         if !d.starts_with("www.") {
-            out.push_str(&format!("0.0.0.0 www.{}\n", d));
+            out.push_str(&format!("{} www.{}\n", sink, d));
         }
     }
     out
@@ -257,15 +276,30 @@ mod tests {
 
     #[test]
     fn renders_www_alias() {
-        let r = render_block(&["reddit.com".to_string()]);
+        let r = render_block(&["reddit.com".to_string()], Ipv4Addr::UNSPECIFIED);
         assert!(r.contains("0.0.0.0 reddit.com"));
         assert!(r.contains("0.0.0.0 www.reddit.com"));
     }
 
     #[test]
     fn skips_www_alias_when_already_www() {
-        let r = render_block(&["www.example.com".to_string()]);
+        let r = render_block(&["www.example.com".to_string()], Ipv4Addr::UNSPECIFIED);
         assert!(r.contains("0.0.0.0 www.example.com"));
+        assert!(!r.contains("www.www.example.com"));
+    }
+
+    /// The sink is written, not assumed: both the bare name and its `www.`
+    /// alias must carry the address the caller chose, with no `0.0.0.0` left
+    /// anywhere in the region.
+    #[test]
+    fn renders_the_given_sink_for_the_bare_and_www_forms() {
+        let r = render_block(&["reddit.com".to_string()], Ipv4Addr::LOCALHOST);
+        assert!(r.contains("127.0.0.1 reddit.com"));
+        assert!(r.contains("127.0.0.1 www.reddit.com"));
+        assert!(!r.contains("0.0.0.0"));
+        // An already-`www.` name keeps the same single-line treatment.
+        let r = render_block(&["www.example.com".to_string()], Ipv4Addr::LOCALHOST);
+        assert!(r.contains("127.0.0.1 www.example.com"));
         assert!(!r.contains("www.www.example.com"));
     }
 
@@ -355,7 +389,7 @@ mod tests {
         let input = "127.0.0.1 localhost\n";
         // strip + render with empty list yields the unchanged input
         let stripped = strip_managed(input);
-        let rendered = render_block(&[]);
+        let rendered = render_block(&[], Ipv4Addr::UNSPECIFIED);
         assert!(rendered.is_empty() || rendered.trim().is_empty());
         assert_eq!(stripped, "127.0.0.1 localhost\n");
     }

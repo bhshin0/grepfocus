@@ -19,6 +19,7 @@ mod dns;
 mod enforce;
 mod hosts;
 mod ipc;
+mod listener;
 mod nftables;
 mod paths;
 mod procwatch;
@@ -42,6 +43,16 @@ pub struct Daemon {
     /// `None` means unknown/dirty — the next `enforce::sync` re-applies
     /// unconditionally. See `enforce::sync`.
     pub applied: Mutex<Option<enforce::Applied>>,
+    /// The loopback proxy while it is running, or `None` when no ports are
+    /// held (instant-breaks off, or nothing blocked).
+    ///
+    /// Taken ONLY by `enforce::sync`, and only with `applied` already held, so
+    /// it extends the documented lock order to `applied` → `listener` without
+    /// adding a second route to it. Nothing releases it at shutdown: the
+    /// kernel closes the sockets when the process exits, and the offline
+    /// teardown path (`grepfocusd cleanup`) runs with the daemon stopped, so
+    /// there is nothing left bound for it to free.
+    pub listener: Mutex<Option<listener::ProxyListener>>,
     /// Claims from the verified `state.license_token`, or `None` when
     /// unlicensed or the stored token failed verification. Derived and
     /// in-memory only — rebuilt at startup and on `SetLicense`.
@@ -223,6 +234,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         key,
         unlocked_until: Mutex::new(0),
         applied: Mutex::new(None),
+        listener: Mutex::new(None),
         license: Mutex::new(license),
         break_challenges: Mutex::new(std::collections::HashMap::new()),
         app_kills_pending: std::sync::atomic::AtomicU64::new(0),
