@@ -12,22 +12,25 @@
 //! mutates daemon state. `enforce::sync` owns the lifecycle and the sink-IP
 //! decision that turns this on.
 //!
-//! # This stage: refuse-only
+//! # What it does with a connection
 //!
-//! For now the proxy does exactly one thing with a connection: it refuses it.
-//! On `:80` it writes the static [`BLOCK_RESPONSE`] (a `403`) and closes; on
-//! `:443` it closes without sending a byte. The hostname is read — the parsers
-//! below are the audited, fuzzed code the next stage needs — but this stage
-//! does nothing with it beyond an optional `debug!` line. The observable
-//! behaviour is therefore identical to the historical `0.0.0.0` sink: a
-//! blocked domain does not load. What has changed is only *where* the
-//! connection dies — on our loopback socket rather than at an unrouteable
-//! address — which is the seam the next commit needs.
+//! It parses the hostname, then asks [`Decide`] — supplied by `enforce::sync` —
+//! whether that domain is on a break right now:
 //!
-//! **Forwarding is deliberately absent.** The whole point of a passthrough
-//! proxy — reading the hostname and then splicing the connection on to the
-//! real site while a break is active — arrives in the next commit. There is no
-//! `copy_bidirectional`, no upstream connect, and no DNS resolution here yet.
+//! - **on a break** → [`forward`] splices the connection to the real server.
+//!   The TLS handshake is never terminated (no certificate is involved); the
+//!   bytes already read are replayed to the upstream and then the two sockets
+//!   are copied verbatim. This is what makes a break instant on any browser: a
+//!   tab still holding the cached `127.0.0.1` now reaches the real site through
+//!   the pipe instead of a dead socket.
+//! - **blocked** → refuse. On `:80` it writes the static [`BLOCK_RESPONSE`] (a
+//!   `403`) and closes; on `:443` it closes without sending a byte, so the
+//!   browser shows its own connection error rather than a certificate warning.
+//!
+//! Only a domain the daemon marked forwardable is ever spliced, and that set is
+//! exactly the domains the user themselves blocked and is currently on a break
+//! from. A local process cannot add blocks, so it cannot make the proxy forward
+//! anything else — it is never a general forwarder. See [`Decide`].
 //!
 //! # Failure policy
 //!
@@ -103,8 +106,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{lookup_host, TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -130,6 +133,11 @@ const READ_TIMEOUT: Duration = Duration::from_secs(3);
 /// Bound on writing the static :80 response. A peer that connects, sends a
 /// request and then refuses to read must not hold the task either.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Wall-clock bound on dialing the real upstream when forwarding an on-break
+/// connection. Generous, but tight enough that an unreachable host does not pin
+/// a connection slot for long.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Ceiling on connection tasks in flight, shared by both ports.
 ///
@@ -205,6 +213,18 @@ enum Probe {
 /// neither — see the failure policy above.
 const PORTS: [(u16, Probe); 2] = [(HTTP_PORT, Probe::Http), (HTTPS_PORT, Probe::Tls)];
 
+/// Decides, per connection, whether a parsed hostname may be forwarded to the
+/// real server (`true`) or must be refused (`false`).
+///
+/// This is the entire security boundary of the forwarding path. `enforce::sync`
+/// supplies a closure that answers `true` ONLY for a domain on a break right
+/// now that is not otherwise enforced — a set the user themselves created by
+/// blocking that domain and taking a break from it. A local process cannot add
+/// blocks, so it cannot widen this set; the proxy is never a general forwarder.
+/// Called on the accept path, so it must not block or take a tokio lock — the
+/// supplied closure reads a leaf `std::sync::Mutex` and returns at once.
+pub type Decide = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// The pair of loopback sockets, and their lifetime.
 ///
 /// Bound while a domain block is active, released when none is. Holding the
@@ -236,7 +256,7 @@ impl ProxyListener {
     ///
     /// All-or-nothing: unless every port bound, this holds no socket at all and
     /// no accept task exists to hold one.
-    pub async fn start() -> Self {
+    pub async fn start(decide: Decide) -> Self {
         let Some(bound) = bind_all(&PORTS).await else {
             return Self {
                 tasks: Vec::new(),
@@ -244,18 +264,18 @@ impl ProxyListener {
             };
         };
         info!("loopback proxy listening on 127.0.0.1:80 and :443");
-        Self::serve(bound)
+        Self::serve(bound, decide)
     }
 
     /// Start one accept task per already-bound listener, all drawing on one
     /// shared connection budget so the cap is on the daemon and not on each
     /// port in turn.
-    fn serve(listeners: Vec<(TcpListener, Probe)>) -> Self {
+    fn serve(listeners: Vec<(TcpListener, Probe)>, decide: Decide) -> Self {
         let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let fully_bound = listeners.len() == PORTS.len();
         let tasks = listeners
             .into_iter()
-            .map(|(listener, probe)| spawn_accept(listener, probe, permits.clone()))
+            .map(|(listener, probe)| spawn_accept(listener, probe, permits.clone(), decide.clone()))
             .collect();
         Self { tasks, fully_bound }
     }
@@ -402,7 +422,12 @@ impl Throttle {
 /// would hold the descriptors anyway. A browser that gets a closed connection
 /// shows the same failure it would if we had never bound the port, which is the
 /// ordinary degraded behaviour of this whole module.
-fn spawn_accept(listener: TcpListener, probe: Probe, permits: Arc<Semaphore>) -> JoinHandle<()> {
+fn spawn_accept(
+    listener: TcpListener,
+    probe: Probe,
+    permits: Arc<Semaphore>,
+    decide: Decide,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut refusals = Throttle::new();
         let mut failures = Throttle::new();
@@ -422,8 +447,9 @@ fn spawn_accept(listener: TcpListener, probe: Probe, permits: Arc<Semaphore>) ->
                         }
                         continue;
                     };
+                    let decide = decide.clone();
                     tokio::spawn(async move {
-                        handle(stream, probe).await;
+                        handle(stream, probe, &decide).await;
                         // Held for exactly the life of the connection, however
                         // `handle` returned.
                         drop(permit);
@@ -443,28 +469,32 @@ fn spawn_accept(listener: TcpListener, probe: Probe, permits: Arc<Semaphore>) ->
     })
 }
 
-/// Read a bounded head from one connection, then refuse it.
+/// Read a bounded head from one connection, then either forward it or refuse.
 ///
-/// This stage does not forward: the hostname is read (the parsers are the
-/// audited code the forwarding stage needs, so they stay wired in) but the
-/// connection is always refused. On `:80` the static [`BLOCK_RESPONSE`] is
-/// written and the socket closed; on `:443` the socket is closed with nothing
-/// sent, so the browser shows its own connection error rather than a
-/// certificate warning. The next commit is where a parsed hostname decides
-/// whether to splice the connection on to the real site instead.
+/// The hostname is parsed from the head (`Host:` on `:80`, SNI on `:443`) and
+/// handed to `decide`. If it says forward — the domain is on a break right now
+/// — the connection is spliced to the real server ([`forward`]). Otherwise it
+/// is refused: on `:80` the static [`BLOCK_RESPONSE`] (`403`) is written and the
+/// socket closed; on `:443` the socket is closed with nothing sent, so the
+/// browser shows its own connection error rather than a certificate warning.
 ///
 /// Everything that can go wrong here — a timeout, a reset, bytes that parse to
 /// nothing — ends the same way: drop the connection silently. There is nothing
 /// a caller could do about it and nothing worth logging per connection.
-async fn handle(mut stream: TcpStream, probe: Probe) {
-    let host = match tokio::time::timeout(READ_TIMEOUT, read_hostname(&mut stream, probe)).await {
-        Ok(Some(h)) => h,
-        // Timed out, hung up, or said something we could not read a hostname
-        // out of. Refused all the same, by closing.
-        _ => return,
-    };
-    // Read, but not acted on beyond a trace line this stage: no forwarding yet.
-    debug!(%host, ?probe, "loopback proxy refusing blocked connection");
+async fn handle(mut stream: TcpStream, probe: Probe, decide: &Decide) {
+    let (host, head) =
+        match tokio::time::timeout(READ_TIMEOUT, read_hostname(&mut stream, probe)).await {
+            Ok(Some(pair)) => pair,
+            // Timed out, hung up, or said something we could not read a hostname
+            // out of. Refused all the same, by closing.
+            _ => return,
+        };
+    if decide(&host) {
+        // On a break: splice to the real site, replaying the head we consumed.
+        forward(stream, probe, &host, &head).await;
+        return;
+    }
+    debug!(%host, ?probe, "loopback proxy refusing a blocked connection");
     if probe == Probe::Http {
         // One fixed byte string. On :443 this branch is not taken at all: no
         // handshake is attempted and no byte is ever written, so the browser
@@ -475,13 +505,78 @@ async fn handle(mut stream: TcpStream, probe: Probe) {
     drop(stream);
 }
 
+/// Splice an on-break connection through to the real server, and never
+/// terminate TLS — so no certificate is involved and the browser completes its
+/// own handshake straight through to the real site.
+///
+/// The bytes already consumed while reading the hostname (the whole ClientHello
+/// on `:443`, the request head on `:80`) are part of the real request, so they
+/// are written to the upstream FIRST; then the two streams are copied both ways
+/// verbatim. After the replay nothing is inspected, buffered by us, or altered.
+///
+/// There is deliberately no idle timeout on the copy: a legitimately forwarded
+/// stream (a video, a large download) is idle-free but long-lived, and killing
+/// it would break real use during a break. Concurrency is bounded by the
+/// caller's connection permit instead. Any error or EOF just ends the pipe.
+async fn forward(client: TcpStream, probe: Probe, host: &str, head: &[u8]) {
+    let port = match probe {
+        Probe::Http => HTTP_PORT,
+        Probe::Tls => HTTPS_PORT,
+    };
+    let Some(target) = resolve_upstream(host, port).await else {
+        // Unresolvable, or it resolves to loopback/unspecified — which would
+        // splice the proxy into itself. Refuse by closing.
+        return;
+    };
+    splice(client, target, head).await;
+}
+
+/// Dial `target`, replay the already-consumed `head`, then pipe both ways.
+///
+/// Split out from [`forward`] so it can be tested against a real upstream
+/// without depending on name resolution.
+async fn splice(mut client: TcpStream, target: SocketAddr, head: &[u8]) {
+    let mut upstream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await
+    {
+        Ok(Ok(s)) => s,
+        _ => return,
+    };
+    match tokio::time::timeout(WRITE_TIMEOUT, upstream.write_all(head)).await {
+        Ok(Ok(())) => {}
+        _ => return,
+    }
+    let _ = copy_bidirectional(&mut client, &mut upstream).await;
+}
+
+/// Resolve `host:port` to a real, dialable address, or `None`.
+///
+/// During a break the domain is absent from `/etc/hosts`, so an ordinary lookup
+/// returns the real address. The loopback/unspecified guard is defence in
+/// depth: only a domain the daemon deemed forwardable reaches here, but if a
+/// lookup ever came back pointing at us — a forwardable entry racing a re-block,
+/// or the domain still `127.0.0.1` in `/etc/hosts` because another block still
+/// enforces it — dialing it would splice the proxy into itself. Refuse instead.
+async fn resolve_upstream(host: &str, port: u16) -> Option<SocketAddr> {
+    let addrs = lookup_host((host, port)).await.ok()?;
+    first_dialable_addr(addrs)
+}
+
+/// The first address that is safe to dial: neither loopback nor unspecified.
+fn first_dialable_addr(mut addrs: impl Iterator<Item = SocketAddr>) -> Option<SocketAddr> {
+    addrs.find(|a| !a.ip().is_loopback() && !a.ip().is_unspecified())
+}
+
 /// Read at most [`MAX_READ`] bytes, trying the parser as soon as the bytes that
 /// arrived could have completed the structure, so a well-formed request is
 /// answered when it is complete rather than when the peer stops talking.
 ///
+/// Returns the parsed hostname AND the exact bytes consumed while reading it, so
+/// the forwarding path can replay that head to the upstream — every byte taken
+/// from the client is preserved, in order, and none is read twice.
+///
 /// The buffer is allocated once at a FIXED size. Nothing on the wire chooses
 /// it, and the loop cannot grow it.
-async fn read_hostname(stream: &mut TcpStream, probe: Probe) -> Option<String> {
+async fn read_hostname(stream: &mut TcpStream, probe: Probe) -> Option<(String, Vec<u8>)> {
     let mut buf = vec![0u8; MAX_READ];
     let mut filled = 0usize;
     while filled < buf.len() {
@@ -496,7 +591,8 @@ async fn read_hostname(stream: &mut TcpStream, probe: Probe) -> Option<String> {
             continue;
         }
         if let Some(host) = parse(probe, head) {
-            return Some(host);
+            buf.truncate(filled);
+            return Some((host, buf));
         }
     }
     // The read ended — the peer hung up, or the buffer is full — with the
@@ -504,7 +600,9 @@ async fn read_hostname(stream: &mut TcpStream, probe: Probe) -> Option<String> {
     // is the normal shape of a ClientHello whose record header claims more
     // bytes than ever arrived, and the hostname inside one that did arrive is
     // still worth having.
-    parse(probe, buf.get(..filled)?)
+    let host = parse(probe, buf.get(..filled)?)?;
+    buf.truncate(filled);
+    Some((host, buf))
 }
 
 /// Dispatch to the parser for `probe`. The port chooses this, never the bytes.
@@ -1367,8 +1465,20 @@ mod tests {
     async fn ephemeral_with_budget(probe: Probe, budget: usize) -> (SocketAddr, JoinHandle<()>) {
         let listener = ephemeral_listener().await;
         let addr = listener.local_addr().unwrap();
-        let task = spawn_accept(listener, probe, Arc::new(Semaphore::new(budget)));
+        let task = spawn_accept(
+            listener,
+            probe,
+            Arc::new(Semaphore::new(budget)),
+            no_forward(),
+        );
         (addr, task)
+    }
+
+    /// A decide hook that forwards nothing — every connection is refused, the
+    /// behaviour these socket tests exercise. A forwarding decide would need a
+    /// real upstream; the forward path is tested separately.
+    fn no_forward() -> Decide {
+        Arc::new(|_| false)
     }
 
     /// A listener on an ephemeral loopback port — port 0, never 80 or 443.
@@ -1561,7 +1671,8 @@ mod tests {
         let tls = ephemeral_listener().await;
         let addrs = [http.local_addr().unwrap(), tls.local_addr().unwrap()];
 
-        let running = ProxyListener::serve(vec![(http, Probe::Http), (tls, Probe::Tls)]);
+        let running =
+            ProxyListener::serve(vec![(http, Probe::Http), (tls, Probe::Tls)], no_forward());
         assert!(running.fully_bound(), "both ports were handed over");
         running.release().await;
 
@@ -1581,7 +1692,7 @@ mod tests {
     async fn dropping_a_listener_frees_its_port() {
         let listener = ephemeral_listener().await;
         let addr = listener.local_addr().unwrap();
-        let running = ProxyListener::serve(vec![(listener, Probe::Http)]);
+        let running = ProxyListener::serve(vec![(listener, Probe::Http)], no_forward());
         assert!(
             !running.fully_bound(),
             "one listener out of two is not fully bound"
@@ -1642,5 +1753,83 @@ mod tests {
         throttle.last = Instant::now().checked_sub(LOG_INTERVAL);
         assert_eq!(throttle.tick(), Some(1_001));
         assert_eq!(throttle.tick(), None, "and the count starts again");
+    }
+
+    // ── forwarding (stage 2) ────────────────────────────────────────────────
+
+    /// `read_hostname` must hand back EXACTLY the bytes it consumed, or the
+    /// forward path would replay a corrupted or truncated head to the upstream.
+    #[tokio::test]
+    async fn read_hostname_returns_the_bytes_it_consumed() {
+        for (probe, sent) in [
+            (Probe::Tls, hello_for("reddit.com")),
+            (Probe::Http, req("Host: reddit.com\r\n")),
+        ] {
+            let listener = ephemeral_listener().await;
+            let addr = listener.local_addr().unwrap();
+            let payload = sent.clone();
+            let client = tokio::spawn(async move {
+                let mut c = TcpStream::connect(addr).await.unwrap();
+                c.write_all(&payload).await.unwrap();
+                // Hold the connection open so the server's read is not raced by a
+                // close; the parser returns as soon as the head is complete.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            });
+            let (mut server, _) = listener.accept().await.unwrap();
+            let (host, head) = read_hostname(&mut server, probe).await.unwrap();
+            assert_eq!(host, "reddit.com");
+            assert_eq!(head, sent, "the replayed head must equal what was sent");
+            client.await.unwrap();
+        }
+    }
+
+    /// The loopback/unspecified guard: forwarding must never dial back into the
+    /// proxy itself, so those addresses are skipped and a real one is chosen.
+    #[test]
+    fn first_dialable_addr_skips_loopback_and_unspecified() {
+        let real: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let addrs = [
+            "127.0.0.1:443".parse().unwrap(),
+            "0.0.0.0:443".parse().unwrap(),
+            real,
+        ];
+        assert_eq!(first_dialable_addr(addrs.into_iter()), Some(real));
+
+        // Only loopback/unspecified → nothing safe to dial.
+        let unsafe_only: [SocketAddr; 2] =
+            ["127.0.0.1:80".parse().unwrap(), "[::1]:80".parse().unwrap()];
+        assert_eq!(first_dialable_addr(unsafe_only.into_iter()), None);
+    }
+
+    /// End to end: `splice` writes the replayed head to the upstream first, then
+    /// pipes both directions. An echo upstream lets us see both happen — the
+    /// client gets back the head, then whatever it sends after.
+    #[tokio::test]
+    async fn splice_replays_the_head_then_pipes_both_ways() {
+        // Echo upstream: everything it receives, it sends back.
+        let echo = ephemeral_listener().await;
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+
+        // A client connected to a socket that we (the "proxy") accept.
+        let inbound = ephemeral_listener().await;
+        let inbound_addr = inbound.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut c = TcpStream::connect(inbound_addr).await.unwrap();
+            c.write_all(b"MORE").await.unwrap();
+            let mut got = vec![0u8; 8];
+            c.read_exact(&mut got).await.unwrap();
+            got
+        });
+
+        let (proxy_client, _) = inbound.accept().await.unwrap();
+        splice(proxy_client, echo_addr, b"HEAD").await;
+
+        // Head replayed first (echoed back), then the client's own bytes.
+        assert_eq!(&client.await.unwrap(), b"HEADMORE");
     }
 }

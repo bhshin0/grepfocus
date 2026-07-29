@@ -26,14 +26,15 @@
 //! but the instant-refusal, since the sink simply stays `0.0.0.0` and blocking
 //! is untouched.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 use grepfocus_core::license::features;
 use grepfocus_core::{now_unix, ActiveBlock};
 use tracing::{debug, info, warn};
 
-use crate::listener::ProxyListener;
+use crate::listener::{Decide, ProxyListener};
 use crate::{dns, has_feature, hosts, nftables, Daemon};
 
 /// How long a live-system verification stays fresh. While a domain block is
@@ -125,8 +126,16 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
     let (domains, tamper_protect, instant_breaks, any_block_active) = {
         let st = daemon.state.lock().await;
         let lic = daemon.license.lock().await;
+        let domains = union_domains(&st.active, now);
+        // Refresh the proxy's forwardable set every tick — BEFORE the memo
+        // early-return below can skip the rest of `sync`. It is what the proxy's
+        // per-connection decide hook reads. A leaf lock, taken and released
+        // here and never held across an await; recovering from poison keeps a
+        // panicked prior holder from wedging enforcement.
+        *daemon.forwardable.lock().unwrap_or_else(|p| p.into_inner()) =
+            forwardable_set(&st.active, now, &domains);
         (
-            union_domains(&st.active, now),
+            domains,
             has_feature(lic.as_ref(), &st, features::TAMPER_PROTECTION),
             st.settings.instant_breaks,
             !st.active.is_empty(),
@@ -326,7 +335,18 @@ async fn ensure_detection(daemon: &Daemon, want: bool) -> Detection {
         return Detection::Off;
     }
     if slot.is_none() {
-        let started = ProxyListener::start().await;
+        // The decision hook the proxy consults per connection: forward only a
+        // host in the live forwardable set. The closure owns an `Arc` clone of
+        // that set, so it keeps seeing `sync`'s per-tick updates even though the
+        // listener is started once. Poison is recovered rather than propagated.
+        let forwardable = daemon.forwardable.clone();
+        let decide: Decide = Arc::new(move |host: &str| {
+            forwardable
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(host)
+        });
+        let started = ProxyListener::start(decide).await;
         if !started.fully_bound() {
             // Once, at the transition. The instant-refusal is the only
             // casualty: the sink stays 0.0.0.0 and every blocked name still
@@ -361,6 +381,40 @@ fn union_domains(active: &[ActiveBlock], now: u64) -> Vec<String> {
         }
     }
     set.into_iter().collect()
+}
+
+/// The domains the loopback proxy may forward RIGHT NOW.
+///
+/// The mirror image of [`union_domains`]: every domain of an active block that
+/// IS on a break (`break_until_unix > now`), MINUS any domain still in `union`
+/// (i.e. still enforced by some other, non-break block). The subtraction is
+/// essential — a domain still in the union is written to `/etc/hosts` as the
+/// loopback sink, so resolving it returns `127.0.0.1` and forwarding it would
+/// splice the proxy into itself. Each surviving domain is lowercased (matching
+/// the parsers' output) and its `www.` alias added (matching
+/// `hosts::render_block`), so whichever form the browser cached is recognised.
+///
+/// Pure over `(active, now, union)` — the caller passes the clock in.
+fn forwardable_set(active: &[ActiveBlock], now: u64, union: &[String]) -> HashSet<String> {
+    let enforced: HashSet<&str> = union.iter().map(String::as_str).collect();
+    let mut out = HashSet::new();
+    for a in active {
+        if a.break_until_unix.is_none_or(|t| t <= now) {
+            continue; // not on a break — the union already covers it
+        }
+        for d in &a.block.domains {
+            let d = d.trim();
+            if d.is_empty() || enforced.contains(d) {
+                continue;
+            }
+            let lower = d.to_ascii_lowercase();
+            if !lower.starts_with("www.") {
+                out.insert(format!("www.{lower}"));
+            }
+            out.insert(lower);
+        }
+    }
+    out
 }
 
 /// Apply a freshly computed union to `/etc/hosts` AND the nftables DoH
@@ -405,6 +459,50 @@ mod tests {
 
     fn one_domain() -> Vec<String> {
         vec!["reddit.com".to_string()]
+    }
+
+    /// An active block over `domains`, on a break until `break_until` if set.
+    fn active(domains: &[&str], break_until: Option<u64>) -> ActiveBlock {
+        ActiveBlock {
+            block: grepfocus_core::Block {
+                domains: domains.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
+            started_at_unix: 0,
+            ends_at_unix: u64::MAX,
+            originator: grepfocus_core::Originator::Manual,
+            break_until_unix: break_until,
+            apps_enforced: false,
+            lock: grepfocus_core::LockMode::default(),
+            allowance: None,
+        }
+    }
+
+    /// Forwardable = on-break domains, lowercased with the `www.` alias, MINUS
+    /// anything still enforced by a non-break block (which would self-loop).
+    #[test]
+    fn forwardable_is_on_break_minus_union() {
+        let now = 1_000;
+
+        // Solo break: domain removed from the union, so forwardable — both the
+        // lowercased name and its www. alias, matching how it was written.
+        let set = forwardable_set(&[active(&["Reddit.com"], Some(now + 60))], now, &[]);
+        assert!(set.contains("reddit.com"));
+        assert!(set.contains("www.reddit.com"));
+        assert_eq!(set.len(), 2);
+
+        // Not on a break → the union covers it, never forwardable.
+        assert!(forwardable_set(&[active(&["reddit.com"], None)], now, &[]).is_empty());
+
+        // On a break but STILL enforced by another block (in the union): it
+        // resolves to 127.0.0.1, so it must be excluded to avoid a self-loop.
+        let union = vec!["reddit.com".to_string()];
+        assert!(
+            forwardable_set(&[active(&["reddit.com"], Some(now + 60))], now, &union).is_empty()
+        );
+
+        // An already-expired break is not forwardable.
+        assert!(forwardable_set(&[active(&["reddit.com"], Some(now - 1))], now, &[]).is_empty());
     }
 
     #[test]

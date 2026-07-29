@@ -53,6 +53,13 @@ pub struct Daemon {
     /// teardown path (`grepfocusd cleanup`) runs with the daemon stopped, so
     /// there is nothing left bound for it to free.
     pub listener: Mutex<Option<listener::ProxyListener>>,
+    /// Domains the loopback proxy may forward RIGHT NOW: those on a break this
+    /// instant that are not otherwise enforced (see `enforce::forwardable_set`).
+    /// Rewritten by `enforce::sync` each tick under the state lock; read by the
+    /// proxy's per-connection decision hook. A `std::sync::Mutex` on purpose —
+    /// it is a leaf lock held for microseconds and NEVER across an await, so the
+    /// accept path takes no tokio lock and cannot deadlock against the daemon.
+    pub forwardable: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Claims from the verified `state.license_token`, or `None` when
     /// unlicensed or the stored token failed verification. Derived and
     /// in-memory only — rebuilt at startup and on `SetLicense`.
@@ -235,6 +242,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         unlocked_until: Mutex::new(0),
         applied: Mutex::new(None),
         listener: Mutex::new(None),
+        forwardable: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         license: Mutex::new(license),
         break_challenges: Mutex::new(std::collections::HashMap::new()),
         app_kills_pending: std::sync::atomic::AtomicU64::new(0),

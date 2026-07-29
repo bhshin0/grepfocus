@@ -1405,6 +1405,9 @@ mod tests {
             unlocked_until: tokio::sync::Mutex::new(0),
             applied: tokio::sync::Mutex::new(None),
             listener: tokio::sync::Mutex::new(None),
+            forwardable: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             license: tokio::sync::Mutex::new(None),
             break_challenges: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             app_kills_pending: std::sync::atomic::AtomicU64::new(0),
