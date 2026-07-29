@@ -12,7 +12,7 @@
 %global debug_package %{nil}
 
 Name:           grepfocus
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Website and app blocker for Linux
 
@@ -122,6 +122,12 @@ fi
 %dir %attr(0700,root,root) %{_sharedstatedir}/grepfocus
 
 %changelog
+* Tue Jul 28 2026 Bryan <bhshin@gmail.com> - 0.4.0-1
+- Instant breaks: a blocked site becomes reachable the moment a break starts,
+  even in an already-open tab, via a loopback passthrough proxy (default on)
+- Week tab: a read-only weekly overview of every block's scheduled windows
+- New app icon (the grepfocus ">" mark)
+
 * Sun Jul 26 2026 Bryan <bhshin@gmail.com> - 0.3.0-1
 - Break allowance is now a policy: none / per-day / per rolling window / per break
 - Rolling-window breaks are all-or-nothing (one break per window)
