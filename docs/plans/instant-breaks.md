@@ -1,7 +1,8 @@
 # Instant breaks — a loopback passthrough proxy
 
-Status: **planned** (2026-07-27). Owner approved: build it, **default-on**,
-fail-soft with a GUI notice when a port is taken.
+Status: **implemented** (2026-07-28); adversarial security audit in progress,
+live verification pending. Owner approved: build it, **default-on**, fail-soft
+with a GUI notice when a port is taken.
 
 ## The problem
 
@@ -107,6 +108,27 @@ Branch `instant-breaks` off `master`.
    long-lived streams, teardown — then the milestone doc.
 
 Stages 1–2 are daemon-only, verifiable over the IPC socket + `curl`/browser.
+
+## What shipped (all gated on `./scripts/check.sh`)
+
+- `bca81fe` docs: this plan.
+- `0f3a72e` stage 1 — the loopback listener ported refuse-only behind
+  `instant_breaks` (default on), sink threaded through `hosts`/`enforce`, bind
+  keyed on "any active block". Parsers byte-identical to the fuzzed shelf.
+- `293b4fd` stage 2 — forward on-break connections: byte-exact head replay +
+  `copy_bidirectional`, the `forwardable` set (on-break minus union) updated each
+  tick and read by the per-connection `Decide` hook, loopback/unspecified guard.
+- `b949af4` stage 3 — GUI: `instant_breaks` settings toggle (default on) and a
+  `instant_breaks_degraded` status flag driving a "port in use" notice; both
+  preference toggles send the full `Settings` object.
+- `61cacf5` — dial guard also rejects IPv4 link-local (`169.254/16`, the cloud
+  metadata range), defence in depth.
+
+Deviations from the plan above: the fail-soft status is a single
+`instant_breaks_degraded: bool` on `Status` rather than an `Off|Active|Degraded`
+enum — the GUI only needs "wanted-but-couldn't-bind", and `settings.instant_breaks`
+already carries on/off. The SSRF guard was extended past the planned loopback/`::1`
+to also cover IPv4 link-local.
 
 ## Verification (live, after deploy)
 
