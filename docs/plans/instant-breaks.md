@@ -1,8 +1,11 @@
 # Instant breaks — a loopback passthrough proxy
 
-Status: **implemented** (2026-07-28); adversarial security audit in progress,
-live verification pending. Owner approved: build it, **default-on**, fail-soft
-with a GUI notice when a port is taken.
+Status: **implemented and live-verified** (2026-07-28). The core behaviour —
+an already-open tab on a blocked site becomes reachable the instant a break
+starts, with the proxy bound and active — was confirmed on the owner's machine.
+Adversarial security audit passed (findings low/theoretical, all fixed). Owner
+approved: build it, **default-on**, fail-soft with a GUI notice when a port is
+taken.
 
 ## The problem
 
