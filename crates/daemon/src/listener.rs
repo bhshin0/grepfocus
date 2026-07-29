@@ -561,9 +561,20 @@ async fn resolve_upstream(host: &str, port: u16) -> Option<SocketAddr> {
     first_dialable_addr(addrs)
 }
 
-/// The first address that is safe to dial: neither loopback nor unspecified.
+/// The first address that is safe to dial.
+///
+/// Excludes loopback and the unspecified address (which would splice the proxy
+/// back into itself), and — defence in depth — the IPv4 link-local range
+/// `169.254.0.0/16`, which contains the cloud-metadata endpoint
+/// `169.254.169.254`. Only a domain the user themselves blocked and is on a
+/// break from can ever reach here, so this is belt-and-braces, but it is a
+/// stable one-line guard against ever dialing that range on their behalf.
 fn first_dialable_addr(mut addrs: impl Iterator<Item = SocketAddr>) -> Option<SocketAddr> {
-    addrs.find(|a| !a.ip().is_loopback() && !a.ip().is_unspecified())
+    addrs.find(|a| {
+        let ip = a.ip();
+        let link_local = matches!(ip, std::net::IpAddr::V4(v4) if v4.is_link_local());
+        !ip.is_loopback() && !ip.is_unspecified() && !link_local
+    })
 }
 
 /// Read at most [`MAX_READ`] bytes, trying the parser as soon as the bytes that
@@ -1795,9 +1806,13 @@ mod tests {
         ];
         assert_eq!(first_dialable_addr(addrs.into_iter()), Some(real));
 
-        // Only loopback/unspecified → nothing safe to dial.
-        let unsafe_only: [SocketAddr; 2] =
-            ["127.0.0.1:80".parse().unwrap(), "[::1]:80".parse().unwrap()];
+        // Loopback, unspecified, and IPv4 link-local (169.254/16, the cloud
+        // metadata range) → nothing safe to dial.
+        let unsafe_only: [SocketAddr; 3] = [
+            "127.0.0.1:80".parse().unwrap(),
+            "[::1]:80".parse().unwrap(),
+            "169.254.169.254:80".parse().unwrap(),
+        ];
         assert_eq!(first_dialable_addr(unsafe_only.into_iter()), None);
     }
 
