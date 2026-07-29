@@ -1232,6 +1232,12 @@ pub enum Response {
         /// object fills the same way.
         #[serde(default)]
         settings: Settings,
+        /// True when `settings.instant_breaks` is on and a block is active but
+        /// the loopback proxy could not bind both ports, so breaks lag on this
+        /// machine. Drives a GUI notice explaining why. `#[serde(default)]`:
+        /// an old daemon never emits it and the client reads `false`.
+        #[serde(default)]
+        instant_breaks_degraded: bool,
     },
     Added {
         id: u64,
@@ -2625,6 +2631,7 @@ mod tests {
                 cycles_total: 4,
             }),
             settings: Settings::default(),
+            instant_breaks_degraded: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();

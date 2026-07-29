@@ -226,6 +226,9 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 licensed_features: lic.features,
                 pomodoro,
                 settings: st.settings.clone(),
+                instant_breaks_degraded: daemon
+                    .instant_breaks_degraded
+                    .load(std::sync::atomic::Ordering::Relaxed),
             }
         }
 
@@ -1411,6 +1414,7 @@ mod tests {
             license: tokio::sync::Mutex::new(None),
             break_challenges: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             app_kills_pending: std::sync::atomic::AtomicU64::new(0),
+            instant_breaks_degraded: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

@@ -75,6 +75,11 @@ pub struct Daemon {
     /// "accumulate in memory, persist when something else saves" pattern. No
     /// fsync per kill; a crash loses at most the unflushed count.
     pub app_kills_pending: std::sync::atomic::AtomicU64,
+    /// Whether instant breaks are wanted (setting on, a block active) but the
+    /// loopback proxy could not bind both ports — so breaks lag on this machine.
+    /// Set by `enforce::sync` each tick, read by `GetStatus` so the GUI can say
+    /// why. In-memory only; enforcement never depends on it.
+    pub instant_breaks_degraded: std::sync::atomic::AtomicBool,
 }
 
 /// Wall-clock "now" (unix seconds) for license checks, clamped so a rewound
@@ -246,6 +251,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         license: Mutex::new(license),
         break_challenges: Mutex::new(std::collections::HashMap::new()),
         app_kills_pending: std::sync::atomic::AtomicU64::new(0),
+        instant_breaks_degraded: std::sync::atomic::AtomicBool::new(false),
     });
 
     // Re-apply the union of all still-active blocks before accepting clients.

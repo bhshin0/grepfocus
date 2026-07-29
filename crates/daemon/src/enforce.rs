@@ -149,7 +149,16 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
     // must stay up to refuse the domains that are about to come back. The state
     // lock is already released here and `applied` is still held, which is the
     // lock order this mutex lives under.
-    let sink = sink_ip(ensure_detection(daemon, instant_breaks && any_block_active).await);
+    let want_proxy = instant_breaks && any_block_active;
+    let detection = ensure_detection(daemon, want_proxy).await;
+    // Record for `GetStatus`: instant breaks were wanted but a port would not
+    // bind, so breaks lag here and the GUI should say why. Set every tick,
+    // outside the memo, so it tracks the live state rather than the last apply.
+    daemon.instant_breaks_degraded.store(
+        matches!(detection, Detection::Degraded),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let sink = sink_ip(detection);
     if let Some(prev) = applied.as_mut() {
         if prev.matches(&domains, sink) {
             if !needs_probe(&domains, prev.verified_at, now) {
