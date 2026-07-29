@@ -226,6 +226,9 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 licensed_features: lic.features,
                 pomodoro,
                 settings: st.settings.clone(),
+                instant_breaks_degraded: daemon
+                    .instant_breaks_degraded
+                    .load(std::sync::atomic::Ordering::Relaxed),
             }
         }
 
@@ -1404,9 +1407,14 @@ mod tests {
             key: b"ipc-test-key-0123456789abcdef012".to_vec(),
             unlocked_until: tokio::sync::Mutex::new(0),
             applied: tokio::sync::Mutex::new(None),
+            listener: tokio::sync::Mutex::new(None),
+            forwardable: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             license: tokio::sync::Mutex::new(None),
             break_challenges: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             app_kills_pending: std::sync::atomic::AtomicU64::new(0),
+            instant_breaks_degraded: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1869,6 +1877,7 @@ mod tests {
             Request::SetSettings {
                 settings: Settings {
                     notifications: false,
+                    instant_breaks: true,
                 },
             },
             &daemon,

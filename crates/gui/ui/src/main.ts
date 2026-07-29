@@ -96,6 +96,9 @@ interface PomodoroStatus {
 /// hand-written Default, so an upgrading user is never silently muted).
 interface Settings {
   notifications: boolean;
+  /// Instant breaks: run the loopback proxy so a break takes effect at once
+  /// even in a tab that is already open. Defaults ON server-side.
+  instant_breaks: boolean;
 }
 
 interface Status {
@@ -115,6 +118,10 @@ interface Status {
   licensed_features: string[];
   pomodoro: PomodoroStatus | null;
   settings: Settings;
+  /// True when instant breaks are on and a block is active but the loopback
+  /// proxy could not bind a port (something else holds :80 or :443), so breaks
+  /// lag on this machine. Drives an explanatory notice.
+  instant_breaks_degraded: boolean;
 }
 
 interface Schedule {
@@ -1438,6 +1445,8 @@ const oldPwLabel = document.querySelector<HTMLLabelElement>("#old-pw-label")!;
 const pwSubmit = document.querySelector<HTMLButtonElement>("#password-submit")!;
 const pwClear = document.querySelector<HTMLButtonElement>("#password-clear")!;
 const notificationsToggle = document.querySelector<HTMLInputElement>("#notifications-toggle")!;
+const instantBreaksToggle = document.querySelector<HTMLInputElement>("#instant-breaks-toggle")!;
+const instantBreaksNote = document.querySelector<HTMLParagraphElement>("#instant-breaks-note")!;
 const prefsMsg = document.querySelector<HTMLParagraphElement>("#prefs-msg")!;
 
 const unlockDialog = document.querySelector<HTMLDialogElement>("#unlock-dialog")!;
@@ -1515,6 +1524,17 @@ async function refreshSettings() {
     // Reflect current preferences. Setting `.checked` in code does not fire a
     // change event, so this can never re-trigger the write path below.
     notificationsToggle.checked = s.settings.notifications;
+    instantBreaksToggle.checked = s.settings.instant_breaks;
+    // Only meaningful when the feature is on AND the daemon reports it degraded
+    // (a port is taken). Otherwise the row is silent.
+    if (s.settings.instant_breaks && s.instant_breaks_degraded) {
+      instantBreaksNote.hidden = false;
+      instantBreaksNote.textContent =
+        "Instant breaks unavailable — port 80 or 443 is in use, so breaks may take up to a minute to show in an already-open tab. Blocking is unaffected.";
+    } else {
+      instantBreaksNote.hidden = true;
+      instantBreaksNote.textContent = "";
+    }
     if (!s.password_set) {
       lockStateEl.textContent = "No settings password is set. Configuration can be changed freely.";
       lockStateEl.className = "lock-state";
@@ -1587,23 +1607,43 @@ pwClear.addEventListener("click", async () => {
 // Apply-on-change, revert-on-refusal — the same shape the schedule Enable
 // toggle uses. The daemon gates SetSettings behind the settings lock, so a
 // cancelled unlock (or a refusal) puts the checkbox back to its prior value.
-notificationsToggle.addEventListener("change", async () => {
+//
+// `set_settings` replaces the whole Settings object, so every write sends BOTH
+// fields read from the live checkbox states — sending only the toggled one
+// would reset the other to its server-side default. `toggle` is the input that
+// changed, so a refusal reverts exactly that one.
+async function applySettings(toggle: HTMLInputElement, okMsg: string) {
   prefsMsg.classList.remove("error");
   prefsMsg.textContent = "";
-  const desired = notificationsToggle.checked;
+  const desired = toggle.checked;
   if (!(await ensureUnlocked())) {
-    notificationsToggle.checked = !desired;
+    toggle.checked = !desired;
     return;
   }
   try {
-    await invoke("set_settings", { settings: { notifications: desired } });
-    prefsMsg.textContent = desired ? "notifications on" : "notifications off";
+    await invoke("set_settings", {
+      settings: {
+        notifications: notificationsToggle.checked,
+        instant_breaks: instantBreaksToggle.checked,
+      },
+    });
+    prefsMsg.textContent = okMsg;
+    // The instant-breaks note depends on the new setting + live degraded state.
+    refreshSettings();
   } catch (e) {
-    notificationsToggle.checked = !desired;
+    toggle.checked = !desired;
     prefsMsg.classList.add("error");
     prefsMsg.textContent = String(e);
   }
-});
+}
+
+notificationsToggle.addEventListener("change", () =>
+  applySettings(notificationsToggle, notificationsToggle.checked ? "notifications on" : "notifications off"),
+);
+
+instantBreaksToggle.addEventListener("change", () =>
+  applySettings(instantBreaksToggle, instantBreaksToggle.checked ? "instant breaks on" : "instant breaks off"),
+);
 
 // ─── License ────────────────────────────────────────────────────────────────
 

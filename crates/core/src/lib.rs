@@ -941,17 +941,29 @@ pub struct Settings {
     /// Desktop notifications (block start/end). Default ON, preserving
     /// today's behaviour.
     pub notifications: bool,
+    /// Point blocked domains at `127.0.0.1` and hold a loopback proxy there
+    /// while any block is active, so a blocked connection is refused instantly
+    /// by our own listener instead of resolving to a dark `0.0.0.0`. Default
+    /// ON. Read only by `enforce`; toggling it is a later stage.
+    ///
+    /// Like `notifications`, the hand-written [`Default`] below sets this
+    /// `true`, so an old state file whose `settings` object predates the field
+    /// fills it from the default (ON) rather than from serde's bool zero
+    /// (OFF) — see the container-level `#[serde(default)]`.
+    pub instant_breaks: bool,
 }
 
 impl Default for Settings {
     /// HAND-WRITTEN, deliberately not `#[derive(Default)]`: derive would give
-    /// `notifications: false`, silently disabling notifications for every
-    /// existing user the moment they upgrade to a daemon that reads this
-    /// field. The default must preserve the pre-settings behaviour, which was
-    /// notifications always on.
+    /// every `bool` `false`, silently disabling both notifications and
+    /// instant-breaks for every existing user the moment they upgrade to a
+    /// daemon that reads these fields. The default must preserve the
+    /// pre-settings behaviour, which was notifications always on, and match
+    /// the on-by-default intent of instant-breaks.
     fn default() -> Self {
         Self {
             notifications: true,
+            instant_breaks: true,
         }
     }
 }
@@ -1220,6 +1232,12 @@ pub enum Response {
         /// object fills the same way.
         #[serde(default)]
         settings: Settings,
+        /// True when `settings.instant_breaks` is on and a block is active but
+        /// the loopback proxy could not bind both ports, so breaks lag on this
+        /// machine. Drives a GUI notice explaining why. `#[serde(default)]`:
+        /// an old daemon never emits it and the client reads `false`.
+        #[serde(default)]
+        instant_breaks_degraded: bool,
     },
     Added {
         id: u64,
@@ -1497,6 +1515,37 @@ mod tests {
         assert!(!s.notifications);
     }
 
+    // The instant-breaks default is load-bearing in the same way notifications
+    // is: a #[derive(Default)] would give `false` and silently turn the
+    // feature off for every upgrading user.
+    #[test]
+    fn settings_default_has_instant_breaks_on() {
+        assert!(Settings::default().instant_breaks);
+    }
+
+    // Upgrade compat: a 0.3.0 state whose `settings` object predates
+    // `instant_breaks` (it has only `notifications`) must load with
+    // `instant_breaks == true`, filled from the hand-written default via the
+    // container-level #[serde(default)] — NOT the bool zero (false).
+    #[test]
+    fn old_settings_without_instant_breaks_defaults_on() {
+        let old = r#"{
+            "next_id": 1,
+            "blocks": [],
+            "active": [],
+            "settings": { "notifications": true }
+        }"#;
+        let st: State = serde_json::from_str(old).unwrap();
+        assert!(
+            st.settings.instant_breaks,
+            "a settings object missing instant_breaks must fill it from the default (ON)"
+        );
+        assert!(st.settings.notifications, "notifications is still honoured");
+        // And a bare Settings object missing the field does the same.
+        let s: Settings = serde_json::from_str(r#"{"notifications":true}"#).unwrap();
+        assert!(s.instant_breaks);
+    }
+
     // Pin the SetSettings wire tag under the "method" discriminant.
     #[test]
     fn set_settings_wire_tag_round_trips() {
@@ -1507,13 +1556,16 @@ mod tests {
             req,
             Request::SetSettings {
                 settings: Settings {
-                    notifications: false
+                    notifications: false,
+                    // Omitted on the wire, so it fills from the default (ON).
+                    instant_breaks: true,
                 }
             }
         ));
         let json = serde_json::to_string(&Request::SetSettings {
             settings: Settings {
                 notifications: true,
+                instant_breaks: true,
             },
         })
         .unwrap();
@@ -2579,6 +2631,7 @@ mod tests {
                 cycles_total: 4,
             }),
             settings: Settings::default(),
+            instant_breaks_degraded: false,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();

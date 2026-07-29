@@ -19,6 +19,7 @@ mod dns;
 mod enforce;
 mod hosts;
 mod ipc;
+mod listener;
 mod nftables;
 mod paths;
 mod procwatch;
@@ -42,6 +43,23 @@ pub struct Daemon {
     /// `None` means unknown/dirty — the next `enforce::sync` re-applies
     /// unconditionally. See `enforce::sync`.
     pub applied: Mutex<Option<enforce::Applied>>,
+    /// The loopback proxy while it is running, or `None` when no ports are
+    /// held (instant-breaks off, or nothing blocked).
+    ///
+    /// Taken ONLY by `enforce::sync`, and only with `applied` already held, so
+    /// it extends the documented lock order to `applied` → `listener` without
+    /// adding a second route to it. Nothing releases it at shutdown: the
+    /// kernel closes the sockets when the process exits, and the offline
+    /// teardown path (`grepfocusd cleanup`) runs with the daemon stopped, so
+    /// there is nothing left bound for it to free.
+    pub listener: Mutex<Option<listener::ProxyListener>>,
+    /// Domains the loopback proxy may forward RIGHT NOW: those on a break this
+    /// instant that are not otherwise enforced (see `enforce::forwardable_set`).
+    /// Rewritten by `enforce::sync` each tick under the state lock; read by the
+    /// proxy's per-connection decision hook. A `std::sync::Mutex` on purpose —
+    /// it is a leaf lock held for microseconds and NEVER across an await, so the
+    /// accept path takes no tokio lock and cannot deadlock against the daemon.
+    pub forwardable: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Claims from the verified `state.license_token`, or `None` when
     /// unlicensed or the stored token failed verification. Derived and
     /// in-memory only — rebuilt at startup and on `SetLicense`.
@@ -57,6 +75,11 @@ pub struct Daemon {
     /// "accumulate in memory, persist when something else saves" pattern. No
     /// fsync per kill; a crash loses at most the unflushed count.
     pub app_kills_pending: std::sync::atomic::AtomicU64,
+    /// Whether instant breaks are wanted (setting on, a block active) but the
+    /// loopback proxy could not bind both ports — so breaks lag on this machine.
+    /// Set by `enforce::sync` each tick, read by `GetStatus` so the GUI can say
+    /// why. In-memory only; enforcement never depends on it.
+    pub instant_breaks_degraded: std::sync::atomic::AtomicBool,
 }
 
 /// Wall-clock "now" (unix seconds) for license checks, clamped so a rewound
@@ -223,9 +246,12 @@ async fn run_daemon() -> anyhow::Result<()> {
         key,
         unlocked_until: Mutex::new(0),
         applied: Mutex::new(None),
+        listener: Mutex::new(None),
+        forwardable: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         license: Mutex::new(license),
         break_challenges: Mutex::new(std::collections::HashMap::new()),
         app_kills_pending: std::sync::atomic::AtomicU64::new(0),
+        instant_breaks_degraded: std::sync::atomic::AtomicBool::new(false),
     });
 
     // Re-apply the union of all still-active blocks before accepting clients.

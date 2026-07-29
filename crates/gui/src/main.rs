@@ -126,6 +126,9 @@ struct StatusOut {
     /// Current cross-cutting preferences, so the frontend can render toggles
     /// (e.g. the notifications checkbox) off the same status poll.
     settings: Settings,
+    /// Instant breaks wanted but a loopback port would not bind, so the
+    /// frontend can explain why breaks lag on this machine.
+    instant_breaks_degraded: bool,
 }
 
 #[tauri::command]
@@ -146,6 +149,7 @@ async fn get_status() -> Result<StatusOut, String> {
             licensed_features,
             pomodoro,
             settings,
+            instant_breaks_degraded,
         } => Ok(StatusOut {
             active,
             now_unix,
@@ -161,6 +165,7 @@ async fn get_status() -> Result<StatusOut, String> {
             licensed_features,
             pomodoro,
             settings,
+            instant_breaks_degraded,
         }),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),
