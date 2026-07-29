@@ -28,9 +28,10 @@
 //!   browser shows its own connection error rather than a certificate warning.
 //!
 //! Only a domain the daemon marked forwardable is ever spliced, and that set is
-//! exactly the domains the user themselves blocked and is currently on a break
-//! from. A local process cannot add blocks, so it cannot make the proxy forward
-//! anything else — it is never a general forwarder. See [`Decide`].
+//! the domains under a block that is on a break right now. The splice dials the
+//! domain's real resolved IP, so it is never a relay to a target the caller
+//! could not already reach directly, and the dial guard refuses loopback and
+//! link-local so it can never be pointed back at us. See [`Decide`].
 //!
 //! # Failure policy
 //!
@@ -102,7 +103,7 @@
 //! shifts before then: run the daemon with `CAP_NET_BIND_SERVICE` and drop the
 //! rest, which buys most of the isolation without a second process.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -216,11 +217,16 @@ const PORTS: [(u16, Probe); 2] = [(HTTP_PORT, Probe::Http), (HTTPS_PORT, Probe::
 /// Decides, per connection, whether a parsed hostname may be forwarded to the
 /// real server (`true`) or must be refused (`false`).
 ///
-/// This is the entire security boundary of the forwarding path. `enforce::sync`
+/// This is the security boundary of the forwarding path. `enforce::sync`
 /// supplies a closure that answers `true` ONLY for a domain on a break right
-/// now that is not otherwise enforced — a set the user themselves created by
-/// blocking that domain and taking a break from it. A local process cannot add
-/// blocks, so it cannot widen this set; the proxy is never a general forwarder.
+/// now that is not otherwise enforced — the domains the user blocked and is on
+/// a break from. A process with access to the IPC socket (mode `0o660`, and
+/// unlocked by default) could add a block of its own to widen the set, but that
+/// buys nothing: [`forward`] dials the domain's *real resolved IP* and pipes
+/// raw bytes, so the caller only ever reaches a host it could already reach
+/// directly. The proxy is never a relay to a target otherwise unreachable, and
+/// never a general forwarder of arbitrary destinations.
+///
 /// Called on the accept path, so it must not block or take a tokio lock — the
 /// supplied closure reads a leaf `std::sync::Mutex` and returns at once.
 pub type Decide = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -561,20 +567,33 @@ async fn resolve_upstream(host: &str, port: u16) -> Option<SocketAddr> {
     first_dialable_addr(addrs)
 }
 
-/// The first address that is safe to dial.
-///
-/// Excludes loopback and the unspecified address (which would splice the proxy
-/// back into itself), and — defence in depth — the IPv4 link-local range
-/// `169.254.0.0/16`, which contains the cloud-metadata endpoint
-/// `169.254.169.254`. Only a domain the user themselves blocked and is on a
-/// break from can ever reach here, so this is belt-and-braces, but it is a
-/// stable one-line guard against ever dialing that range on their behalf.
+/// The first address that is safe to dial. `find` returns the first address
+/// that *itself* passes, so a mixed result set can never sneak an unsafe dial
+/// through behind a safe one.
 fn first_dialable_addr(mut addrs: impl Iterator<Item = SocketAddr>) -> Option<SocketAddr> {
-    addrs.find(|a| {
-        let ip = a.ip();
-        let link_local = matches!(ip, std::net::IpAddr::V4(v4) if v4.is_link_local());
-        !ip.is_loopback() && !ip.is_unspecified() && !link_local
-    })
+    addrs.find(|a| safe_to_dial(a.ip()))
+}
+
+/// Whether it is safe to forward to `ip`.
+///
+/// Excludes loopback and the unspecified address (dialing either would splice
+/// the proxy back into itself), and — defence in depth — the IPv4 link-local
+/// range `169.254.0.0/16`, which holds the cloud-metadata endpoint
+/// `169.254.169.254`. Only a domain the user themselves blocked and is on a
+/// break from ever reaches here, so this is belt-and-braces, but it costs
+/// almost nothing.
+///
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is first folded to its IPv4
+/// form, so a mapped loopback or link-local address cannot slip past the checks
+/// below — `Ipv6Addr::is_loopback` is true only for `::1`, not for
+/// `::ffff:127.0.0.1`.
+fn safe_to_dial(ip: IpAddr) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    };
+    let link_local = matches!(ip, IpAddr::V4(v4) if v4.is_link_local());
+    !ip.is_loopback() && !ip.is_unspecified() && !link_local
 }
 
 /// Read at most [`MAX_READ`] bytes, trying the parser as soon as the bytes that
@@ -1806,14 +1825,23 @@ mod tests {
         ];
         assert_eq!(first_dialable_addr(addrs.into_iter()), Some(real));
 
-        // Loopback, unspecified, and IPv4 link-local (169.254/16, the cloud
-        // metadata range) → nothing safe to dial.
-        let unsafe_only: [SocketAddr; 3] = [
+        // Loopback, unspecified, IPv4 link-local (169.254/16, the cloud
+        // metadata range), and their IPv4-mapped-IPv6 disguises → nothing safe
+        // to dial. `::ffff:127.0.0.1` must not slip past the loopback guard.
+        let unsafe_only: [SocketAddr; 5] = [
             "127.0.0.1:80".parse().unwrap(),
             "[::1]:80".parse().unwrap(),
             "169.254.169.254:80".parse().unwrap(),
+            "[::ffff:127.0.0.1]:80".parse().unwrap(),
+            "[::ffff:169.254.169.254]:80".parse().unwrap(),
         ];
-        assert_eq!(first_dialable_addr(unsafe_only.into_iter()), None);
+        for a in unsafe_only {
+            assert_eq!(
+                first_dialable_addr(std::iter::once(a)),
+                None,
+                "{a} must be refused"
+            );
+        }
     }
 
     /// End to end: `splice` writes the replayed head to the upstream first, then

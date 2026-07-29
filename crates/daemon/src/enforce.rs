@@ -405,7 +405,15 @@ fn union_domains(active: &[ActiveBlock], now: u64) -> Vec<String> {
 ///
 /// Pure over `(active, now, union)` — the caller passes the clock in.
 fn forwardable_set(active: &[ActiveBlock], now: u64, union: &[String]) -> HashSet<String> {
-    let enforced: HashSet<&str> = union.iter().map(String::as_str).collect();
+    // Lowercased on both sides so the subtraction is case-insensitive: a domain
+    // still enforced as `Reddit.com` must exclude an on-break `reddit.com`, or
+    // it would be marked forwardable while `/etc/hosts` still points it at the
+    // loopback sink. (The dial-time loopback guard is the hard backstop, but
+    // this keeps the set itself honest.)
+    let enforced: HashSet<String> = union
+        .iter()
+        .map(|d| d.trim().to_ascii_lowercase())
+        .collect();
     let mut out = HashSet::new();
     for a in active {
         if a.break_until_unix.is_none_or(|t| t <= now) {
@@ -413,10 +421,13 @@ fn forwardable_set(active: &[ActiveBlock], now: u64, union: &[String]) -> HashSe
         }
         for d in &a.block.domains {
             let d = d.trim();
-            if d.is_empty() || enforced.contains(d) {
+            if d.is_empty() {
                 continue;
             }
             let lower = d.to_ascii_lowercase();
+            if enforced.contains(&lower) {
+                continue;
+            }
             if !lower.starts_with("www.") {
                 out.insert(format!("www.{lower}"));
             }
@@ -505,9 +516,11 @@ mod tests {
 
         // On a break but STILL enforced by another block (in the union): it
         // resolves to 127.0.0.1, so it must be excluded to avoid a self-loop.
+        // Case-insensitively — an enforced `reddit.com` must exclude an on-break
+        // `Reddit.com`, not leak it into the forwardable set.
         let union = vec!["reddit.com".to_string()];
         assert!(
-            forwardable_set(&[active(&["reddit.com"], Some(now + 60))], now, &union).is_empty()
+            forwardable_set(&[active(&["Reddit.com"], Some(now + 60))], now, &union).is_empty()
         );
 
         // An already-expired break is not forwardable.
