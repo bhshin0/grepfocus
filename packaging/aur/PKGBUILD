@@ -1,0 +1,64 @@
+# Maintainer: Bryan <bhshin@gmail.com>
+#
+# Source-of-truth PKGBUILD for the AUR package `grepfocus`. The live AUR repo is
+# a separate git repo (ssh://aur@aur.archlinux.org/grepfocus.git); copy this
+# file, grepfocus.install, and a regenerated .SRCINFO there to publish. See
+# README.md in this directory.
+#
+# This mirrors packaging/grepfocus.spec: same daemon + systemd unit + sysusers +
+# tmpfiles layout, relocated from the dev /usr/local/bin to /usr/bin.
+
+pkgname=grepfocus
+pkgver=0.5.0
+pkgrel=1
+pkgdesc="Website and app blocker for Linux"
+arch=('x86_64')
+url="https://grepfocus.com"
+# Source-available, not OSI open source: PolyForm Shield permits any use except
+# building something that competes with GrepFocus. See the bundled LICENSE.
+license=('custom:PolyForm-Shield-1.0.0')
+depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3' 'nftables' 'libayatana-appindicator')
+makedepends=('rust' 'nodejs' 'pnpm')
+install="$pkgname.install"
+source=("$pkgname-$pkgver.tar.gz::https://github.com/bhshin0/grepfocus/archive/refs/tags/v$pkgver.tar.gz")
+# TODO: set after tagging v0.5.0 (see README.md):
+#   curl -fsSL https://github.com/bhshin0/grepfocus/archive/refs/tags/v0.5.0.tar.gz | sha256sum
+sha256sums=('SKIP')
+
+build() {
+    cd "$pkgname-$pkgver"
+    export CARGO_TARGET_DIR=target
+    # The Tauri build embeds ui/dist at compile time and a plain `cargo build`
+    # does not run tauri.conf.json's beforeBuildCommand, so the UI must be built
+    # BEFORE cargo (same ordering as the RPM spec).
+    pnpm --dir crates/gui/ui install --frozen-lockfile
+    pnpm --dir crates/gui/ui build
+    cargo build --release --locked
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+
+    install -Dm755 target/release/grepfocusd "$pkgdir/usr/bin/grepfocusd"
+    install -Dm755 target/release/grepfocus-gui "$pkgdir/usr/bin/grepfocus-gui"
+
+    install -Dm644 packaging/systemd/grepfocusd.service \
+        "$pkgdir/usr/lib/systemd/system/grepfocusd.service"
+    install -Dm644 packaging/systemd/80-grepfocus.preset \
+        "$pkgdir/usr/lib/systemd/system-preset/80-grepfocus.preset"
+    install -Dm644 packaging/sysusers.d/grepfocus.conf \
+        "$pkgdir/usr/lib/sysusers.d/grepfocus.conf"
+    install -Dm644 packaging/tmpfiles.d/grepfocus.conf \
+        "$pkgdir/usr/lib/tmpfiles.d/grepfocus.conf"
+    install -Dm644 packaging/grepfocus.desktop \
+        "$pkgdir/usr/share/applications/grepfocus.desktop"
+    install -Dm644 crates/gui/icons/icon.png \
+        "$pkgdir/usr/share/icons/hicolor/64x64/apps/grepfocus.png"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+    # The sources hardcode /usr/local/bin for the dev scripts; the package puts
+    # the binaries in /usr/bin. Patch the STAGED copies only (same sed as the spec).
+    sed -i 's|/usr/local/bin/|/usr/bin/|g' \
+        "$pkgdir/usr/lib/systemd/system/grepfocusd.service" \
+        "$pkgdir/usr/share/applications/grepfocus.desktop"
+}

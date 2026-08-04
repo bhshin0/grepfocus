@@ -27,6 +27,9 @@
     "allow-take-break",
     "allow-get-break-challenge",
     "allow-start-pomodoro",
-    "allow-stop-pomodoro"
+    "allow-stop-pomodoro",
+    "allow-app-env",
+    "allow-install-service",
+    "allow-uninstall-service"
   ]
 }

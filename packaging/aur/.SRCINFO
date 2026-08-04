@@ -1,0 +1,20 @@
+pkgbase = grepfocus
+	pkgdesc = Website and app blocker for Linux
+	pkgver = 0.5.0
+	pkgrel = 1
+	url = https://grepfocus.com
+	install = grepfocus.install
+	arch = x86_64
+	license = custom:PolyForm-Shield-1.0.0
+	makedepends = rust
+	makedepends = nodejs
+	makedepends = pnpm
+	depends = webkit2gtk-4.1
+	depends = gtk3
+	depends = libsoup3
+	depends = nftables
+	depends = libayatana-appindicator
+	source = grepfocus-0.5.0.tar.gz::https://github.com/bhshin0/grepfocus/archive/refs/tags/v0.5.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = grepfocus

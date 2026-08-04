@@ -20,6 +20,9 @@ fn main() {
             "get_break_challenge",
             "start_pomodoro",
             "stop_pomodoro",
+            "app_env",
+            "install_service",
+            "uninstall_service",
         ]));
     tauri_build::try_build(attributes).expect("tauri-build failed");
 }

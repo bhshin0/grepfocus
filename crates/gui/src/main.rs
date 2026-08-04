@@ -311,6 +311,178 @@ async fn delete_schedule(id: u64) -> Result<(), String> {
     }
 }
 
+/// What the frontend needs to know about how the app is running. Today only
+/// whether we're an AppImage — which gates the first-run "install the system
+/// service" flow: the pkexec installer only makes sense from an AppImage
+/// (package installs already set the daemon up). AppRun sets $APPIMAGE.
+#[derive(serde::Serialize)]
+struct AppEnv {
+    appimage: bool,
+}
+
+#[tauri::command]
+fn app_env() -> AppEnv {
+    AppEnv {
+        appimage: std::env::var_os("APPIMAGE").is_some(),
+    }
+}
+
+/// Install the system service from inside an AppImage by running the bundled
+/// installer as root via pkexec. The daemon binary + unit/config files ride
+/// along in the AppImage as Tauri resources (bundle.resources ->
+/// resource_dir()/payload/); the script relocates them and enables the unit.
+/// See packaging/appimage/appimage-install.sh.
+#[tauri::command]
+async fn install_service(app: AppHandle) -> Result<(), String> {
+    // Resolve the target user in-process (the desktop user running the GUI),
+    // not from the frontend — the script usermod's them into the grepfocus group.
+    let user = std::env::var("USER").unwrap_or_default();
+    run_service_script(&app, "install", Some(user)).await
+}
+
+#[tauri::command]
+async fn uninstall_service(app: AppHandle) -> Result<(), String> {
+    run_service_script(&app, "uninstall", None).await
+}
+
+/// The payload files the privileged installer needs. The script must be first —
+/// the bootstrap executes `$tmp/appimage-install.sh` after verifying everything.
+const PAYLOAD_FILES: [&str; 5] = [
+    "appimage-install.sh",
+    "grepfocusd",
+    "grepfocusd.service",
+    "grepfocus.sysusers.conf",
+    "grepfocus.tmpfiles.conf",
+];
+
+/// Runs as root under `pkexec /bin/sh -c BOOTSTRAP sh <action> <user> [<staged
+/// path> <sha256>]...`. Copies each staged file into a fresh ROOT-owned temp
+/// dir, verifies the sha256 of the root-owned copy, and only then executes the
+/// installer from that dir. Exit 97 = integrity mismatch.
+const BOOTSTRAP: &str = r#"
+set -eu
+action="$1"; tgt_user="$2"; shift 2
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+while [ "$#" -ge 2 ]; do
+    src="$1"; sha="$2"; shift 2
+    base=${src##*/}
+    cp -- "$src" "$tmp/$base"
+    printf '%s  %s\n' "$sha" "$tmp/$base" | sha256sum -c - >/dev/null 2>&1 \
+        || { printf 'integrity check failed: %s\n' "$base" >&2; exit 97; }
+done
+/bin/sh "$tmp/appimage-install.sh" "$action" "$tgt_user"
+"#;
+
+/// Run the bundled appimage-install.sh as root via pkexec.
+///
+/// This CANNOT execute the script straight from the AppImage mount: the mount
+/// is user-private FUSE (no allow_other), which the kernel makes unreadable to
+/// every other uid INCLUDING root — pkexec would authorize fine and then root's
+/// shell would fail to even open the script. So instead: we (the mounting user)
+/// stage the payload into a private temp dir and hash it, then the pkexec'd
+/// BOOTSTRAP re-copies the files into a root-owned temp dir and re-verifies the
+/// hashes there before executing. The expected hashes travel in pkexec's argv,
+/// which no other process can alter, and root hashes its own copies — so a
+/// same-user process swapping staged files between the auth prompt and root
+/// execution is caught, closing the classic user-writable-path race.
+async fn run_service_script(
+    app: &AppHandle,
+    action: &str,
+    user: Option<String>,
+) -> Result<(), String> {
+    let payload_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("cannot locate bundled resources: {e}"))?
+        .join("payload");
+    if !payload_dir.join(PAYLOAD_FILES[0]).exists() {
+        return Err(format!(
+            "installer payload not found under {} — is this the AppImage build?",
+            payload_dir.display()
+        ));
+    }
+
+    let action = action.to_string();
+    let output =
+        tauri::async_runtime::spawn_blocking(move || -> Result<std::process::Output, String> {
+            use std::os::unix::fs::PermissionsExt;
+
+            let stage =
+                std::env::temp_dir().join(format!("grepfocus-stage-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&stage);
+            std::fs::create_dir(&stage).map_err(|e| format!("cannot create staging dir: {e}"))?;
+            std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("cannot restrict staging dir: {e}"))?;
+
+            let run = (|| -> Result<std::process::Output, String> {
+                let mut pairs: Vec<(std::path::PathBuf, String)> = Vec::new();
+                for name in PAYLOAD_FILES {
+                    let dst = stage.join(name);
+                    std::fs::copy(payload_dir.join(name), &dst)
+                        .map_err(|e| format!("cannot stage {name}: {e}"))?;
+                    let out = std::process::Command::new("sha256sum")
+                        .arg(&dst)
+                        .output()
+                        .map_err(|e| format!("cannot hash {name}: {e}"))?;
+                    if !out.status.success() {
+                        return Err(format!("sha256sum failed for {name}"));
+                    }
+                    let hash = String::from_utf8_lossy(&out.stdout)
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    if hash.len() != 64 {
+                        return Err(format!("unexpected sha256 output for {name}"));
+                    }
+                    pairs.push((dst, hash));
+                }
+
+                let mut cmd = std::process::Command::new("pkexec");
+                cmd.arg("/bin/sh")
+                    .arg("-c")
+                    .arg(BOOTSTRAP)
+                    .arg("sh")
+                    .arg(&action)
+                    .arg(user.as_deref().unwrap_or(""));
+                for (path, hash) in &pairs {
+                    cmd.arg(path).arg(hash);
+                }
+                cmd.output()
+                    .map_err(|e| format!("failed to launch pkexec: {e}"))
+            })();
+
+            let _ = std::fs::remove_dir_all(&stage);
+            run
+        })
+        .await
+        .map_err(|e| format!("failed to launch installer: {e}"))??;
+
+    if output.status.success() {
+        return Ok(());
+    }
+    // pkexec itself: 126 = auth dialog dismissed, 127 = not authorized — but
+    // once the program runs, the exit code is the program's, so only trust
+    // those meanings when the run produced no stderr of its own.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    match output.status.code() {
+        Some(126) if stderr.is_empty() => Err("Authorization was dismissed.".to_string()),
+        Some(127) if stderr.is_empty() => {
+            Err("Authentication failed or not authorized.".to_string())
+        }
+        Some(97) => Err(
+            "Installer bundle failed its integrity check — re-download the AppImage.".to_string(),
+        ),
+        code => Err(format!(
+            "Installer failed (exit {}): {}",
+            code.unwrap_or(-1),
+            stderr
+        )),
+    }
+}
+
 /// Fire a desktop notification. Best-effort — failures are ignored so a
 /// missing notification daemon never disrupts the app.
 fn notify(app: &AppHandle, title: &str, body: &str) {
@@ -418,7 +590,45 @@ fn spawn_status_watcher(app: AppHandle) {
     });
 }
 
+/// When running from an AppImage, point the bundled libwebkit2gtk at its own
+/// helper processes. It looks for WebKitWebProcess / WebKitNetworkProcess and
+/// the injected bundle at a compiled-in absolute path (the Ubuntu build
+/// host's), which doesn't exist on other distros -> the page never loads.
+/// WEBKIT_EXEC_PATH / WEBKIT_INJECTED_BUNDLE_PATH redirect it to the copies
+/// under $APPDIR. Must run before GTK/webkit initialize (before
+/// tauri::Builder::run) and only under $APPIMAGE, so native installs
+/// (rpm/deb/AUR — no $APPIMAGE) are untouched. Set only if unset, so a user
+/// can still override.
+///
+/// The other half of "renders on an arbitrary host" is handled at build time:
+/// build-appimage.sh strips every bundled libwayland-*.so so the HOST copy is
+/// used — the host's Mesa EGL stack hard-requires its own libwayland version
+/// (e.g. wl_fixes_interface, wayland 1.23), and a shadowing older copy makes
+/// EGL fail entirely, SIGABRTing the web process.
+fn configure_appimage_webview_env() {
+    if std::env::var_os("APPIMAGE").is_none() {
+        return;
+    }
+    if let Some(appdir) = std::env::var_os("APPDIR") {
+        let base = std::path::Path::new(&appdir).join("usr/lib/x86_64-linux-gnu/webkit2gtk-4.1");
+        set_env_if_unset("WEBKIT_EXEC_PATH", base.as_os_str());
+        set_env_if_unset(
+            "WEBKIT_INJECTED_BUNDLE_PATH",
+            base.join("injected-bundle").as_os_str(),
+        );
+    }
+}
+
+fn set_env_if_unset(key: &str, val: &std::ffi::OsStr) {
+    if std::env::var_os(key).is_none() {
+        std::env::set_var(key, val);
+    }
+}
+
 fn main() {
+    // AppImage-only webview env fixes; must precede any GTK/webkit init below.
+    configure_appimage_webview_env();
+
     // wry's custom URI scheme handler is unreliable on this webkit2gtk-4.1
     // build (2.52). Serve embedded assets via a real localhost HTTP server
     // instead. Note: this URL is treated as "remote" by Tauri 2's ACL, so
@@ -544,6 +754,9 @@ fn main() {
             get_break_challenge,
             start_pomodoro,
             stop_pomodoro,
+            app_env,
+            install_service,
+            uninstall_service,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

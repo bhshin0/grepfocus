@@ -578,3 +578,13 @@ dialog .row { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
   border: 1px solid var(--border);
   display: inline-block;
 }
+
+/* Per-block mini grid inside a block card's schedule section. Reuses every
+   .week-* rule; just drops the 560px floor so it fits the card (still scrolls
+   sideways via the inherited .week-scroll) and shrinks the window text for the
+   smaller 12px/hour columns. */
+.week-mini .week-grid { min-width: 0; }
+.week-mini .week-window {
+  font-size: 10px;
+  padding: 0 3px;
+}

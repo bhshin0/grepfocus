@@ -230,6 +230,24 @@
       </form>
     </dialog>
 
+    <!--
+      First-run system-service installer. Shown only when the daemon is
+      unreachable — in an AppImage that means either "not installed yet" (offer
+      the pkexec installer) or, right after installing, "log out and back in"
+      for the new group membership. Package installs already set the daemon up,
+      so this never appears there. Driven from main.ts's refreshStatus.
+    -->
+    <dialog id="firstrun-dialog">
+      <form id="firstrun-form" method="dialog">
+        <h3 id="firstrun-title">Set up GrepFocus</h3>
+        <p class="hint" id="firstrun-body"></p>
+        <div class="row">
+          <button type="button" id="firstrun-action">Install system service</button>
+        </div>
+        <p id="firstrun-msg" class="msg"></p>
+      </form>
+    </dialog>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

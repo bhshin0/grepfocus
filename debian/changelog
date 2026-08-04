@@ -1,3 +1,10 @@
+grepfocus (0.5.0-1) unstable; urgency=medium
+
+  * Each block's schedule card now shows a compact weekly grid of its windows.
+  * New schedules prefill their name from the block they belong to.
+
+ -- Bryan <bhshin@gmail.com>  Mon, 03 Aug 2026 19:49:24 -0700
+
 grepfocus (0.4.0-1) unstable; urgency=medium
 
   * Instant breaks: a blocked site becomes reachable the moment a break starts,

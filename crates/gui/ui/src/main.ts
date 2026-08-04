@@ -589,6 +589,17 @@ function renderBlockCard(
   if (schedules.length === 0) {
     schedList.appendChild(emptyLi("No schedules for this block yet."));
   } else {
+    // Compact week grid above the text rows: one column set for THIS block, so
+    // drop the redundant block name from each window label. The now line stays
+    // for at-a-glance "is a window live right now" context.
+    const mini = buildWeekGrid(schedules, {
+      blockName: () => b.name,
+      windowLabel: (_s, _n, range) => range,
+      hourPx: 12,
+      showNow: true,
+    });
+    mini.classList.add("week-mini");
+    schedList.before(mini);
     for (const s of schedules) schedList.appendChild(renderScheduleRow(s));
   }
   li.querySelector<HTMLButtonElement>(".add-sched-btn")!.addEventListener("click", () => {
@@ -635,6 +646,8 @@ function statusInteractionBusy(): boolean {
 async function refreshStatus() {
   try {
     const s = await invoke<Status>("get_status");
+    // Reaching the daemon means any first-run installer prompt is now moot.
+    hideFirstRun();
     activeServerSkew = s.now_unix - Math.floor(Date.now() / 1000);
     // Premium is all-or-nothing: a valid license reveals the Stats tab, an
     // invalid/absent one hides it. This poll is the single place license
@@ -666,6 +679,8 @@ async function refreshStatus() {
     p.textContent = String(e);
     statusEl.appendChild(p);
     stopCountdownTimer();
+    // In an AppImage a daemon-unreachable error is the first-run signal.
+    handleDaemonUnreachable(e);
   }
 }
 
@@ -1186,9 +1201,14 @@ function openScheduleDialog(intent: SchedIntent, blockName?: string) {
     // reset() already restored the markup defaults; `id` has no wire meaning
     // on an add, and the daemon assigns the real one.
     idInput.value = "";
+    // Default the name to the block this schedule is under — the common case is
+    // one schedule per block, so prefill it (selected below, so it's trivial to
+    // type over when you do want a distinct name).
+    if (blockName) nameInput.value = blockName;
   }
   schedDialog.showModal();
   nameInput.focus();
+  nameInput.select();
 }
 
 function closeScheduleDialog() {
@@ -1296,28 +1316,32 @@ function fmtMinute(m: number): string {
   return `${String(h).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 }
 
-/// Rebuild the Week grid from scratch: one 7-day × 24-hour column set showing
-/// every schedule's windows, colour-coded per block. Read-only apart from
-/// click-to-edit. Mirrors `refreshList`'s fetch (degrade to empty on failure).
-async function refreshWeek() {
-  weekEl.innerHTML = "";
-  const [blocks, schedules] = await Promise.all([
-    invoke<Block[]>("list_blocks").catch(() => []),
-    invoke<Schedule[]>("list_schedules").catch(() => []),
-  ]);
-
-  if (schedules.length === 0) {
-    weekEl.appendChild(emptyDiv("No schedules yet — add one from a block's card."));
-    return;
-  }
-
-  const blockName = new Map<number, string>();
-  for (const b of blocks) blockName.set(b.id, b.name);
+/// Build the read-only week grid DOM shared by the Week tab and each block
+/// card's mini grid: a `.week-scroll` box wrapping a `.week-grid` with a time
+/// axis and 7 day columns (Mon→Sun), every schedule window colour-coded per
+/// block and click-to-edit. Returns the `.week-scroll` node; the caller owns
+/// any legend. `opts.blockName` maps a block id to its display name;
+/// `opts.windowLabel` overrides the default `${name} ${range}` window text (the
+/// title tooltip is unchanged); `opts.hourPx` (default 22) sets the per-hour
+/// column height via the `--week-hour` CSS var; `opts.showNow` (default true)
+/// toggles the local-clock "now" line.
+function buildWeekGrid(
+  schedules: Schedule[],
+  opts: {
+    blockName: (id: number) => string;
+    windowLabel?: (s: Schedule, name: string, range: string) => string;
+    hourPx?: number;
+    showNow?: boolean;
+  },
+): HTMLElement {
+  const hourPx = opts.hourPx ?? 22;
+  const showNow = opts.showNow ?? true;
 
   // Scroll the grid inside its own box: on a narrow window the grid scrolls
   // sideways here, the page body never does.
   const scroller = document.createElement("div");
   scroller.className = "week-scroll";
+  scroller.style.setProperty("--week-hour", hourPx + "px");
   const grid = document.createElement("div");
   grid.className = "week-grid";
 
@@ -1346,7 +1370,6 @@ async function refreshWeek() {
   const now = new Date();
   const todayBit = now.getDay(); // 0 = Sun … 6 = Sat — matches the wire bitmask.
   const nowMinutes = now.getHours() * 60 + now.getMinutes();
-  const usedBlockIds = new Set<number>();
 
   for (const bit of DISPLAY_DAYS) {
     const col = document.createElement("div");
@@ -1379,7 +1402,6 @@ async function refreshWeek() {
     const laneCount = Math.max(1, laneEnds.length);
 
     for (const s of todays) {
-      usedBlockIds.add(s.block_id);
       const lane = laneOf.get(s) ?? 0;
       const win = document.createElement("div");
       win.className = `week-window${s.enabled ? "" : " disabled"}`;
@@ -1391,9 +1413,10 @@ async function refreshWeek() {
       const pal = WEEK_PALETTE[s.block_id % WEEK_PALETTE.length];
       win.style.background = pal.fill;
       win.style.color = pal.text;
-      const name = blockName.get(s.block_id) ?? `#${s.block_id}`;
+      const name = opts.blockName(s.block_id);
       const range = `${fmtMinute(s.start_minute)}–${fmtMinute(s.start_minute + s.duration_minutes)}`;
-      win.textContent = `${name} ${range}${s.enabled ? "" : " (off)"}`;
+      const label = opts.windowLabel ? opts.windowLabel(s, name, range) : `${name} ${range}`;
+      win.textContent = `${label}${s.enabled ? "" : " (off)"}`;
       win.title = `${name} · ${DAY_LABEL[bit]} · ${range}${s.enabled ? "" : " (disabled)"}`;
       // Reuse the exact edit entry point the block-card rows use — no new dialog.
       win.addEventListener("click", () => {
@@ -1404,7 +1427,7 @@ async function refreshWeek() {
 
     // "Now" marker across today's column at the current local minute. A
     // wall-clock week view wants the local clock — no `activeServerSkew`.
-    if (bit === todayBit) {
+    if (showNow && bit === todayBit) {
       const line = document.createElement("div");
       line.className = "week-now";
       line.style.top = `${(nowMinutes / 1440) * 100}%`;
@@ -1416,7 +1439,36 @@ async function refreshWeek() {
   }
 
   scroller.appendChild(grid);
-  weekEl.appendChild(scroller);
+  return scroller;
+}
+
+/// Rebuild the Week grid from scratch: one 7-day × 24-hour column set showing
+/// every schedule's windows, colour-coded per block. Read-only apart from
+/// click-to-edit. Mirrors `refreshList`'s fetch (degrade to empty on failure).
+async function refreshWeek() {
+  weekEl.innerHTML = "";
+  const [blocks, schedules] = await Promise.all([
+    invoke<Block[]>("list_blocks").catch(() => []),
+    invoke<Schedule[]>("list_schedules").catch(() => []),
+  ]);
+
+  if (schedules.length === 0) {
+    weekEl.appendChild(emptyDiv("No schedules yet — add one from a block's card."));
+    return;
+  }
+
+  const blockName = new Map<number, string>();
+  for (const b of blocks) blockName.set(b.id, b.name);
+
+  weekEl.appendChild(
+    buildWeekGrid(schedules, { blockName: (id) => blockName.get(id) ?? `#${id}` }),
+  );
+
+  // Which blocks have a window rendered somewhere in the grid — a schedule
+  // shows iff it fires on at least one of the 7 display days (bits 0–6). Mirrors
+  // the `usedBlockIds` the inlined grid used to accumulate, for the legend.
+  const usedBlockIds = new Set<number>();
+  for (const s of schedules) if ((s.days & 0b1111111) !== 0) usedBlockIds.add(s.block_id);
 
   // Legend: one chip per block that has at least one schedule, in config order.
   const legend = document.createElement("div");
@@ -2275,7 +2327,146 @@ function emptyLi(text: string): HTMLLIElement {
   return li;
 }
 
+// ─── First-run system-service installer ──────────────────────────────────────
+//
+// Shown when the daemon is unreachable. In an AppImage that means either "not
+// installed yet" (offer the pkexec installer via install_service) or, right
+// after installing, "log out and back in" — the new grepfocus group membership
+// needs a fresh login. Package installs already set the daemon up so this never
+// appears; on a non-AppImage dev run we leave the existing per-tab error alone.
+
+interface AppEnv {
+  appimage: boolean;
+}
+
+let appEnv: AppEnv | null = null;
+
+const firstRunDialog = document.querySelector<HTMLDialogElement>("#firstrun-dialog")!;
+const firstRunTitle = document.querySelector<HTMLElement>("#firstrun-title")!;
+const firstRunBody = document.querySelector<HTMLElement>("#firstrun-body")!;
+const firstRunMsg = document.querySelector<HTMLElement>("#firstrun-msg")!;
+const firstRunAction = document.querySelector<HTMLButtonElement>("#firstrun-action")!;
+
+type FirstRunMode = "install" | "relogin";
+let firstRunMode: FirstRunMode | null = null;
+// True while the install click owns the dialog (pkexec in flight or waiting for
+// the fresh daemon to answer). Blocks the background status poll's error
+// handler from resetting the dialog state mid-flow — without this, a poll
+// landing between "install finished" and "daemon accepting connections" flips
+// the dialog back to the install screen.
+let firstRunBusy = false;
+
+// Esc must not dismiss this into an unusable app.
+firstRunDialog.addEventListener("cancel", (ev) => ev.preventDefault());
+
+function showFirstRun(mode: FirstRunMode) {
+  firstRunMode = mode;
+  firstRunMsg.classList.remove("error");
+  firstRunMsg.textContent = "";
+  firstRunAction.disabled = false;
+  if (mode === "install") {
+    firstRunTitle.textContent = "Set up GrepFocus";
+    firstRunBody.textContent =
+      "GrepFocus needs a small background service to enforce blocks. Install it now? You'll be asked to authorize with your password.";
+    firstRunAction.textContent = "Install system service";
+  } else {
+    firstRunTitle.textContent = "Almost there";
+    firstRunBody.textContent =
+      "The GrepFocus service is installed. Log out and back in to finish — your new group membership needs a fresh login — then reopen GrepFocus.";
+    firstRunAction.textContent = "Retry";
+  }
+  if (!firstRunDialog.open) firstRunDialog.showModal();
+}
+
+function hideFirstRun() {
+  firstRunMode = null;
+  if (firstRunDialog.open) firstRunDialog.close();
+}
+
+// Classify a daemon-unreachable error and show the right first-run state. The
+// error strings come from crates/gui/src/client.rs.
+function handleDaemonUnreachable(err: unknown) {
+  if (firstRunBusy) return; // the install flow owns the dialog right now
+  const msg = String(err);
+  if (msg.includes("not allowed to talk")) {
+    // Socket exists but we lack group membership — installed, needs relogin.
+    showFirstRun("relogin");
+  } else if (appEnv?.appimage) {
+    // Nothing listening on the socket + we're an AppImage → not installed yet.
+    showFirstRun("install");
+  }
+  // Otherwise (non-AppImage): leave today's per-tab error visible, no modal.
+}
+
+/// Poll the daemon until it answers, the socket denies us (needs relogin), or
+/// the timeout runs out. The freshly-installed unit is Type=simple, so
+/// systemctl returns before the socket exists — a fixed post-install sleep
+/// would be a guess; polling reacts the moment it is actually up.
+async function waitForDaemon(timeoutMs: number): Promise<"ok" | "denied" | "timeout"> {
+  const start = Date.now();
+  for (;;) {
+    try {
+      await invoke("get_status");
+      return "ok";
+    } catch (e) {
+      if (String(e).includes("not allowed to talk")) return "denied";
+      if (Date.now() - start >= timeoutMs) return "timeout";
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+}
+
+firstRunAction.addEventListener("click", async () => {
+  if (firstRunMode === "relogin") {
+    // The user says they've logged back in — re-poll; success hides the dialog.
+    firstRunMsg.classList.remove("error");
+    firstRunMsg.textContent = "Checking…";
+    refreshStatus();
+    return;
+  }
+  firstRunBusy = true;
+  firstRunAction.disabled = true;
+  firstRunMsg.classList.remove("error");
+  firstRunMsg.textContent = "Installing… authorize when prompted.";
+  try {
+    await invoke("install_service");
+    firstRunMsg.textContent = "Service installed — waiting for it to start…";
+    switch (await waitForDaemon(15000)) {
+      case "ok":
+        // Already in the grepfocus group (e.g. reinstall) — done, no relogin.
+        hideFirstRun();
+        refreshStatus();
+        break;
+      case "denied":
+        // Fresh install: usermod ran but this login predates it.
+        showFirstRun("relogin");
+        break;
+      case "timeout":
+        firstRunMsg.classList.add("error");
+        firstRunMsg.textContent =
+          "The service was installed but isn't answering yet. It may still be starting — this screen will close by itself once it's reachable.";
+        firstRunAction.disabled = false;
+        break;
+    }
+  } catch (e) {
+    firstRunMsg.classList.add("error");
+    firstRunMsg.textContent = String(e);
+    firstRunAction.disabled = false;
+  } finally {
+    firstRunBusy = false;
+  }
+});
+
 // ─── Boot ──────────────────────────────────────────────────────────────────
 
-refreshStatus();
-window.setInterval(refreshStatus, 5000);
+void (async () => {
+  // Learn whether we're an AppImage before the first poll so a daemon-down
+  // first tick can show the installer immediately instead of after 5s.
+  try {
+    appEnv = await invoke<AppEnv>("app_env");
+  } catch {
+    appEnv = null;
+  }
+  refreshStatus();
+  window.setInterval(refreshStatus, 5000);
+})();
