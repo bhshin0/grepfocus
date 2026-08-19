@@ -9,7 +9,7 @@
 # tmpfiles layout, relocated from the dev /usr/local/bin to /usr/bin.
 
 pkgname=grepfocus
-pkgver=0.5.0
+pkgver=0.5.1
 pkgrel=1
 pkgdesc="Website and app blocker for Linux"
 arch=('x86_64')
@@ -21,8 +21,8 @@ depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3' 'nftables' 'libayatana-appindicator'
 makedepends=('rust' 'nodejs' 'pnpm')
 install="$pkgname.install"
 source=("$pkgname-$pkgver.tar.gz::https://github.com/bhshin0/grepfocus/archive/refs/tags/v$pkgver.tar.gz")
-# TODO: set after tagging v0.5.0 (see README.md):
-#   curl -fsSL https://github.com/bhshin0/grepfocus/archive/refs/tags/v0.5.0.tar.gz | sha256sum
+# TODO: set after tagging v0.5.1 (see README.md):
+#   curl -fsSL https://github.com/bhshin0/grepfocus/archive/refs/tags/v0.5.1.tar.gz | sha256sum
 sha256sums=('SKIP')
 
 build() {

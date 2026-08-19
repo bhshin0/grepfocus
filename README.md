@@ -222,7 +222,13 @@ that Cold Turkey beats either.
 - **Custom DoH/DoT endpoints.** An `nftables` table drops DoH (TCP 443)
   and DNS-over-TLS (TCP/UDP 853) to known public resolver IPs, so stock
   Firefox/Chrome DoH can't bypass `/etc/hosts` — but unlisted or
-  self-hosted endpoints are allowed by design.
+  self-hosted endpoints are allowed by design. Mullvad Browser's default
+  resolver (`dns.mullvad.net`) is on the list, and since that browser
+  uses DoH-only mode by default (no system-resolver fallback), it loses
+  DNS entirely while a block is active — all sites, not just blocked
+  ones; use a regular browser during blocks. A system resolver doing
+  DoT to `dns.mullvad.net` hits the same documented case as `1.1.1.1`
+  below.
 - **System resolvers doing DoT to a listed IP.** The flip side of that
   table: if your system resolver does DNS-over-TLS to one of the listed
   public resolver IPs (e.g. systemd-resolved with `DNSOverTLS=yes`

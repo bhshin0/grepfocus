@@ -1,3 +1,10 @@
+grepfocus (0.5.1-1) unstable; urgency=medium
+
+  * Block Mullvad and Mozilla DoH resolver endpoints (closes the Mullvad
+    Browser bypass of active blocks).
+
+ -- Bryan <bhshin@gmail.com>  Mon, 18 Aug 2026 12:00:00 -0700
+
 grepfocus (0.5.0-1) unstable; urgency=medium
 
   * Each block's schedule card now shows a compact weekly grid of its windows.

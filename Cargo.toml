@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 # Source-available, not OSI open source: PolyForm Shield permits any use
 # EXCEPT building something that competes with GrepFocus. See LICENSE.

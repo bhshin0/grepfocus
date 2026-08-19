@@ -12,7 +12,7 @@
 %global debug_package %{nil}
 
 Name:           grepfocus
-Version:        0.5.0
+Version:        0.5.1
 Release:        1%{?dist}
 Summary:        Website and app blocker for Linux
 
@@ -122,6 +122,10 @@ fi
 %dir %attr(0700,root,root) %{_sharedstatedir}/grepfocus
 
 %changelog
+* Mon Aug 18 2026 Bryan <bhshin@gmail.com> - 0.5.1-1
+- Block Mullvad and Mozilla DoH resolver endpoints (closes the Mullvad
+  Browser bypass of active blocks)
+
 * Mon Aug 03 2026 Bryan <bhshin@gmail.com> - 0.5.0-1
 - Each block's schedule card now shows a compact weekly grid of its windows
 - New schedules prefill their name from the block they belong to

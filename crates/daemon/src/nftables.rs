@@ -2,8 +2,9 @@
 //!
 //! We install a small `inet` table that drops TCP 443 (DoH) and TCP/UDP
 //! 853 (DNS-over-TLS) traffic to known public DoH resolver IPs. This
-//! closes the bypass where browsers — chiefly Firefox — skip `/etc/hosts`
-//! by resolving names directly via Cloudflare/Mozilla over HTTPS.
+//! closes the bypass where browsers — chiefly Firefox and Mullvad
+//! Browser — skip `/etc/hosts` by resolving names directly via
+//! Cloudflare/Mozilla/Mullvad over HTTPS.
 //!
 //! Trade-offs (documented, not fixed):
 //! - Doesn't catch DoH providers we don't list (custom endpoints,
@@ -14,6 +15,10 @@
 //!   line we draw for custom DoH. An unscoped 853 drop would kill ALL
 //!   DNS for a system resolver (e.g. systemd-resolved) doing DoT to a
 //!   private or custom endpoint: an effective network brick.
+//! - Mullvad Browser ships TRR-only DoH (`network.trr.mode=3`, no
+//!   native-resolver fallback), so with its resolver IPs listed it loses
+//!   ALL DNS during active blocks — same accepted class as the
+//!   listed-DoT-resolver case below.
 //! - A system resolver doing DoT to a *listed* public IP (e.g.
 //!   `1.1.1.1:853`) still loses DNS during active blocks. The README
 //!   documents it.
@@ -64,6 +69,18 @@ const DOH_V4: &[&str] = &[
     // NextDNS anycast
     "45.90.28.0/24",
     "45.90.30.0/24",
+    // Mullvad (dns/adblock/base/extended/family/all.dns.mullvad.net —
+    // Mullvad Browser's built-in TRR-only default resolver)
+    "194.242.2.2",
+    "194.242.2.3",
+    "194.242.2.4",
+    "194.242.2.5",
+    "194.242.2.6",
+    "194.242.2.9",
+    // Mozilla's Firefox DoH default (mozilla.cloudflare-dns.com — anycast,
+    // distinct from 1.1.1.1; IPs can rotate, best-effort)
+    "162.159.61.4",
+    "172.64.41.4",
 ];
 
 const DOH_V6: &[&str] = &[
@@ -79,6 +96,18 @@ const DOH_V6: &[&str] = &[
     // AdGuard
     "2a10:50c0::ad1:ff",
     "2a10:50c0::ad2:ff",
+    // Mullvad (dns/adblock/base/extended/family/all.dns.mullvad.net —
+    // Mullvad Browser's built-in TRR-only default resolver)
+    "2a07:e340::2",
+    "2a07:e340::3",
+    "2a07:e340::4",
+    "2a07:e340::5",
+    "2a07:e340::6",
+    "2a07:e340::9",
+    // Mozilla's Firefox DoH default (mozilla.cloudflare-dns.com — anycast,
+    // distinct from 1.1.1.1; IPs can rotate, best-effort)
+    "2803:f800:53::4",
+    "2a06:98c1:52::4",
 ];
 
 /// Build an `nft` invocation bounded by coreutils `timeout` (SIGTERM at
@@ -191,6 +220,9 @@ mod tests {
         assert!(r.contains("1.1.1.1"));
         assert!(r.contains("8.8.8.8"));
         assert!(r.contains("2606:4700:4700::1111"));
+        assert!(r.contains("194.242.2.2"));
+        assert!(r.contains("2a07:e340::2"));
+        assert!(r.contains("162.159.61.4"));
         assert!(r.contains("tcp dport 443 drop"));
         assert!(r.contains("tcp dport 853 drop"));
         assert!(r.contains("udp dport 853 drop"));
