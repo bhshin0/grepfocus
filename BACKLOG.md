@@ -59,6 +59,22 @@ review findings — so they don't have to be re-derived later.
   "GrepFocus — daemon unreachable" (without touching the notification
   baseline `prev`).
 
+## Input hardening, health, DoH policies, updates (2026-09-28)
+
+Status: **in progress** — WP1 (core validators, `State::sanitize`, health
+wire types) and WP2 (daemon + GUI input hardening, procwatch guards) landed
+on `hardening-health`; WP3–WP7 pending. Design record:
+`docs/plans/hardening-health-updates.md`. Pending release-note lines (the
+next `Release x.y.z` commit owns the changelog files):
+
+- Block content is validated: domains must be hostnames (URLs are trimmed to
+  the hostname; IP literals, wildcards and single labels are refused), app
+  matchers must be well-formed and may not target GrepFocus itself, a block
+  needs at least one domain or app; stored entries are canonicalized at
+  startup and unusable legacy entries are dropped with a journal warning.
+- App blocking never kills root processes (system services, `sudo`/`pkexec`-
+  launched apps) or GrepFocus itself.
+
 ## Decisions
 
 - **Rename to grepfocus: DONE (2026-07-10).** Deferred on 2026-07-04 (then
@@ -166,6 +182,21 @@ to be redone when the item is picked up.
   crate/binary names, systemd unit, socket path `/run/grepfocus`, unix
   group, hosts markers, nft table name, `/var` + `/etc` dirs,
   `.desktop`/icon, Tauri identifier, GitHub repo.
+- **Multi-user procwatch scoping** — app matchers apply to every non-root
+  process on the machine, whoever owns it (README → *Known limits*). The
+  fix is to record the requesting uid on `ActiveBlock` (`SO_PEERCRED` on
+  the accepted socket — `UnixStream::peer_cred`; nothing reads it today,
+  the group on the socket file is the whole authorization) and have
+  `procwatch::sweep` compare it against the process's effective uid; the
+  guard set (`is_protected`) stays as is. Needs a decision on schedules and
+  pomodoro activations, which have no requesting client.
+- **Save-time breadth check for app matchers** — a `cmdline:` pattern such
+  as `cmdline:bin` is well-formed but matches nearly every process,
+  including the desktop session (README → *Recovery* has the escape). The
+  daemon could count the processes currently matching a new or changed
+  matcher at `AddBlock`/`UpdateBlock` time and refuse above a threshold (or
+  when it would hit the caller's own session). Reads `/proc` under the IPC
+  lock, so it needs the same `spawn_blocking` treatment as Argon2.
 - **[FIXED — UX polish] GNOME tray invisibility** — stock GNOME ships no
   StatusNotifier host, so the tray icon never appeared and close-to-tray made
   the app invisible after its first close. The GUI now probes for a host at

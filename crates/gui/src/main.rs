@@ -24,8 +24,13 @@ async fn list_blocks() -> Result<Vec<Block>, String> {
     }
 }
 
+/// Save a new block. The content validator is core's — the same one the
+/// daemon runs — so a refusal reaches the user with the daemon's exact text
+/// and no round trip; the daemon stays authoritative and re-validates.
 #[tauri::command]
 async fn add_block(block: Block) -> Result<u64, String> {
+    let mut block = block;
+    grepfocus_core::validate::validate_block(&mut block)?;
     match client::call(Request::AddBlock { block }).await? {
         Response::Added { id } => Ok(id),
         Response::Error { message } => Err(message),
@@ -38,9 +43,12 @@ async fn add_block(block: Block) -> Result<u64, String> {
 /// allowance and lock cannot be softened mid-flight; the frontend disables its
 /// edit form for active blocks rather than inviting that refusal. It also
 /// normalizes the allowance policy and its legacy mirror on save, so a client
-/// frame need only be coherent, not canonical.
+/// frame need only be coherent, not canonical. Domains and app matchers are
+/// validated here first, as in `add_block`.
 #[tauri::command]
 async fn update_block(block: Block) -> Result<(), String> {
+    let mut block = block;
+    grepfocus_core::validate::validate_block(&mut block)?;
     match client::call(Request::UpdateBlock { block }).await? {
         Response::Ok {} => Ok(()),
         Response::Error { message } => Err(message),

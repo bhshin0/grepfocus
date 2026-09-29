@@ -31,6 +31,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use grepfocus_core::license::features;
+use grepfocus_core::validate::normalize_domain;
 use grepfocus_core::{now_unix, ActiveBlock};
 use tracing::{debug, info, warn};
 
@@ -374,8 +375,14 @@ async fn ensure_detection(daemon: &Daemon, want: bool) -> Detection {
 }
 
 /// Deduplicated, sorted union of all domains across the active blocks that are
-/// currently being enforced. Blocks on a break (`break_until_unix > now`) are
-/// skipped so their domains resolve again until the break ends.
+/// currently being enforced, in canonical form. Blocks on a break
+/// (`break_until_unix > now`) are skipped so their domains resolve again
+/// until the break ends.
+///
+/// Every entry passes through `normalize_domain` on its way in, so nothing
+/// that cannot be one `/etc/hosts` name reaches the writer: stored content is
+/// canonical after the startup sanitize, but the active copies are what gets
+/// written as root, and this is the tick that writes them.
 fn union_domains(active: &[ActiveBlock], now: u64) -> Vec<String> {
     let mut set: BTreeSet<String> = BTreeSet::new();
     for a in active {
@@ -383,9 +390,15 @@ fn union_domains(active: &[ActiveBlock], now: u64) -> Vec<String> {
             continue;
         }
         for d in &a.block.domains {
-            let d = d.trim();
-            if !d.is_empty() {
-                set.insert(d.to_string());
+            match normalize_domain(d) {
+                Ok(n) => {
+                    set.insert(n);
+                }
+                // `debug!`: this runs on every 1 s tick, and the startup
+                // sanitize already warned once about anything it dropped.
+                Err(e) => {
+                    debug!(domain = ?d, block = a.block.id, %e, "skipping invalid stored domain")
+                }
             }
         }
     }
@@ -399,39 +412,37 @@ fn union_domains(active: &[ActiveBlock], now: u64) -> Vec<String> {
 /// (i.e. still enforced by some other, non-break block). The subtraction is
 /// essential — a domain still in the union is written to `/etc/hosts` as the
 /// loopback sink, so resolving it returns `127.0.0.1` and forwarding it would
-/// splice the proxy into itself. Each surviving domain is lowercased (matching
-/// the parsers' output) and its `www.` alias added (matching
-/// `hosts::render_block`), so whichever form the browser cached is recognised.
+/// splice the proxy into itself. Each surviving domain is canonicalized
+/// (lowercase, matching the wire parsers' output) and its `www.` alias added
+/// (matching `hosts::render_block`), so whichever form the browser cached is
+/// recognised.
 ///
 /// Pure over `(active, now, union)` — the caller passes the clock in.
 fn forwardable_set(active: &[ActiveBlock], now: u64, union: &[String]) -> HashSet<String> {
-    // Lowercased on both sides so the subtraction is case-insensitive: a domain
-    // still enforced as `Reddit.com` must exclude an on-break `reddit.com`, or
-    // it would be marked forwardable while `/etc/hosts` still points it at the
-    // loopback sink. (The dial-time loopback guard is the hard backstop, but
-    // this keeps the set itself honest.)
-    let enforced: HashSet<String> = union
-        .iter()
-        .map(|d| d.trim().to_ascii_lowercase())
-        .collect();
+    // Canonical on both sides so the subtraction is exact: `union` comes out
+    // of `union_domains` already normalized, and an on-break entry goes
+    // through the same `normalize_domain` here. Otherwise a domain still
+    // enforced as `reddit.com` would not exclude an on-break `Reddit.com.`,
+    // which would be marked forwardable while `/etc/hosts` still points it at
+    // the loopback sink. (The dial-time loopback guard is the hard backstop,
+    // but this keeps the set itself honest.)
+    let enforced: HashSet<&str> = union.iter().map(String::as_str).collect();
     let mut out = HashSet::new();
     for a in active {
         if a.break_until_unix.is_none_or(|t| t <= now) {
             continue; // not on a break — the union already covers it
         }
         for d in &a.block.domains {
-            let d = d.trim();
-            if d.is_empty() {
+            let Ok(canonical) = normalize_domain(d) else {
+                continue; // never written, so never resolves to us
+            };
+            if enforced.contains(canonical.as_str()) {
                 continue;
             }
-            let lower = d.to_ascii_lowercase();
-            if enforced.contains(&lower) {
-                continue;
+            if !canonical.starts_with("www.") {
+                out.insert(format!("www.{canonical}"));
             }
-            if !lower.starts_with("www.") {
-                out.insert(format!("www.{lower}"));
-            }
-            out.insert(lower);
+            out.insert(canonical);
         }
     }
     out
@@ -498,33 +509,86 @@ mod tests {
         }
     }
 
-    /// Forwardable = on-break domains, lowercased with the `www.` alias, MINUS
-    /// anything still enforced by a non-break block (which would self-loop).
+    /// Forwardable = on-break domains, canonicalized with the `www.` alias,
+    /// MINUS anything still enforced by a non-break block (which would
+    /// self-loop).
     #[test]
     fn forwardable_is_on_break_minus_union() {
         let now = 1_000;
 
         // Solo break: domain removed from the union, so forwardable — both the
-        // lowercased name and its www. alias, matching how it was written.
-        let set = forwardable_set(&[active(&["Reddit.com"], Some(now + 60))], now, &[]);
-        assert!(set.contains("reddit.com"));
-        assert!(set.contains("www.reddit.com"));
-        assert_eq!(set.len(), 2);
+        // canonical name and its www. alias, matching how it was written. A
+        // trailing dot and capitals (a legacy or hand-written active copy)
+        // canonicalize the same way `union_domains` would have written them.
+        for raw in ["Reddit.com", "reddit.com.", "REDDIT.COM."] {
+            let set = forwardable_set(&[active(&[raw], Some(now + 60))], now, &[]);
+            assert!(set.contains("reddit.com"), "raw {raw:?}");
+            assert!(set.contains("www.reddit.com"), "raw {raw:?}");
+            assert_eq!(set.len(), 2, "raw {raw:?}");
+        }
 
         // Not on a break → the union covers it, never forwardable.
         assert!(forwardable_set(&[active(&["reddit.com"], None)], now, &[]).is_empty());
 
         // On a break but STILL enforced by another block (in the union): it
         // resolves to 127.0.0.1, so it must be excluded to avoid a self-loop.
-        // Case-insensitively — an enforced `reddit.com` must exclude an on-break
-        // `Reddit.com`, not leak it into the forwardable set.
+        // Whatever form the on-break copy carries — an enforced `reddit.com`
+        // must exclude an on-break `Reddit.com` or `reddit.com.`, not leak it
+        // into the forwardable set.
         let union = vec!["reddit.com".to_string()];
-        assert!(
-            forwardable_set(&[active(&["Reddit.com"], Some(now + 60))], now, &union).is_empty()
-        );
+        for raw in ["Reddit.com", "reddit.com.", "REDDIT.COM."] {
+            assert!(
+                forwardable_set(&[active(&[raw], Some(now + 60))], now, &union).is_empty(),
+                "raw {raw:?}"
+            );
+        }
+
+        // An entry that cannot be a hostname is never written, so it is never
+        // forwardable either.
+        assert!(forwardable_set(
+            &[active(
+                &["reddit.com\n0.0.0.0 evil.example"],
+                Some(now + 60)
+            )],
+            now,
+            &[]
+        )
+        .is_empty());
 
         // An already-expired break is not forwardable.
         assert!(forwardable_set(&[active(&["reddit.com"], Some(now - 1))], now, &[]).is_empty());
+    }
+
+    /// The union is what `/etc/hosts` is written from, so every entry is
+    /// canonical and anything that cannot be one hostname is left out.
+    #[test]
+    fn union_domains_canonicalizes_and_drops_invalid() {
+        let now = 1_000;
+        let union = union_domains(
+            &[
+                active(
+                    &["Reddit.com", "reddit.com.", "https://twitter.com/home"],
+                    None,
+                ),
+                active(
+                    &[
+                        "reddit.com\n0.0.0.0 evil.example",
+                        "localhost",
+                        "1.2.3.4",
+                        "*.example.com",
+                        "",
+                    ],
+                    None,
+                ),
+                // On a break: contributes nothing, valid or not.
+                active(&["news.ycombinator.com"], Some(now + 60)),
+            ],
+            now,
+        );
+        assert_eq!(
+            union,
+            vec!["reddit.com".to_string(), "twitter.com".to_string()]
+        );
     }
 
     #[test]

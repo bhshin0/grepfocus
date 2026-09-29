@@ -30,11 +30,11 @@
         <h2>New block</h2>
         <form id="new-block-form">
           <label>Name <input name="name" required /></label>
-          <label>Domains (one per line)
+          <label>Domains (one per line — hostnames only, e.g. reddit.com; the www. form is blocked too)
             <textarea name="domains" rows="4" placeholder="reddit.com&#10;twitter.com"></textarea>
           </label>
-          <label>App exe paths or basenames (one per line)
-            <textarea name="apps" rows="4" placeholder="/usr/bin/steam&#10;discord"></textarea>
+          <label>App exe paths, basenames, or cmdline:&lt;substring&gt; (one per line)
+            <textarea name="apps" rows="4" placeholder="/usr/bin/steam&#10;discord&#10;cmdline:com.discordapp.Discord"></textarea>
           </label>
           <label>Break allowance
             <select name="allowance_kind">

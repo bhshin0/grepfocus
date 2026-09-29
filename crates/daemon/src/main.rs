@@ -220,6 +220,17 @@ async fn run_daemon() -> anyhow::Result<()> {
         }
     };
 
+    // Canonicalize stored block content — the saved blocks and the copies
+    // inside active blocks, which is what enforcement reads — before anything
+    // enforces it. Entries written by a pre-validation daemon (or a raw
+    // socket client) that cannot be normalized are dropped here; each change
+    // is one journal line, and the flag-only notes (over-cap lists, invalid
+    // names) repeat every start until the user fixes the block.
+    let notes = initial.sanitize();
+    for n in &notes {
+        warn!(note = %n, "sanitized stored block content");
+    }
+
     // Drop any active blocks that have already expired between shutdown and
     // startup. (They will simply never be re-applied.)
     let before = initial.active.len();
@@ -228,9 +239,9 @@ async fn run_daemon() -> anyhow::Result<()> {
     if dropped > 0 {
         info!(dropped, "discarded expired active blocks on startup");
     }
-    if dropped > 0 {
+    if dropped > 0 || !notes.is_empty() {
         if let Err(e) = state::save(&initial, &key) {
-            error!(?e, "failed to save state after dropping expired actives");
+            error!(?e, "failed to save state after startup sanitize");
         }
     }
 

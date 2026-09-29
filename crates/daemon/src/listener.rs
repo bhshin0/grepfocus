@@ -107,6 +107,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use grepfocus_core::validate;
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -196,7 +197,7 @@ const BLOCK_RESPONSE: &[u8] = b"HTTP/1.1 403 Forbidden\r\n\
 
 /// Longest hostname we will accept, from the DNS name limit. A cheap length
 /// check before anything is allocated.
-const MAX_HOSTNAME: usize = 253;
+const MAX_HOSTNAME: usize = validate::MAX_HOSTNAME_LEN;
 
 /// What a connection on this socket is expected to be speaking. Chosen by the
 /// port we accepted on, never sniffed from the bytes: a plaintext parser must
@@ -873,29 +874,17 @@ fn hostname_from_str(host: &str) -> Option<String> {
 ///
 /// Strict on purpose. Anything reaching here came off the network, and it will
 /// end up in a log line and a desktop notification — so no control characters,
-/// no spaces, no percent-escapes, no wildcards, no `..`, and nothing that
-/// could be read as a path or a shell word. An IDN arrives as punycode
-/// (`xn--…`), which passes; raw UTF-8 does not, which is deliberate — a
-/// hostname that renders as a lookalike of another one has no business in a
+/// no spaces, no percent-escapes, no wildcards, no `..`, no trailing dot, and
+/// nothing that could be read as a path or a shell word. An IDN arrives as
+/// punycode (`xn--…`), which passes; raw UTF-8 does not, which is deliberate —
+/// a hostname that renders as a lookalike of another one has no business in a
 /// notification.
+///
+/// The rule set is core's `hostname_shape`, the same one stored block entries
+/// are canonicalized under, so a name the proxy accepts and a name a block
+/// carries can never disagree about what a hostname is.
 fn plausible_hostname(host: &str) -> bool {
-    if host.is_empty() || host.len() > MAX_HOSTNAME || !host.is_ascii() {
-        return false;
-    }
-    // A trailing dot is legal in DNS but never useful here, and rejecting it
-    // keeps the label rule below to one case.
-    host.split('.').all(|label| {
-        !label.is_empty()
-            && label.len() <= 63
-            // RFC 1123: a label starts and ends with a letter or digit. This
-            // is also what rejects a bare "-", which passes every other rule
-            // here while being nobody's hostname.
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    })
+    validate::hostname_shape(host).is_ok()
 }
 
 /// A bounds-checked cursor over a byte slice.
@@ -1079,6 +1068,41 @@ mod tests {
             parse_host_header(&req("Host: my-site.example\r\n")),
             Some("my-site.example".to_string())
         );
+    }
+
+    /// A stored block entry (canonical form from `normalize_domain`) and the
+    /// hostname the proxy reads off the wire must compare equal, or the
+    /// forwardable set would never match: the wire parser accepts every
+    /// canonical form unchanged, and lowercases a capitalized wire form to it.
+    #[test]
+    fn canonical_domains_round_trip_through_the_wire_parser() {
+        for raw in [
+            "reddit.com",
+            "https://www.Reddit.com/r/rust",
+            "REDDIT.COM:443",
+            "reddit.com.",
+            "  news.ycombinator.com  ",
+            "xn--bcher-kva.example",
+            "my-site.example",
+            "a.b.c.d.example",
+        ] {
+            let canonical = validate::normalize_domain(raw).unwrap();
+            assert_eq!(
+                hostname_from_str(&canonical),
+                Some(canonical.clone()),
+                "raw {raw:?}"
+            );
+            assert_eq!(
+                hostname_from_str(&canonical.to_ascii_uppercase()),
+                Some(canonical.clone()),
+                "raw {raw:?}"
+            );
+            assert_eq!(
+                parse_host_header(&req(&format!("Host: {canonical}\r\n"))),
+                Some(canonical.clone()),
+                "raw {raw:?}"
+            );
+        }
     }
 
     // A single header longer than anything real must neither parse nor cost

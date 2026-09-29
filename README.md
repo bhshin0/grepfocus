@@ -13,7 +13,8 @@ When a block is active, GrepFocus:
   blocked domain (and its `www.` alias) to `0.0.0.0`, then sets `chattr +i`
   so the file cannot be edited until the block ends.
 - **Blocks applications** by polling `/proc` every 500ms and `SIGKILL`ing any
-  process whose exe path, basename, or cmdline matches the blocklist.
+  process whose exe path, basename, or cmdline matches the blocklist and
+  that is not running as root (see *Known limits*).
 - **Survives tampering** within the bounds of what's possible on Linux (see
   *Known limits* below). The daemon auto-restarts on kill, re-applies blocks
   on reboot, and persists state with an HMAC seal so hand-edits to
@@ -160,6 +161,35 @@ A `Block` is `{ id, name, domains: [..], apps: [AppMatcher, ..] }` where
 `AppMatcher` is one of `{kind: "exe_path", path}`, `{kind: "basename", name}`,
 or `{kind: "cmdline", contains}`.
 
+`add_block` and `update_block` validate the content and refuse the frame with
+a plain-language `{ result: "error", message }` when it fails; the GUI runs
+the same validator (`grepfocus_core::validate`) so it shows the same text
+without a round trip. The rules:
+
+- `domains`: hostnames only, one per entry. A pasted URL is trimmed to its
+  host — scheme, path, query, port and one trailing dot are stripped — and
+  the result is lowercased. IP literals, wildcards (`*.example.com`) and
+  single labels (`localhost`) are refused, as is anything that is not
+  letters, digits, dots and hyphens (so a newline or a space can never
+  become a second `/etc/hosts` line). International names go in as punycode
+  (`xn--…`). A name may be at most 249 characters unless it already starts
+  with `www.`, so the alias the daemon adds still fits the 253-character DNS
+  limit. At most 5000 per block.
+- `apps`: an `exe_path` must be absolute and resolved (no `.`, `..` or `//`
+  components — it is compared byte-for-byte with `/proc/<pid>/exe`); a
+  `basename` may not contain `/`; a `cmdline` pattern must be at least 3
+  characters. Nothing may target GrepFocus itself (any matcher containing
+  `grepfocus`, case-insensitively). At most 500 per block.
+- A block needs at least one domain or app, and a name of at most 200
+  characters with no control characters.
+
+Entries are canonicalized on save, and the daemon applies the same rules to
+its stored state at every start: an entry it can normalize is rewritten in
+place, one it cannot is dropped, and each change is one journal line
+(`journalctl -u grepfocusd | grep sanitized`). A block that was saved by an
+older version with more entries than the caps allow keeps working but cannot
+be re-saved until it is trimmed.
+
 ## Recovery
 
 GrepFocus must never brick a machine, so every enforcement artifact has a
@@ -208,6 +238,15 @@ must be world-readable for the resolver in non-root processes:
 sudo install -m 644 /var/lib/grepfocus/hosts.orig /etc/hosts
 ```
 
+A `cmdline:` matcher broad enough to hit your desktop session (say,
+`cmdline:bin`) kills it again within half a second of every login, and the
+GUI cannot delete an active block. Switch to a text console (`Ctrl+Alt+F3`),
+log in, then run `sudo systemctl stop grepfocusd && sudo grepfocusd cleanup`
+and start the daemon again: cleanup clears the persisted active blocks, so
+the block is not re-applied and the saved block can be edited or deleted
+from the GUI. Root processes are never killed, so the console login itself
+is safe.
+
 ## Known limits
 
 We're honest about what we don't defend against. None of these are bypasses
@@ -240,6 +279,19 @@ that Cold Turkey beats either.
   daemon logs a warning when this happens.
 - **VPNs over IP literals.** If the user knows the IP address of a blocked
   site and types it directly, hosts-file blocking won't catch them.
+- **Root processes are never killed.** App blocking skips pid 0 and 1,
+  kernel threads, the daemon itself, and every process whose effective uid
+  is root: system services, setuid helpers, and — the cost — an app you
+  launch through `sudo` or `pkexec`. The boundary is uid 0, not the distro's
+  `UID_MIN`, because a wrong boundary would silently stop blocking your own
+  apps.
+- **Other users' desktop processes ARE killed.** On a shared machine an app
+  matcher applies to every non-root process, whoever owns it; blocks are
+  not scoped to the user who started them.
+- **The `www.` alias is one-directional.** Blocking `reddit.com` also blocks
+  `www.reddit.com`; blocking `www.reddit.com` blocks only that name. Other
+  subdomains (`old.reddit.com`) must be listed explicitly — wildcards are
+  refused.
 - **Uninstalling works even mid-block — by design.** A Cold Turkey-style
   uninstall lockout was considered and deliberately rejected: root is out
   of the threat model (see above), and never bricking a machine beats

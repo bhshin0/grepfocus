@@ -157,14 +157,22 @@ tabs.forEach((btn) => {
 
 // ─── New block form ────────────────────────────────────────────────────────
 
+/// Spelling of a `cmdline` matcher in the app textarea. The block card renders
+/// a saved cmdline matcher with the same prefix, so an Edit → Save round trip
+/// keeps its kind instead of silently turning it into a basename.
+const CMDLINE_PREFIX = "cmdline:";
+
 function parseAppLines(raw: string): AppMatcher[] {
   return raw
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean)
-    .map((line): AppMatcher =>
-      line.startsWith("/") ? { kind: "exe_path", path: line } : { kind: "basename", name: line },
-    );
+    .map((line): AppMatcher => {
+      if (line.startsWith(CMDLINE_PREFIX)) {
+        return { kind: "cmdline", contains: line.slice(CMDLINE_PREFIX.length) };
+      }
+      return line.startsWith("/") ? { kind: "exe_path", path: line } : { kind: "basename", name: line };
+    });
 }
 
 /// Show only the inputs the selected allowance kind actually uses: "none"
@@ -229,9 +237,10 @@ function readBlockForm(form: HTMLFormElement, id: number): Block {
   return {
     id,
     name: String(fd.get("name") ?? "").trim(),
+    // Any whitespace or comma separates entries, so a pasted `reddit.com
+    // twitter.com` becomes two domains rather than one refused entry.
     domains: String(fd.get("domains") ?? "")
-      .split("\n")
-      .map((s) => s.trim())
+      .split(/[\s,]+/)
       .filter(Boolean),
     apps: parseAppLines(String(fd.get("apps") ?? "")),
     allowance_secs_per_day: allowance.kind === "none" ? 0 : allowance.secs,
@@ -458,11 +467,11 @@ function renderBlockCard(
       <form class="edit-block-form">
         <p class="msg warn edit-active-note" hidden>This block is running. Editing is disabled until it ends — the daemon refuses changes to an active block so a running block's allowance and lock cannot be softened mid-flight.</p>
         <label>Name <input name="name" required /></label>
-        <label>Domains (one per line)
-          <textarea name="domains" rows="4"></textarea>
+        <label>Domains (one per line — hostnames only, e.g. reddit.com; the www. form is blocked too)
+          <textarea name="domains" rows="4" placeholder="reddit.com&#10;twitter.com"></textarea>
         </label>
-        <label>App exe paths or basenames (one per line)
-          <textarea name="apps" rows="4"></textarea>
+        <label>App exe paths, basenames, or cmdline:&lt;substring&gt; (one per line)
+          <textarea name="apps" rows="4" placeholder="/usr/bin/steam&#10;discord&#10;cmdline:com.discordapp.Discord"></textarea>
         </label>
         <label>Break allowance
           <select name="allowance_kind">
@@ -499,7 +508,7 @@ function renderBlockCard(
   const apps = b.apps.map((a) => {
     if (a.kind === "exe_path") return a.path;
     if (a.kind === "basename") return a.name;
-    return `cmdline:${a.contains}`;
+    return `${CMDLINE_PREFIX}${a.contains}`;
   });
   const allowanceNote = policyNote(blockPolicy(b)) + liveAllowanceNote(allowance);
   li.querySelector(".meta")!.textContent =
