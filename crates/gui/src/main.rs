@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use grepfocus_core::{
-    ActiveBlock, AllowanceLedger, AllowanceStatus, Block, DayStat, FocusSession, LifetimeTotals,
-    PomodoroStatus, Request, Response, Schedule, Settings,
+    ActiveBlock, AllowanceLedger, AllowanceStatus, Block, DayStat, FocusSession, Health,
+    LifetimeTotals, PomodoroStatus, Request, Response, Schedule, Settings,
 };
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -134,9 +134,14 @@ struct StatusOut {
     /// Current cross-cutting preferences, so the frontend can render toggles
     /// (e.g. the notifications checkbox) off the same status poll.
     settings: Settings,
-    /// Instant breaks wanted but a loopback port would not bind, so the
-    /// frontend can explain why breaks lag on this machine.
+    /// DEPRECATED, still carried: equal to `health.proxy == "degraded"`.
+    /// The frontend's "port in use" notice reads this until it moves to
+    /// `health.proxy`.
     instant_breaks_degraded: bool,
+    /// Enforcement health and daemon identity, passed through untouched. An
+    /// old daemon never emits it, in which case core's default arrives here
+    /// with an empty `daemon_version`.
+    health: Health,
 }
 
 #[tauri::command]
@@ -158,6 +163,7 @@ async fn get_status() -> Result<StatusOut, String> {
             pomodoro,
             settings,
             instant_breaks_degraded,
+            health,
         } => Ok(StatusOut {
             active,
             now_unix,
@@ -174,6 +180,7 @@ async fn get_status() -> Result<StatusOut, String> {
             pomodoro,
             settings,
             instant_breaks_degraded,
+            health: *health,
         }),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),

@@ -37,7 +37,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context};
-use tracing::{debug, warn};
+use tracing::debug;
 
 const NFT: &str = "/usr/sbin/nft";
 const TABLE: &str = "grepfocus_doh";
@@ -167,22 +167,28 @@ pub fn table_exists() -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Remove the table if present. Idempotent — silent on absence.
+/// Remove the table if present. Idempotent — silent on absence. Any other
+/// non-zero exit is an error: a table left behind after a block keeps
+/// dropping DoH, so `enforce::sync` reports it and retries the delete at the
+/// re-verify cadence.
 pub fn clear() -> anyhow::Result<()> {
     let out = nft_command(&["delete", "table", "inet", TABLE])
         .output()
         .context("spawning nft delete")?;
-    if !out.status.success() {
-        // Common case: table doesn't exist (first run, or already cleared).
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("No such file or directory") || stderr.contains("does not exist") {
-            return Ok(());
-        }
-        warn!(stderr = %stderr.trim(), "nft delete returned non-zero");
-    } else {
+    if out.status.success() {
         debug!("removed nftables DoH block table");
+        return Ok(());
     }
-    Ok(())
+    // Common case: table doesn't exist (first run, or already cleared).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("No such file or directory") || stderr.contains("does not exist") {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "nft delete failed (status {}): {}",
+        out.status,
+        stderr.trim()
+    ))
 }
 
 fn build_ruleset() -> String {

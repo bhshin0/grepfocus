@@ -25,6 +25,13 @@
 //! an nft failure is degraded-but-enforced, and a failed bind costs nothing
 //! but the instant-refusal, since the sink simply stays `0.0.0.0` and blocking
 //! is untouched.
+//!
+//! Every outcome — each half of an apply, a failed apply, an nft re-install
+//! from the probe, a hosts drift re-apply, the live proxy state — is recorded
+//! in `daemon.health` (see `health`) so `GetStatus` can report what used to
+//! be journal-only. A teardown whose `nft delete` failed leaves the memo
+//! marked not-ok on an empty union, and `sync` retries the delete at the
+//! `REVERIFY_SECS` cadence until the table is gone.
 
 use std::collections::{BTreeSet, HashSet};
 use std::net::Ipv4Addr;
@@ -32,9 +39,10 @@ use std::sync::Arc;
 
 use grepfocus_core::license::features;
 use grepfocus_core::validate::normalize_domain;
-use grepfocus_core::{now_unix, ActiveBlock};
+use grepfocus_core::{now_unix, ActiveBlock, HostsLockStatus, NftStatus, ProxyStatus};
 use tracing::{debug, info, warn};
 
+use crate::health;
 use crate::listener::{Decide, ProxyListener};
 use crate::{dns, has_feature, hosts, nftables, Daemon};
 
@@ -155,13 +163,27 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
     // Record for `GetStatus`: instant breaks were wanted but a port would not
     // bind, so breaks lag here and the GUI should say why. Set every tick,
     // outside the memo, so it tracks the live state rather than the last apply.
-    daemon.instant_breaks_degraded.store(
-        matches!(detection, Detection::Degraded),
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    daemon.health().set_proxy(proxy_status(detection));
     let sink = sink_ip(detection);
     if let Some(prev) = applied.as_mut() {
         if prev.matches(&domains, sink) {
+            // A teardown that could not delete the DoH table (`nft_ok` false
+            // on an EMPTY union) keeps dropping DoH while nothing is blocked.
+            // Retry at the probe cadence — `needs_probe` never fires on an
+            // empty union, so this comes first. `debug!` on the miss: on a
+            // host with a broken nft this repeats forever.
+            if domains.is_empty() && !prev.nft_ok && now.abs_diff(prev.verified_at) >= REVERIFY_SECS
+            {
+                let res = nftables::clear();
+                daemon.health().teardown_retried(res.as_ref().map(|_| ()));
+                match &res {
+                    Ok(()) => info!("nftables DoH table removed after earlier teardown failure"),
+                    Err(e) => debug!(?e, "nftables DoH table still present — will retry"),
+                }
+                prev.nft_ok = res.is_ok();
+                prev.verified_at = now;
+                return Ok(());
+            }
             if !needs_probe(&domains, prev.verified_at, now) {
                 return Ok(());
             }
@@ -175,7 +197,12 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
                 if prev.nft_ok {
                     warn!("nftables DoH table drifted (firewall reload?) — re-installing");
                 }
-                match nftables::apply() {
+                let prev_ok = prev.nft_ok;
+                let res = nftables::apply();
+                daemon
+                    .health()
+                    .nft_reprobed(prev_ok, res.as_ref().map(|_| ()));
+                match res {
                     Ok(()) => {
                         if !prev.nft_ok {
                             info!("nftables DoH table installed after earlier failure");
@@ -194,6 +221,7 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
                 return Ok(());
             }
             warn!("enforcement drift detected — re-applying");
+            daemon.health().hosts_drift_detected();
         }
     }
     // `applied` still holds the PREVIOUS union here — it is only replaced on
@@ -207,7 +235,7 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
         sink,
     );
     match apply(&domains, sink, tamper_protect) {
-        Ok(nft_ok) => {
+        Ok(outcome) => {
             // Only after the change actually landed, and only when the set of
             // blocked domains really moved: a drift re-apply rewrites
             // /etc/hosts with an identical union, so no cached lookup can
@@ -217,6 +245,8 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
             if changed {
                 dns::flush_caches();
             }
+            let nft_ok = outcome.nft_ok();
+            daemon.health().apply_succeeded(outcome.nft, outcome.hosts);
             *applied = Some(Applied {
                 domains,
                 sink,
@@ -227,6 +257,7 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
         }
         Err(e) => {
             *applied = None;
+            daemon.health().apply_failed(&e, now);
             Err(e)
         }
     }
@@ -311,6 +342,15 @@ fn sink_ip(detection: Detection) -> Ipv4Addr {
     match detection {
         Detection::Listening => Ipv4Addr::LOCALHOST,
         Detection::Off | Detection::Degraded => Ipv4Addr::UNSPECIFIED,
+    }
+}
+
+/// The wire form of a detection, for `health`.
+fn proxy_status(detection: Detection) -> ProxyStatus {
+    match detection {
+        Detection::Off => ProxyStatus::Off,
+        Detection::Listening => ProxyStatus::Holding,
+        Detection::Degraded => ProxyStatus::Degraded,
     }
 }
 
@@ -448,6 +488,43 @@ fn forwardable_set(active: &[ActiveBlock], now: u64, union: &[String]) -> HashSe
     out
 }
 
+/// What one successful `apply` left behind: the nft half and the hosts lock,
+/// for the memo and for `health`. The hosts CONTENT is implied — a content
+/// failure is `apply`'s only `Err`.
+struct ApplyOutcome {
+    nft: NftStatus,
+    hosts: HostsLockStatus,
+}
+
+impl ApplyOutcome {
+    /// Whether the memo may trust the nft half. `Failed` (install) and
+    /// `StaleTable` (teardown) both read as not-ok, so each of the two
+    /// re-probe paths in `sync` keys off the one flag.
+    fn nft_ok(&self) -> bool {
+        matches!(self.nft, NftStatus::Ok | NftStatus::NotApplicable)
+    }
+}
+
+/// The nft half of a non-empty apply.
+fn install_nft_status(result: Result<(), &anyhow::Error>) -> NftStatus {
+    match result {
+        Ok(()) => NftStatus::Ok,
+        Err(e) => NftStatus::Failed {
+            reason: health::reason(e),
+        },
+    }
+}
+
+/// The nft half of an empty apply (teardown).
+fn teardown_nft_status(result: Result<(), &anyhow::Error>) -> NftStatus {
+    match result {
+        Ok(()) => NftStatus::NotApplicable,
+        Err(e) => NftStatus::StaleTable {
+            reason: health::reason(e),
+        },
+    }
+}
+
 /// Apply a freshly computed union to `/etc/hosts` AND the nftables DoH
 /// block table. If empty, clears both; otherwise installs both.
 ///
@@ -457,30 +534,38 @@ fn forwardable_set(active: &[ActiveBlock], now: u64, union: &[String]) -> HashSe
 /// `hosts::apply_block` — the hosts content and the nft DoH table are
 /// free-tier enforcement, the immutable bit is the premium hardening layer.
 ///
-/// Returns whether the nft half succeeded, for the memo: a hosts failure is
-/// fatal (`Err`), an nft failure is degraded-but-enforced (`Ok(false)`) so
-/// the periodic probe keeps retrying the nft half.
+/// A hosts failure is fatal (`Err`); an nft failure — install or teardown —
+/// is degraded-but-enforced and rides in the outcome, so the periodic probe
+/// keeps retrying the nft half.
 ///
 /// DoH blocking only matters when websites are being blocked — an
 /// app-only block (`domains: []`) doesn't need it.
-fn apply(domains: &[String], sink: Ipv4Addr, tamper_protect: bool) -> anyhow::Result<bool> {
+fn apply(domains: &[String], sink: Ipv4Addr, tamper_protect: bool) -> anyhow::Result<ApplyOutcome> {
     if domains.is_empty() {
         hosts::clear_block()?;
-        if let Err(e) = nftables::clear() {
-            warn!(?e, "nftables clear failed (continuing)");
+        let nft = nftables::clear();
+        if let Err(e) = &nft {
+            warn!(
+                ?e,
+                "nftables clear failed — DoH table left behind, will retry"
+            );
         }
-        // Nothing is enforced, so there is no nft half to be unhealthy —
-        // and `needs_probe` never fires on an empty union anyway.
-        Ok(true)
+        Ok(ApplyOutcome {
+            nft: teardown_nft_status(nft.as_ref().map(|_| ())),
+            hosts: HostsLockStatus::NotApplicable,
+        })
     } else {
-        hosts::apply_block(domains, sink, tamper_protect)?;
-        if let Err(e) = nftables::apply() {
+        let hosts = hosts::apply_block(domains, sink, tamper_protect)?;
+        let nft = nftables::apply();
+        if let Err(e) = &nft {
             // Hosts block is in place; DoH bypass is open. Log loudly but
             // don't unwind — partial enforcement is better than none.
             warn!(?e, "nftables apply failed — Firefox DoH bypass not closed");
-            return Ok(false);
         }
-        Ok(true)
+        Ok(ApplyOutcome {
+            nft: install_nft_status(nft.as_ref().map(|_| ())),
+            hosts,
+        })
     }
 }
 
@@ -648,6 +733,47 @@ mod tests {
         assert_eq!(sink_ip(Detection::Off), DARK);
         assert_eq!(sink_ip(Detection::Listening), SEEN);
         assert_eq!(sink_ip(Detection::Degraded), DARK);
+    }
+
+    /// The wire form tracks the detection one-to-one, so the legacy degraded
+    /// flag `ipc` derives from it means exactly what the old atomic did.
+    #[test]
+    fn proxy_status_maps_detection() {
+        assert_eq!(proxy_status(Detection::Off), ProxyStatus::Off);
+        assert_eq!(proxy_status(Detection::Listening), ProxyStatus::Holding);
+        assert_eq!(proxy_status(Detection::Degraded), ProxyStatus::Degraded);
+    }
+
+    /// Both nft failure shapes carry the error text and read as not-ok for
+    /// the memo, so the install re-probe and the teardown retry each fire;
+    /// both success shapes read as ok.
+    #[test]
+    fn nft_status_mappings_and_memo_flag() {
+        let e = anyhow::anyhow!("nft -f failed (status 1): oops");
+        assert_eq!(install_nft_status(Ok(())), NftStatus::Ok);
+        assert_eq!(
+            install_nft_status(Err(&e)),
+            NftStatus::Failed {
+                reason: "nft -f failed (status 1): oops".into()
+            }
+        );
+        assert_eq!(teardown_nft_status(Ok(())), NftStatus::NotApplicable);
+        assert_eq!(
+            teardown_nft_status(Err(&e)),
+            NftStatus::StaleTable {
+                reason: "nft -f failed (status 1): oops".into()
+            }
+        );
+
+        let outcome = |nft: NftStatus| ApplyOutcome {
+            nft,
+            hosts: HostsLockStatus::NotApplicable,
+        };
+        assert!(outcome(NftStatus::Ok).nft_ok());
+        assert!(outcome(NftStatus::NotApplicable).nft_ok());
+        assert!(!outcome(install_nft_status(Err(&e))).nft_ok());
+        assert!(!outcome(teardown_nft_status(Err(&e))).nft_ok());
+        assert!(!outcome(NftStatus::Unknown).nft_ok());
     }
 
     /// Toggling `instant_breaks` mid-block changes the file's content, so it

@@ -17,8 +17,9 @@
 //! `enforce::sync` clears its memo, and the next 1s tick retries. A failed
 //! `chattr +i` (SELinux, or a filesystem without immutable-flag support) only
 //! logs a warning: the block is active, just not tamper-protected, and
-//! refusing to enforce at all would be strictly worse. `chattr -i` in the
-//! clear paths is likewise best-effort.
+//! refusing to enforce at all would be strictly worse. Both lock outcomes are
+//! returned as a `HostsLockStatus` so `enforce::sync` can report them on
+//! `GetStatus.health`. `chattr -i` in the clear paths is likewise best-effort.
 
 use std::fs;
 use std::net::Ipv4Addr;
@@ -26,6 +27,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::process::Command;
 
 use anyhow::{anyhow, Context};
+use grepfocus_core::HostsLockStatus;
 use tracing::{debug, info, warn};
 
 use crate::paths::{HOSTS, HOSTS_BEGIN, HOSTS_END, HOSTS_ORIG};
@@ -51,7 +53,16 @@ const HOSTS_ORIG_MODE: u32 = 0o600;
 /// unconditional regardless of license: it is the mechanical unlock needed
 /// to rewrite a possibly-still-locked file (e.g. locked by a previously
 /// licensed apply), not a license decision.
-pub fn apply_block(domains: &[String], sink: Ipv4Addr, tamper_protect: bool) -> anyhow::Result<()> {
+///
+/// Returns what happened to the immutable bit: `Locked`, `Unlocked` with the
+/// `chattr` error when it was wanted but refused, or `NotApplicable` when
+/// the license did not ask for it. An `Err` means the content itself did not
+/// land.
+pub fn apply_block(
+    domains: &[String],
+    sink: Ipv4Addr,
+    tamper_protect: bool,
+) -> anyhow::Result<HostsLockStatus> {
     chattr_immutable(HOSTS, false).ok(); // best-effort unlock if previously locked
     let original = fs::read_to_string(HOSTS).context("reading /etc/hosts")?;
     let stripped = strip_managed(&original);
@@ -71,27 +82,32 @@ pub fn apply_block(domains: &[String], sink: Ipv4Addr, tamper_protect: bool) -> 
         )
     };
     write_atomic(HOSTS, &new, HOSTS_MODE)?;
-    match hardening_for(tamper_protect) {
+    let lock = match hardening_for(tamper_protect) {
         // The immutable bit is hardening, not enforcement (see module docs):
         // the block is live once the write lands, so degrade gracefully here.
-        Hardening::SetImmutable => {
-            if let Err(e) = chattr_immutable(HOSTS, true) {
+        Hardening::SetImmutable => match chattr_immutable(HOSTS, true) {
+            Ok(()) => HostsLockStatus::Locked,
+            Err(e) => {
                 warn!(
                     ?e,
                     "chattr +i failed — hosts block is active but NOT tamper-protected \
                      (SELinux or the filesystem may forbid the immutable flag)"
                 );
+                HostsLockStatus::Unlocked {
+                    reason: crate::health::reason(&e),
+                }
             }
-        }
+        },
         // info! rather than debug!: apply_block runs only when the enforced
         // union changes or drift was detected — a handful of times per block
         // lifetime, never per tick — and the missing lock is the first thing
         // support will ask about ("why isn't /etc/hosts immutable?").
         Hardening::Skip => {
             info!("hosts block active without tamper protection (premium feature)");
+            HostsLockStatus::NotApplicable
         }
-    }
-    Ok(())
+    };
+    Ok(lock)
 }
 
 /// What `apply_block` does about the immutable bit after writing. Split out

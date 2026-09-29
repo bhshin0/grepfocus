@@ -101,6 +101,97 @@ interface Settings {
   instant_breaks: boolean;
 }
 
+// ─── Health (mirrors core's wire types, snake_case on the wire) ─────────────
+//
+// Every enum below can carry a tag this build does not know — a newer daemon
+// may add one — which core folds to `"unknown"`; the UI says nothing for it.
+
+/// Where the daemon binary lives, classified once at daemon start.
+type InstallKind = "package" | "local" | "unknown";
+
+/// State of the DoH-blocking nftables table.
+type NftStatus =
+  | { kind: "ok" }
+  /// `nft` could not install the table: the hosts block is live, DoH is open.
+  | { kind: "failed"; reason: string }
+  /// The block ended but `nft delete` failed; the daemon keeps retrying.
+  | { kind: "stale_table"; reason: string }
+  /// Nothing enforced, no table left behind.
+  | { kind: "not_applicable" }
+  | { kind: "unknown" };
+
+/// State of the immutable flag on `/etc/hosts`.
+type HostsLockStatus =
+  | { kind: "locked" }
+  /// Licensed for tamper protection but `chattr +i` failed.
+  | { kind: "unlocked"; reason: string }
+  /// Nothing enforced, or not licensed (no lock attempted).
+  | { kind: "not_applicable" }
+  | { kind: "unknown" };
+
+/// State of the instant-breaks loopback proxy. `degraded` is what the legacy
+/// `Status.instant_breaks_degraded` flag is derived from.
+type ProxyStatus = "holding" | "degraded" | "off" | "unknown";
+
+/// Why a browser's DoH policy file could not be written. `unsupported` and
+/// `read_only_fs` are not fixable from inside GrepFocus; the rest are.
+type BrowserPolicyFailKind =
+  | "unsupported"
+  | "read_only_fs"
+  | "not_json"
+  | "symlink"
+  | "io"
+  | "unknown";
+
+/// What the daemon did about one browser's DoH policy file. The failure
+/// payload is `fail_kind` on the wire because the tag already owns `kind`.
+type BrowserPolicyState =
+  | { kind: "not_installed" }
+  | { kind: "written" }
+  | { kind: "merged" }
+  | { kind: "failed"; fail_kind: BrowserPolicyFailKind; reason: string }
+  | { kind: "unknown" };
+
+/// One browser's DoH policy file, as the daemon last saw it. `browser` is a
+/// slug (`firefox | firefox-flatpak | mullvad-browser | chromium |
+/// chromium-snap | chrome | brave`); the UI maps slugs to display names.
+interface BrowserPolicyStatus {
+  browser: string;
+  path: string;
+  state: BrowserPolicyState;
+  /// `written`/`merged`: mtime of the file; otherwise when this daemon first
+  /// saw the state.
+  since_unix: number;
+}
+
+/// Enforcement health plus daemon identity, carried on `Status`. An OLD
+/// daemon never emits it and core's default arrives instead — an empty
+/// `daemon_version` is the tell, and every other field is then meaningless.
+interface Health {
+  daemon_version: string;
+  daemon_exe: string;
+  install_kind: InstallKind;
+  nft: NftStatus;
+  hosts: HostsLockStatus;
+  /// Times a re-probe found the hosts region missing and re-applied it — a
+  /// tamper signal.
+  hosts_reapplies: number;
+  /// Times a re-probe found the table gone while nft worked and re-installed
+  /// it — a firewall reload.
+  nft_reinstalls: number;
+  proxy: ProxyStatus;
+  /// Fixed slug order after the first browser-policy pass; empty before it
+  /// and on an old daemon.
+  browser_policies: BrowserPolicyStatus[];
+  /// What the daemon's startup sanitize changed or flagged (capped at 200
+  /// lines, the last one a count of the rest).
+  startup_notes: string[];
+  /// The last enforcement error (hosts read/write, install or teardown);
+  /// cleared by the next success.
+  last_error: string | null;
+  last_error_unix: number | null;
+}
+
 interface Status {
   active: ActiveBlock[];
   now_unix: number;
@@ -118,10 +209,13 @@ interface Status {
   licensed_features: string[];
   pomodoro: PomodoroStatus | null;
   settings: Settings;
-  /// True when instant breaks are on and a block is active but the loopback
-  /// proxy could not bind a port (something else holds :80 or :443), so breaks
-  /// lag on this machine. Drives an explanatory notice.
+  /// DEPRECATED, still emitted: equal to `health.proxy === "degraded"` —
+  /// instant breaks are on and a block is active but the loopback proxy could
+  /// not bind a port (something else holds :80 or :443), so breaks lag on
+  /// this machine. Drives an explanatory notice.
   instant_breaks_degraded: boolean;
+  /// Enforcement health and daemon identity — see `Health`.
+  health: Health;
 }
 
 interface Schedule {

@@ -12,7 +12,7 @@ use grepfocus_core::validate::validate_block;
 use grepfocus_core::{
     compute_grant, evaluate_allowance, now_unix, validate_policy, ActiveBlock, AllowanceLedger,
     AllowancePolicy, AllowanceStatus, AppMatcher, BreakRecord, LockMode, Originator, PomodoroPhase,
-    PomodoroSession, PomodoroStatus, Request, Response, Schedule, State,
+    PomodoroSession, PomodoroStatus, ProxyStatus, Request, Response, Schedule, State,
 };
 use nix::unistd::Group;
 use tokio::net::{UnixListener, UnixStream};
@@ -212,6 +212,10 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 cycle_index: p.cycle_index,
                 cycles_total: p.cycles_total,
             });
+            let health = daemon.health().snapshot();
+            // The legacy flag is derived, never stored separately, so the two
+            // cannot disagree on one frame.
+            let instant_breaks_degraded = health.proxy == ProxyStatus::Degraded;
             Response::Status {
                 active: st.active.clone(),
                 now_unix: now,
@@ -227,9 +231,8 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 licensed_features: lic.features,
                 pomodoro,
                 settings: st.settings.clone(),
-                instant_breaks_degraded: daemon
-                    .instant_breaks_degraded
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                instant_breaks_degraded,
+                health: Box::new(health),
             }
         }
 
@@ -1428,8 +1431,60 @@ mod tests {
             license: tokio::sync::Mutex::new(None),
             break_challenges: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             app_kills_pending: std::sync::atomic::AtomicU64::new(0),
-            instant_breaks_degraded: std::sync::atomic::AtomicBool::new(false),
+            health: std::sync::Mutex::new(crate::health::HealthState::default()),
         })
+    }
+
+    // `health` rides on every Status frame straight from the daemon's health
+    // state, and the legacy `instant_breaks_degraded` is derived from it —
+    // never a second source that could drift.
+    #[tokio::test]
+    async fn get_status_carries_health_and_derives_legacy_degraded_flag() {
+        let daemon = test_daemon();
+        match dispatch(Request::GetStatus {}, &daemon).await {
+            Response::Status {
+                instant_breaks_degraded,
+                health,
+                ..
+            } => {
+                assert!(!instant_breaks_degraded);
+                assert_eq!(health.daemon_version, env!("CARGO_PKG_VERSION"));
+                assert_eq!(health.proxy, ProxyStatus::Off);
+                assert_eq!(health.nft, grepfocus_core::NftStatus::NotApplicable);
+                assert_eq!(health.hosts, grepfocus_core::HostsLockStatus::NotApplicable);
+                assert!(health.browser_policies.is_empty());
+                assert_eq!(health.last_error, None);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+
+        daemon.health().set_proxy(ProxyStatus::Degraded);
+        daemon.health().hosts_drift_detected();
+        match dispatch(Request::GetStatus {}, &daemon).await {
+            Response::Status {
+                instant_breaks_degraded,
+                health,
+                ..
+            } => {
+                assert!(instant_breaks_degraded);
+                assert_eq!(health.proxy, ProxyStatus::Degraded);
+                assert_eq!(health.hosts_reapplies, 1);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+
+        daemon.health().set_proxy(ProxyStatus::Holding);
+        match dispatch(Request::GetStatus {}, &daemon).await {
+            Response::Status {
+                instant_breaks_degraded,
+                health,
+                ..
+            } => {
+                assert!(!instant_breaks_degraded);
+                assert_eq!(health.proxy, ProxyStatus::Holding);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
     }
 
     /// An active record whose embedded block carries `policy`.

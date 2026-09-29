@@ -1521,12 +1521,21 @@ pub enum Response {
         /// object fills the same way.
         #[serde(default)]
         settings: Settings,
-        /// True when `settings.instant_breaks` is on and a block is active but
-        /// the loopback proxy could not bind both ports, so breaks lag on this
-        /// machine. Drives a GUI notice explaining why. `#[serde(default)]`:
-        /// an old daemon never emits it and the client reads `false`.
+        /// DEPRECATED, still emitted: always equal to
+        /// `health.proxy == ProxyStatus::Degraded`. Kept so a GUI built
+        /// against a pre-health daemon keeps its "port in use" notice; new
+        /// clients read `health.proxy`. `#[serde(default)]`: an old daemon
+        /// never emits it and the client reads `false`.
         #[serde(default)]
         instant_breaks_degraded: bool,
+        /// Enforcement health + daemon identity (see [`Health`]).
+        /// `#[serde(default)]`: an old daemon never emits it and the client
+        /// reads `Health::default()`, whose empty `daemon_version` is the
+        /// tell. Boxed only to keep `Response` small for its many one-word
+        /// variants (`clippy::large_enum_variant`); the wire shape is the
+        /// same.
+        #[serde(default)]
+        health: Box<Health>,
     },
     Added {
         id: u64,
@@ -2921,6 +2930,7 @@ mod tests {
             }),
             settings: Settings::default(),
             instant_breaks_degraded: false,
+            health: Box::default(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -2935,6 +2945,84 @@ mod tests {
             }
             other => panic!("expected Status, got {other:?}"),
         }
+    }
+
+    // Old daemon → new GUI: a Status frame without `health` (and without the
+    // legacy degraded flag) reads as `Health::default()`, whose empty
+    // `daemon_version` is how a client tells a pre-reporting daemon apart
+    // from a healthy one. A frame that does carry it round-trips the
+    // enforcement fields intact.
+    #[test]
+    fn status_without_health_still_deserializes() {
+        let old = r#"{
+            "result": "status",
+            "active": [],
+            "now_unix": 1752192000,
+            "password_set": false,
+            "unlocked": true,
+            "allowance_used": []
+        }"#;
+        let resp: Response = serde_json::from_str(old).unwrap();
+        match resp {
+            Response::Status {
+                instant_breaks_degraded,
+                health,
+                ..
+            } => {
+                assert!(!instant_breaks_degraded);
+                assert_eq!(*health, Health::default());
+                assert_eq!(health.daemon_version, "");
+                assert_eq!(health.install_kind, InstallKind::Unknown);
+                assert_eq!(health.proxy, ProxyStatus::Off);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+
+        let resp = Response::Status {
+            active: vec![],
+            now_unix: 1000,
+            password_set: false,
+            unlocked: true,
+            allowance_used: vec![],
+            allowance: vec![],
+            license_present: false,
+            license_valid: false,
+            license_kind: None,
+            license_email: None,
+            license_expires_at: None,
+            licensed_features: vec![],
+            pomodoro: None,
+            settings: Settings::default(),
+            instant_breaks_degraded: true,
+            health: Box::new(Health {
+                daemon_version: "0.5.1".into(),
+                daemon_exe: "/usr/local/bin/grepfocusd".into(),
+                install_kind: InstallKind::Local,
+                nft: NftStatus::Failed {
+                    reason: "nft -f failed".into(),
+                },
+                hosts: HostsLockStatus::Locked,
+                hosts_reapplies: 2,
+                nft_reinstalls: 1,
+                proxy: ProxyStatus::Degraded,
+                browser_policies: vec![],
+                startup_notes: vec!["block 1 (saved) \"x\": dropped domain".into()],
+                last_error: Some("reading /etc/hosts: Permission denied".into()),
+                last_error_unix: Some(999),
+            }),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            json.contains(r#""health":{"daemon_version":"0.5.1""#),
+            "got {json}"
+        );
+        let back: Response = serde_json::from_str(&json).unwrap();
+        let (Response::Status { health: a, .. }, Response::Status { health: b, .. }) =
+            (&resp, &back)
+        else {
+            panic!("expected Status");
+        };
+        assert_eq!(a, b);
     }
 
     // A PomodoroSession survives a state round-trip, and old state without

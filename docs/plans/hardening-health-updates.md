@@ -16,7 +16,7 @@ leaves `./scripts/check.sh` green and is shippable on its own):
 | WP | Scope | Commit |
 |---|---|---|
 | 1 | core: `validate` module, `State::sanitize`, health wire types | `9e0fb39` |
-| 2 | daemon + GUI input hardening, procwatch guards | — |
+| 2 | daemon + GUI input hardening, procwatch guards | `97bb9d7` |
 | 3 | daemon health state, `GetStatus.health`, `--version`, GUI pass-through | — |
 | 4 | daemon `browser_policy` module, unit comment, cleanup parity | — |
 | 5 | GUI health banner, tray RED notification, about/diagnostics line, error-state fixes | — |

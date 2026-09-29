@@ -62,8 +62,9 @@ review findings — so they don't have to be re-derived later.
 ## Input hardening, health, DoH policies, updates (2026-09-28)
 
 Status: **in progress** — WP1 (core validators, `State::sanitize`, health
-wire types) and WP2 (daemon + GUI input hardening, procwatch guards) landed
-on `hardening-health`; WP3–WP7 pending. Design record:
+wire types), WP2 (daemon + GUI input hardening, procwatch guards) and WP3
+(daemon health state, `get_status.health`, `grepfocusd --version`, GUI
+pass-through) landed on `hardening-health`; WP4–WP7 pending. Design record:
 `docs/plans/hardening-health-updates.md`. Pending release-note lines (the
 next `Release x.y.z` commit owns the changelog files):
 

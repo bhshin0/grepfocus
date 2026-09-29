@@ -131,7 +131,9 @@ Deviations from the plan above: the fail-soft status is a single
 `instant_breaks_degraded: bool` on `Status` rather than an `Off|Active|Degraded`
 enum — the GUI only needs "wanted-but-couldn't-bind", and `settings.instant_breaks`
 already carries on/off. The SSRF guard was extended past the planned loopback/`::1`
-to also cover IPv4 link-local.
+to also cover IPv4 link-local. Since `hardening-health` WP3, `health.proxy`
+now carries the `Holding|Degraded|Off` enum; the bool is kept on the wire,
+derived (`docs/plans/hardening-health-updates.md`).
 
 ## Verification (live, after deploy)
 

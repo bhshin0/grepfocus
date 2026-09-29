@@ -81,6 +81,7 @@ Verify it's running:
 ```bash
 systemctl status grepfocusd
 journalctl -u grepfocusd -f
+grepfocusd --version   # prints "grepfocusd <version>"
 ```
 
 ## Running the GUI (dev mode)
@@ -155,7 +156,7 @@ unsigned length followed by JSON. Methods:
 | `delete_block`    | `{ id: u64 }`                         | Rejected if block is currently active        |
 | `start_block`     | `{ id: u64, duration_secs: u64 }`     | Rejected if any block is already active      |
 | `cancel_block`    | —                                     | Always rejected while a block is active      |
-| `get_status`      | —                                     | Returns active block (if any) + server time  |
+| `get_status`      | —                                     | Active blocks, server time, license, settings, plus `health` (daemon version, install kind, nft/hosts/proxy state, browser DoH policies, drift counters, last error) |
 
 A `Block` is `{ id, name, domains: [..], apps: [AppMatcher, ..] }` where
 `AppMatcher` is one of `{kind: "exe_path", path}`, `{kind: "basename", name}`,
@@ -189,6 +190,49 @@ place, one it cannot is dropped, and each change is one journal line
 (`journalctl -u grepfocusd | grep sanitized`). A block that was saved by an
 older version with more entries than the caps allow keeps working but cannot
 be re-saved until it is trimmed.
+
+`get_status` carries a `health` object: every enforcement outcome the daemon
+used to log and forget, plus its identity. What a healthy daemon emits:
+
+```json
+"health": {
+  "daemon_version": "0.5.1",
+  "daemon_exe": "/usr/local/bin/grepfocusd",
+  "install_kind": "local",
+  "nft":   {"kind": "ok"},
+  "hosts": {"kind": "locked"},
+  "hosts_reapplies": 0,
+  "nft_reinstalls": 0,
+  "proxy": "holding",
+  "browser_policies": [
+    {"browser": "firefox", "path": "/etc/firefox/policies/policies.json", "state": {"kind": "written"}, "since_unix": 1790000000},
+    {"browser": "mullvad-browser", "path": "/usr/lib/mullvad-browser/distribution/policies.json", "state": {"kind": "failed", "fail_kind": "read_only_fs", "reason": "opening …grepfocus.tmp: Read-only file system (os error 30)"}, "since_unix": 1790000000}
+  ],
+  "startup_notes": [],
+  "last_error": null,
+  "last_error_unix": null
+}
+```
+
+`install_kind` is `package` (`/usr/bin`), `local` (`/usr/local/bin`: the
+AppImage installer or the dev scripts) or `unknown`. `nft` is `ok`, `failed`
+(`nft` could not install the table — the hosts block is live, DoH is open),
+`stale_table` (a block ended but the table could not be removed; the daemon
+retries every 30 s), `not_applicable` (nothing enforced) or `unknown`.
+`hosts` is `locked`, `unlocked` (tamper protection licensed but `chattr +i`
+refused), `not_applicable` or `unknown`. `proxy` is `holding`, `degraded`
+(a loopback port would not bind, so breaks lag) or `off`. `failed`,
+`stale_table` and `unlocked` carry a `reason`. `hosts_reapplies` counts
+re-probes that found the managed region missing (a tamper signal),
+`nft_reinstalls` counts the table vanishing while `nft` worked (a firewall
+reload). `startup_notes` is what the startup sanitize changed or flagged.
+`last_error` is the last failed `/etc/hosts` write, cleared by the next
+success. Every enum accepts a tag it does not know as `unknown`, and a client
+says nothing for `unknown`: a newer daemon may add a variant without an older
+GUI failing the whole frame. An older daemon never emits `health` at all; the
+client then reads the default, whose empty `daemon_version` is the tell. The
+older `instant_breaks_degraded` flag stays on the wire, derived from
+`health.proxy`.
 
 ## Recovery
 
