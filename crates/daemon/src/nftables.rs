@@ -1,10 +1,15 @@
-//! DoH (DNS-over-HTTPS) endpoint blocking via `nft`.
+//! DoH (DNS-over-HTTPS) endpoint blocking via `nft` — the second line of
+//! defence.
 //!
-//! We install a small `inet` table that drops TCP 443 (DoH) and TCP/UDP
-//! 853 (DNS-over-TLS) traffic to known public DoH resolver IPs. This
-//! closes the bypass where browsers — chiefly Firefox and Mullvad
-//! Browser — skip `/etc/hosts` by resolving names directly via
-//! Cloudflare/Mozilla/Mullvad over HTTPS.
+//! The first line is `browser_policy`, which turns DoH off in every
+//! detected browser via enterprise policy. This table catches what that
+//! cannot: browsers that have not restarted since the policy was written
+//! (Firefox reads policies only at start), browsers we do not policy
+//! (Flatpak Firefox, Vivaldi/Edge/Opera, per-user installs) and DoT. It
+//! is a small `inet` table that drops TCP 443 (DoH) and TCP/UDP 853
+//! (DNS-over-TLS) traffic to known public DoH resolver IPs, so a browser
+//! skipping `/etc/hosts` by resolving directly via Cloudflare/Mozilla/
+//! Mullvad over HTTPS gets no answer.
 //!
 //! Trade-offs (documented, not fixed):
 //! - Doesn't catch DoH providers we don't list (custom endpoints,
@@ -15,10 +20,10 @@
 //!   line we draw for custom DoH. An unscoped 853 drop would kill ALL
 //!   DNS for a system resolver (e.g. systemd-resolved) doing DoT to a
 //!   private or custom endpoint: an effective network brick.
-//! - Mullvad Browser ships TRR-only DoH (`network.trr.mode=3`, no
-//!   native-resolver fallback), so with its resolver IPs listed it loses
-//!   ALL DNS during active blocks — same accepted class as the
-//!   listed-DoT-resolver case below.
+//! - Mullvad Browser: with its policy in place it falls back to the
+//!   native resolver and keeps working; only one started before the
+//!   policy was written, or on a read-only `/usr` (no policy file), still
+//!   hits the listed-resolver case and loses DNS during active blocks.
 //! - A system resolver doing DoT to a *listed* public IP (e.g.
 //!   `1.1.1.1:853`) still loses DNS during active blocks. The README
 //!   documents it.

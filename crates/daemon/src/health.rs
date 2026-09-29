@@ -122,7 +122,6 @@ impl HealthState {
     }
 
     /// Whole-list replace after every browser-policy pass.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_browser_policies(&mut self, list: Vec<BrowserPolicyStatus>) {
         self.browser_policies = list;
     }

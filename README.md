@@ -15,6 +15,12 @@ When a block is active, GrepFocus:
 - **Blocks applications** by polling `/proc` every 500ms and `SIGKILL`ing any
   process whose exe path, basename, or cmdline matches the blocklist and
   that is not running as root (see *Known limits*).
+- **Turns browser DNS-over-HTTPS off** through enterprise-policy files
+  (Firefox, Mullvad Browser, Chromium including the Ubuntu snap, Chrome,
+  Brave) so the `/etc/hosts` block applies in them — those browsers say they
+  are "managed by your organization". Written at daemon start and re-checked
+  every minute, not only during blocks; Firefox-based browsers pick it up at
+  their next start, Chromium immediately.
 - **Survives tampering** within the bounds of what's possible on Linux (see
   *Known limits* below). The daemon auto-restarts on kill, re-applies blocks
   on reboot, and persists state with an HMAC seal so hand-edits to
@@ -251,14 +257,22 @@ sudo ./packaging/uninstall.sh [--purge]
 
 # Offline teardown without uninstalling: clears the immutable bit, strips
 # the managed /etc/hosts region, removes stale atomic-write temp files,
-# drops the nftables table, and clears persisted active blocks so a later
-# `systemctl start` won't re-apply them. Refuses to run while the daemon
-# is up (its 1s reconcile tick would re-apply enforcement right behind
-# it) unless you pass --force. --purge deletes /var/lib/grepfocus and
-# /etc/grepfocus; binaries, unit, and the grepfocus group are
-# uninstall.sh's job.
+# drops the nftables table, removes or restores the browser DoH policy
+# files, and clears persisted active blocks so a later `systemctl start`
+# won't re-apply them. Refuses to run while the daemon is up (its 1 s
+# enforcement tick and 60 s browser-policy pass would re-apply everything
+# right behind it) unless you pass --force. --purge deletes
+# /var/lib/grepfocus and /etc/grepfocus; binaries, unit, and the grepfocus
+# group are uninstall.sh's job.
 sudo grepfocusd cleanup [--purge] [--force]
 ```
+
+**Stopping or disabling the daemon does not restore browsers.** The DoH
+policy files stay in place until `grepfocusd cleanup` or an uninstall
+removes them, so a stopped daemon still leaves Firefox and Chromium saying
+"managed by your organization" with DoH off. Downgrading to a release that
+predates the policies (0.5.x) has the same effect: that daemon's `cleanup`
+does not know the files, so run the manual commands below first.
 
 If the binaries are already gone, everything GrepFocus enforces can be
 undone by hand:
@@ -268,6 +282,21 @@ sudo chattr -i /etc/hosts
 sudo sed -i '/# grepfocus-begin/,/# grepfocus-end/d' /etc/hosts
 sudo nft delete table inet grepfocus_doh
 sudo rm -f /etc/hosts.grepfocus.tmp
+# Browser DoH policies. The Chromium-family files are GrepFocus's own:
+sudo rm -f /etc/chromium/policies/managed/grepfocus.json \
+    /var/snap/chromium/current/policies/managed/grepfocus.json \
+    /etc/opt/chrome/policies/managed/grepfocus.json \
+    /etc/brave/policies/managed/grepfocus.json
+# The Firefox-family files are shared. Delete one only if it carries a
+# top-level "grepfocus" key with "created": true (GrepFocus made it); if
+# instead a recovery copy exists under /var/lib/grepfocus/policies, that is
+# the pre-existing file — put it back, e.g.:
+sudo install -m 644 /var/lib/grepfocus/policies/_etc_firefox_policies_policies.json.orig \
+    /etc/firefox/policies/policies.json
+# (the Mullvad Browser pair is /usr/lib/mullvad-browser/distribution/policies.json
+# and .../_usr_lib_mullvad-browser_distribution_policies.json.orig). A file
+# with the marker but "created": false and no recovery copy was merged into:
+# remove its "DNSOverHTTPS" and "grepfocus" keys by hand and keep the rest.
 ```
 
 `/var/lib/grepfocus/hosts.orig` is a root-only snapshot of the *unmanaged*
@@ -302,16 +331,32 @@ that Cold Turkey beats either.
   realistic goal is friction high enough to defeat in-the-moment akrasia.
 - **Live USB.** Anyone with physical access can boot a USB and edit the
   disk. Out of scope.
-- **Custom DoH/DoT endpoints.** An `nftables` table drops DoH (TCP 443)
-  and DNS-over-TLS (TCP/UDP 853) to known public resolver IPs, so stock
-  Firefox/Chrome DoH can't bypass `/etc/hosts` — but unlisted or
-  self-hosted endpoints are allowed by design. Mullvad Browser's default
-  resolver (`dns.mullvad.net`) is on the list, and since that browser
-  uses DoH-only mode by default (no system-resolver fallback), it loses
-  DNS entirely while a block is active — all sites, not just blocked
-  ones; use a regular browser during blocks. A system resolver doing
-  DoT to `dns.mullvad.net` hits the same documented case as `1.1.1.1`
-  below.
+- **Custom DoH/DoT endpoints.** Browser policies turn DoH off at the
+  source (next bullet); behind them an `nftables` table drops DoH (TCP
+  443) and DNS-over-TLS (TCP/UDP 853) to known public resolver IPs during
+  blocks, catching a browser that has not restarted since the policy was
+  written or that has no policy at all — but unlisted or self-hosted
+  endpoints are allowed by design. A system resolver doing DoT to
+  `dns.mullvad.net` hits the same documented case as `1.1.1.1` below.
+- **Browser DoH policies.** Covered: Firefox (rpm/deb, `/usr/lib*`,
+  `/opt`, and the snap — all read `/etc/firefox/policies/policies.json`),
+  Mullvad Browser (`/usr/lib/mullvad-browser/distribution/policies.json`,
+  the only file it reads), Chromium (rpm/deb; the snap under
+  `/var/snap/chromium/current/policies/managed` is not live-tested), Chrome
+  and Brave (`/etc/opt/chrome` and `/etc/brave`, not live-tested). Not
+  covered: Flatpak Firefox (reported as unsupported), Vivaldi, Edge, Opera,
+  and per-user installs under `~`. The Chromium-family file is GrepFocus's
+  own; Chromium applies managed files alphabetically, so a later-sorting
+  admin file wins. The Firefox-family file is shared: a pre-existing one
+  gets only `DNSOverHTTPS` added, its exact bytes are kept under
+  `/var/lib/grepfocus/policies` and put back on cleanup or uninstall; a
+  fresh `/etc` file is seeded from `distribution/policies.json`, which it
+  shadows until uninstall. **DoH stays off while GrepFocus is installed,
+  not only during blocks** — Mullvad Browser's DNS goes to the OS resolver
+  instead of Mullvad's. A Firefox already running keeps DoH until it is
+  restarted. Uninstalling a browser may warn "directory not empty" about
+  its policy directory; the daemon removes the file and the empty
+  directories within a minute.
 - **System resolvers doing DoT to a listed IP.** The flip side of that
   table: if your system resolver does DNS-over-TLS to one of the listed
   public resolver IPs (e.g. systemd-resolved with `DNSOverTLS=yes`

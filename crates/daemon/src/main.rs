@@ -2,7 +2,9 @@
 //!
 //! Runs as root via systemd. Owns the persisted block state, edits
 //! /etc/hosts (with chattr +i during active blocks), and SIGKILLs blocked
-//! processes. Talks to the GUI over a Unix socket at /run/grepfocus/sock.
+//! processes. Keeps browser DNS-over-HTTPS switched off through enterprise
+//! policy files so the hosts block applies there (see `browser_policy`).
+//! Talks to the GUI over a Unix socket at /run/grepfocus/sock.
 //!
 //! Also ships the offline recovery path: `grepfocusd cleanup` tears down all
 //! enforcement without needing a working daemon (see `cleanup`).
@@ -14,6 +16,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 mod auth;
+mod browser_policy;
 mod cleanup;
 mod dns;
 mod enforce;
@@ -303,12 +306,14 @@ async fn run_daemon() -> anyhow::Result<()> {
     let ipc_handle = tokio::spawn(ipc::serve(daemon.clone()));
     let watch_handle = tokio::spawn(procwatch::run(daemon.clone()));
     let sched_handle = tokio::spawn(scheduler::run(daemon.clone()));
+    let policy_handle = tokio::spawn(browser_policy::run(daemon.clone()));
 
     // Run until any task fails or we receive SIGTERM/SIGINT.
     tokio::select! {
         r = ipc_handle => { error!(?r, "ipc task exited"); }
         r = watch_handle => { error!(?r, "procwatch task exited"); }
         r = sched_handle => { error!(?r, "scheduler task exited"); }
+        r = policy_handle => { error!(?r, "browser policy task exited"); }
         _ = tokio::signal::ctrl_c() => { info!("received SIGINT, shutting down"); }
     }
 

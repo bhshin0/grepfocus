@@ -13,8 +13,13 @@ Restart=always
 RestartSec=1
 
 # The daemon must edit /etc/hosts and /var/lib/grepfocus, so we cannot use
-# ProtectSystem=strict. We still apply the hardening that's compatible with
-# our needs.
+# ProtectSystem=strict. It also writes the browser DoH policy files under
+# /etc/firefox/policies, /etc/chromium/policies/managed,
+# /etc/opt/chrome/policies/managed, /etc/brave/policies/managed,
+# /var/snap/chromium/current/policies/managed and
+# /usr/lib/mullvad-browser/distribution — a future ProtectSystem= pass needs
+# a ReadWritePaths= entry for each. We still apply the hardening that's
+# compatible with our needs.
 NoNewPrivileges=no
 ProtectClock=yes
 ProtectKernelTunables=yes

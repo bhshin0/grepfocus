@@ -62,12 +62,20 @@ review findings — so they don't have to be re-derived later.
 ## Input hardening, health, DoH policies, updates (2026-09-28)
 
 Status: **in progress** — WP1 (core validators, `State::sanitize`, health
-wire types), WP2 (daemon + GUI input hardening, procwatch guards) and WP3
+wire types), WP2 (daemon + GUI input hardening, procwatch guards), WP3
 (daemon health state, `get_status.health`, `grepfocusd --version`, GUI
-pass-through) landed on `hardening-health`; WP4–WP7 pending. Design record:
+pass-through) and WP4 (daemon `browser_policy` module, cleanup/uninstall
+parity) landed on `hardening-health`; WP5–WP7 pending. Design record:
 `docs/plans/hardening-health-updates.md`. Pending release-note lines (the
 next `Release x.y.z` commit owns the changelog files):
 
+- Browsers' DNS-over-HTTPS is now switched off through standard
+  enterprise-policy files (Firefox, Mullvad Browser, Chromium, Chrome, Brave)
+  so blocks apply in them; those browsers show a "managed by your
+  organization" notice and must be restarted once. DoH stays off while
+  GrepFocus is installed (Mullvad Browser then uses the OS resolver instead
+  of Mullvad DNS); `grepfocusd cleanup` or uninstalling restores the files.
+  Downgrading: remove the files first (README → Recovery).
 - Block content is validated: domains must be hostnames (URLs are trimmed to
   the hostname; IP literals, wildcards and single labels are refused), app
   matchers must be well-formed and may not target GrepFocus itself, a block
@@ -183,6 +191,30 @@ to be redone when the item is picked up.
   crate/binary names, systemd unit, socket path `/run/grepfocus`, unix
   group, hosts markers, nft table name, `/var` + `/etc` dirs,
   `.desktop`/icon, Tauri identifier, GitHub repo.
+- **Flatpak Firefox DoH policy** — `browser_policy` reports the Flatpak
+  Firefox (`/var/lib/flatpak/app/org.mozilla.firefox`) as `unsupported`.
+  The supported route is the `org.mozilla.firefox.systemconfig` extension
+  (`/var/lib/flatpak/extension/org.mozilla.firefox.systemconfig/x86_64/stable/policies/policies.json`,
+  the path the daemon already reports); it needs a Flatpak Firefox on hand
+  to verify the mount and which extension branch the app actually reads.
+- **Snap browsers, Chrome, Brave: live verification** — the Chromium snap
+  path (`/var/snap/chromium/current/policies/managed/grepfocus.json`), the
+  Firefox snap (reads `/etc/firefox/policies/policies.json` like the rpm —
+  assumed, not verified) and the Chrome/Brave managed dirs are written from
+  documentation only; verify on an Ubuntu VM with each installed.
+- **Vivaldi / Edge / Opera managed dirs** — `/etc/vivaldi/policies/managed`,
+  `/etc/opt/edge/policies/managed`, `/etc/opt/opera/policies/managed` are
+  the documented locations; adding a target is one row in
+  `browser_policy::targets` plus the uninstall.sh mirror (the parity test
+  fails until both are done).
+- **`Settings.browser_policies` opt-out** — v1 writes the policies
+  unconditionally (free tier). A toggle would need the setting on the wire,
+  a password gate like the other settings, and `remove_all` on the off
+  edge.
+- **`/etc/mullvadbrowser/...` is never read** — Mullvad Browser starts with
+  `MOZ_SYSTEM_POLICIES=false`, so the only policy source is
+  `/usr/lib/mullvad-browser/distribution/policies.json`. Do not retry an
+  `/etc` path for it.
 - **Multi-user procwatch scoping** — app matchers apply to every non-root
   process on the machine, whoever owns it (README → *Known limits*). The
   fix is to record the requesting uid on `ActiveBlock` (`SO_PEERCRED` on

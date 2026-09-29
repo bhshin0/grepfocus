@@ -2470,7 +2470,7 @@ function showFirstRun(mode: FirstRunMode) {
   if (mode === "install") {
     firstRunTitle.textContent = "Set up GrepFocus";
     firstRunBody.textContent =
-      "GrepFocus needs a small background service to enforce blocks. Install it now? You'll be asked to authorize with your password.";
+      "GrepFocus needs a small background service to enforce blocks. Install it now? You'll be asked to authorize with your password. It also switches DNS-over-HTTPS off in Firefox, Chromium and similar browsers through a system policy so blocks apply there — those browsers will say they are \"managed by your organization\"; restart them once after installing.";
     firstRunAction.textContent = "Install system service";
   } else {
     firstRunTitle.textContent = "Almost there";
