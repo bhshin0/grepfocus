@@ -410,7 +410,8 @@ async fn install_service(app: AppHandle) -> Result<(), String> {
 
 /// Remove the system service the AppImage's installer put there: the script
 /// stops and disables the unit, runs `grepfocusd cleanup` (hosts region,
-/// nftables, browser DoH policies) and deletes the binary and unit. Saved
+/// nftables, browser DoH policies) and deletes the binary and unit — or,
+/// when that cleanup fails, deletes nothing and says so (exit 96). Saved
 /// data in /var/lib/grepfocus and /etc/grepfocus stays. Called by the
 /// Settings tab's "Remove system service".
 ///
@@ -670,10 +671,11 @@ fn pkexec_refusal(stderr: &str) -> Option<&str> {
 /// exit code is the program's, so those meanings are only trusted when the
 /// run left stderr empty or opening with pkexec's own refusal line (it
 /// prints one for both). Any other pkexec reason — no authentication agent
-/// — falls through with its text. 97/98/99 are the bootstrap's and the
-/// script's own codes (integrity, package install present, downgrade); the
-/// script raises 99 for `install` only. `action` picks the wording where
-/// "update it" or "installer" would be wrong for a removal.
+/// — falls through with its text. 96/97/98/99 are the bootstrap's and the
+/// script's own codes (cleanup failed so nothing was removed, integrity,
+/// package install present, downgrade); the script raises 96 for `uninstall`
+/// only and 99 for `install` only. `action` picks the wording where "update
+/// it" or "installer" would be wrong for a removal.
 fn installer_error(action: ServiceAction, code: Option<i32>, stderr: &str) -> String {
     let stderr = stderr.trim();
     let pkexec = pkexec_refusal(stderr);
@@ -691,6 +693,11 @@ fn installer_error(action: ServiceAction, code: Option<i32>, stderr: &str) -> St
         (Some(127), _) if stderr.is_empty() || pkexec == Some("Not authorized") => {
             "Authentication failed or not authorized.".to_string()
         }
+        // The script's stderr carries cleanup's own error and the commands
+        // to retry with.
+        (Some(96), _) => detail(
+            "The service's cleanup failed, so it was not removed. Blocks may still be in effect.",
+        ),
         (Some(97), _) => {
             "Installer bundle failed its integrity check — re-download the AppImage.".to_string()
         }
@@ -764,14 +771,18 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+/// Whether the main window exists and is hidden (in the tray).
+fn main_window_hidden(app: &AppHandle) -> bool {
+    app.get_webview_window("main")
+        .is_some_and(|window| matches!(window.is_visible(), Ok(false)))
+}
+
 /// Brings the main window back if it is hidden in a tray that cannot be
 /// relied on to bring it back: a hidden window never gets a close event, so
 /// without this it would be stranded.
 fn show_main_window_if_hidden(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        if matches!(window.is_visible(), Ok(false)) {
-            show_main_window(app);
-        }
+    if main_window_hidden(app) {
+        show_main_window(app);
     }
 }
 
@@ -868,7 +879,8 @@ fn reregister_tray(app: &AppHandle) {
 /// newly goes RED (see `enforcement_red`). Runs for the life of the process
 /// (when a tray host is present, the window hides to tray rather than
 /// closing), so notifications keep flowing even with no window open. Also
-/// re-shows a hidden window if its tray host vanishes, and puts the tray item
+/// re-shows a hidden window if its tray host vanishes for another reason than
+/// the screen being locked (see `tray::RescueWatch`), and puts the tray item
 /// back in front of a host that (re)appears (see `tray::TrayWatch`).
 fn spawn_status_watcher(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
@@ -881,6 +893,7 @@ fn spawn_status_watcher(app: AppHandle) {
         // poll would be noise.
         let mut prev_red: Option<bool> = None;
         let mut tray_watch = tray::TrayWatch::default();
+        let mut rescue_watch = tray::RescueWatch::default();
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         loop {
             ticker.tick().await;
@@ -890,9 +903,20 @@ fn spawn_status_watcher(app: AppHandle) {
                 .unwrap_or_default();
 
             // Hidden-window rescue: the tray vanished underneath the window
-            // (extension disabled mid-session).
-            if !probe.host {
-                show_main_window_if_hidden(&app);
+            // (extension disabled mid-session). Not while the screen is
+            // locked: GNOME takes the tray host away for exactly that long.
+            // The window is only asked while the host is away; with a host
+            // the answer changes nothing.
+            let hidden = !probe.host && main_window_hidden(&app);
+            let locked = if tray::RescueWatch::needs_lock_state(hidden, probe.host) {
+                tauri::async_runtime::spawn_blocking(tray::session_locked)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                None
+            };
+            if rescue_watch.poll(hidden, probe.host, locked) == tray::RescueAction::Show {
+                show_main_window(&app);
             }
 
             match tray_watch.poll(
@@ -1256,6 +1280,45 @@ mod tests {
         );
     }
 
+    /// A removal whose cleanup failed is its own message, not "Removing the
+    /// service failed (exit 96)": nothing was removed, and the script's text
+    /// says how to go on.
+    #[test]
+    fn installer_error_96_cleanup_failed() {
+        const STDERR: &str = "Error: hosts cleanup failed — /etc/hosts may still contain the managed region: writing stripped /etc/hosts: Operation not permitted (os error 1)\nerror: `grepfocusd cleanup` failed (status 1), so nothing was removed: the binary and the unit are still installed.\nThe service is stopped and disabled, and Remove system service only works while it is running.\nTo finish from a terminal: sudo /usr/local/bin/grepfocusd cleanup — and once that succeeds: sudo rm -f /usr/local/bin/grepfocusd /etc/systemd/system/grepfocusd.service /usr/lib/sysusers.d/grepfocus.conf /usr/lib/tmpfiles.d/grepfocus.conf && sudo systemctl daemon-reload\nTo retry from the app instead, or to keep the service: sudo systemctl enable --now grepfocusd (README: Uninstalling, Recovery).\n";
+        for action in [ServiceAction::Install, ServiceAction::Uninstall] {
+            let msg = installer_error(action, Some(96), STDERR);
+            assert!(
+                msg.starts_with("The service's cleanup failed, so it was not removed."),
+                "{msg}"
+            );
+            assert!(msg.contains("Blocks may still be in effect."), "{msg}");
+            // Cleanup's reason and both ways on reach the user: the terminal
+            // commands, and starting the service so the button works again.
+            assert!(msg.contains("hosts cleanup failed"), "{msg}");
+            assert!(
+                msg.contains(&format!("sudo {LOCAL_DAEMON_BIN} cleanup")),
+                "{msg}"
+            );
+            assert!(
+                msg.contains(&format!("sudo rm -f {LOCAL_DAEMON_BIN} ")),
+                "{msg}"
+            );
+            assert!(
+                msg.ends_with(
+                    "sudo systemctl enable --now grepfocusd (README: Uninstalling, Recovery).)"
+                ),
+                "{msg}"
+            );
+            assert!(!msg.contains("(exit 96)"), "{msg}");
+            // Without stderr the message stands alone.
+            assert_eq!(
+                installer_error(action, Some(96), " \n"),
+                "The service's cleanup failed, so it was not removed. Blocks may still be in effect."
+            );
+        }
+    }
+
     #[test]
     fn installer_error_97_integrity() {
         for action in [ServiceAction::Install, ServiceAction::Uninstall] {
@@ -1397,9 +1460,25 @@ mod tests {
         // downgrade guard; it must not fail the install.
         assert!(INSTALL_SCRIPT.contains("rc == 126"));
         assert!(INSTALL_SCRIPT.contains("downgrade check skipped"));
-        // A failed teardown must fail the removal: exit 0 is what the GUI
-        // reports as "Service removed".
+        // A failed teardown must fail the removal, with its own code and
+        // before anything is deleted: exit 0 is what the GUI reports as
+        // "Service removed", and the binary is what a retry needs.
         assert!(!INSTALL_SCRIPT.contains("cleanup || true"));
+        // Exit 96 shows the user everything the script wrote to stderr:
+        // `disable` must not open it with the symlink it removed, and the
+        // advice must not send them back to a button that needs the stopped
+        // service to answer without saying how to start it.
+        assert!(INSTALL_SCRIPT.contains("systemctl --quiet disable --now grepfocusd.service"));
+        assert!(INSTALL_SCRIPT.contains(
+            "To retry from the app instead, or to keep the service: sudo systemctl enable --now grepfocusd"
+        ));
+        let cleanup_failed = INSTALL_SCRIPT
+            .rfind("exit 96")
+            .expect("the script's cleanup-failed exit");
+        let delete = INSTALL_SCRIPT
+            .find("rm -f \"$BIN\"")
+            .expect("the script's delete step");
+        assert!(cleanup_failed < delete);
         assert!(INSTALL_SCRIPT.starts_with("#!/usr/bin/env bash\n"));
         for action in [ServiceAction::Install, ServiceAction::Uninstall] {
             assert!(

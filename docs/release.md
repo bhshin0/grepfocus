@@ -41,7 +41,12 @@ instead.
       wrapping needed; write them for users, not for developers). A leading
       `- ` or `* ` is dropped. An indented line under a `- ` or `* ` bullet
       continues that bullet, so a hard-wrapped markdown list can be pasted as
-      it is; any other non-empty line starts a new bullet.
+      it is; any other non-empty line starts a new bullet. Lines collected
+      while the work landed are in `BACKLOG.md` ("Pending release-note
+      lines"); for 0.6.0 they are already a notes file,
+      `docs/release-notes-0.6.0.txt`. Read them against what is actually
+      being released first, and read the two notes under that BACKLOG
+      heading: two of the lines rest on live checks (step 4).
 - [ ] Bump:
 
       ```sh
@@ -98,6 +103,11 @@ Variants, none of which produces a release set on its own:
 - [ ] Install the freshly built package on a real machine and work through the
       "Live verification checklist" in the plan document
       `hardening-health-updates.md` (under `docs/plans/`).
+- [ ] Run the checks marked "Live verification (owner)" in `BACKLOG.md`
+      (GUI: the tray icon after a tray restart, the screen lock). They need a
+      desktop session and eyes on the screen; nothing automated covers them.
+      If one does not hold, the release-note line that rests on it comes out
+      of both changelogs — a fix like any other.
 
 A problem found here means: fix, commit, and go back to step 3. Do not reuse
 artifacts built before the fix.
@@ -129,12 +139,15 @@ any commit added after the build: the tag must be the audited commit.
 
       It downloads the tag tarball, checks that it is the tagged version, and
       writes its sha256 into `PKGBUILD` and `.SRCINFO`. It changes nothing if
-      the tag is not on GitHub yet. Together with step 1 this replaces the
-      manual "Per-release update" steps in `packaging/aur/README.md`.
+      the tag is not on GitHub yet. `.SRCINFO` is edited in place, never
+      regenerated: if `PKGBUILD` changed in anything but version and
+      checksum since the last release, bring `.SRCINFO` in line first
+      ([packaging/aur/README.md](../packaging/aur/README.md), "Per-release
+      update").
 - [ ] Commit the two files and push.
-- [ ] Publish to the AUR as described in
-      [packaging/aur/README.md](../packaging/aur/README.md) ("Publishing to
-      the AUR"; the smoke build in that file is worth running first).
+- [ ] Publish to the AUR as described in the same file ("Publishing to the
+      AUR"; the smoke build described there is manual and worth running
+      first).
 
 ### 7. Website
 

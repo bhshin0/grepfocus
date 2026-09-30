@@ -148,24 +148,25 @@ review findings — so they don't have to be re-derived later.
   Not verified: anything on the real extension — whether the icon and its
   menu render after a host return, with or without this change — and any
   host other than the stub.
-  No release-note line and no README sentence until the live check shows a
-  difference a user would see; if it does, in the user's terms: "if the tray
-  comes back (the extension is re-enabled, or you unlock the screen), the
-  GrepFocus icon returns within about 10 seconds".
+  No README sentence until the live check shows a difference a user would
+  see. The release-note line is drafted with the other pending lines below
+  ("If the system tray restarts …") and rests on the same check: drop it
+  from the notes if steps 1–2 show no such difference.
   **Live verification (owner):** run the new build, close the window to the
   tray, then:
   1. Extension toggle. Turn the AppIndicator extension OFF (Extensions app,
      or `gnome-extensions disable appindicatorsupport@rgcjonas.gmail.com`).
-     The window should reappear within ~5 s (hidden-window rescue). Wait
-     10 s, then turn the extension ON as a SEPARATE command or click — never
+     The window should reappear within ~10 s (hidden-window rescue, two
+     polls since the next entry's change). Wait 10 s more, then turn the
+     extension ON as a SEPARATE command or click — never
      `disable … && enable …` in one line; that once left no tray host at
      all. Within ~10 s the icon should be back with a working menu ("Show
      GrepFocus" and "Quit" both visible and both doing their job), and
      closing the window should hide it to the tray again.
   2. Quick toggle. OFF, then ON within 5 s (still two separate commands).
      Icon back? Menu populated, or blank? This is the between-two-polls gap.
-  3. Screen lock. Lock, wait more than 10 s, unlock. Icon there, menu works?
-     Note whether the window was back on screen (next entry).
+  3. Screen lock: the live check of the next entry (it covers the icon and
+     its menu after the unlock as well).
   4. If the icon is ever missing while the extension is on, capture before
      relaunching:
      `busctl --user call org.kde.StatusNotifierWatcher /StatusNotifierWatcher org.freedesktop.DBus.Properties GetAll s org.kde.StatusNotifierWatcher`
@@ -175,22 +176,112 @@ review findings — so they don't have to be re-derived later.
      host drop the item, not register it again.
   Steps 1–3 on the previous build as well would show whether the icon was
   ever lost without this change.
-- **[OPEN — host loss observed 2026-09-30; the window re-show needs the
-  owner's eyes] Locking the screen is a tray host restart** — observed on
-  the dev machine with the screen locked: `org.gnome.ScreenSaver.GetActive`
-  true, the AppIndicator extension `Enabled: Yes` / `State: INACTIVE`, and no
+- **[FIXED — 2026-09-30; verified headless and against the dev machine's
+  real lock state, the owner's live check is pending] Locking the screen
+  re-showed a window hidden in the tray** — `crates/gui/src/tray.rs`
+  (`session_locked`, `rescue_action`, `RescueWatch`),
+  `crates/gui/src/main.rs` (status watcher). Observed on the dev machine
+  with the screen locked: `org.gnome.ScreenSaver.GetActive` true, the
+  AppIndicator extension `Enabled: Yes` / `State: INACTIVE`, and no
   `org.kde.StatusNotifierWatcher` on the bus (the extension declares no
   `unlock-dialog` session mode, so GNOME Shell disables it while locked; its
-  source calls out "entering/leaving the lock screen"). This is the everyday
-  host restart, and it predates the entry above. By the code, every lock
-  longer than one poll makes the hidden-window rescue (`!probe.host` →
-  `show_main_window`, which also focuses) re-show a window that was hidden in
-  the tray, undoing hide-to-tray; not yet seen with the owner's eyes. Every
-  unlock is a host return, now followed by a menu re-set. Check with step 3
-  above. If the window does come back: gate the rescue — skip it while
-  `org.gnome.ScreenSaver.GetActive` is true (same `busctl call` helper), or
-  require the host to be absent for N consecutive polls after unlock — as
-  its own change, then say so in the README's tray paragraph.
+  source calls out "entering/leaving the lock screen"). Locking is the
+  everyday host restart. By the code, every lock longer than one poll made
+  the hidden-window rescue (`!probe.host` → `show_main_window`, which also
+  focuses) re-show a window that was hidden in the tray, undoing
+  hide-to-tray; that was never seen with the owner's eyes, and the old build
+  was not run against a lock here.
+  What the change does:
+  - The rescue is now a pure decision, `tray::rescue_action(hidden,
+    host_present, locked, absent_polls)`, counted by `RescueWatch`. While
+    the session is locked a missing host never shows the window. Unlocked,
+    the host has to be missing on 2 polls in a row (it leaves a moment
+    before the lock is reported, and a poll landing in between must not show
+    the window); with a lock state that cannot be read, on 3 (nothing then
+    tells a lock from a dead host, so this only absorbs a read that failed
+    once or twice and a host restart — a lock longer than about 15 s shows
+    the window as before). A locked poll starts the count over, so a host that
+    is still gone after the unlock is rescued 2 polls later.
+  - The lock state is `LockedHint` of the logind session, read with
+    `busctl --system call … /org/freedesktop/login1/session/auto
+    org.freedesktop.DBus.Properties Get` (the `call` verb for the same
+    reason as the tray probe). `auto`, not `self`: read from an app scope
+    under the user manager — where a GUI the desktop launched runs —
+    `session/self` answers "Unknown object" and `session/auto` resolves to
+    the graphical session (its `Id` came back as the Wayland session's).
+  - When the hint does not say "locked", `org.gnome.ScreenSaver.GetActive`
+    on the user bus is asked too. GNOME's screen shield also comes up, and
+    takes the extensions down, without locking: on idle, until the lock
+    delay has run out, or for good with automatic locking off. That is
+    from GNOME Shell 50's `screenShield.js` (`activate()` pushes the
+    `unlock-dialog` mode; only `_setLocked` sets the hint; on idle `lock()`
+    runs after the lock delay and only with `lock-enabled`) — read, not
+    exercised. Off GNOME the call fails and the hint alone decides.
+  - Both reads happen only on a poll that finds the window hidden and the
+    host missing: no extra process otherwise, one or two then.
+  - Unchanged: the tray probe and `TrayWatch` run on every poll, so the
+    host's return after an unlock still re-sets the menu; the give-up path
+    still shows a hidden window at once.
+  What it costs: a tray host that really goes away (the extension turned
+  off) brings the window back after two polls, 5–10 s, where it was one.
+  README → *Known limits* says "~10 seconds" and that locking does not count.
+  Verified:
+  - Unit tests for the two reply shapes, for which source may say "locked",
+    and for the decision and its counter (lock, unlock with the host back,
+    unlock with the host still gone, host lost while unlocked, unreadable
+    state, a failed read between locked polls).
+  - Read-only on the dev machine, screen locked, GNOME's default lock
+    settings (`lock-delay` 0, `lock-enabled` true): the exact command the
+    GUI runs returned `v b true`, `GetActive` returned `b true`, no watcher
+    was on the bus.
+  - The GUI run headless (private `dbus-run-session`, headless mutter, a
+    stub `org.kde.StatusNotifierWatcher`, HOME and XDG dirs on a temp dir).
+    Whether the window is on screen was probed with Alt+F4 through mutter's
+    RemoteDesktop API while no host was up: a visible window then quits the
+    app, a hidden one does not get the key. With the real `busctl` and the
+    dev machine's real (locked) session: window hidden, host stopped, 7
+    polls, still hidden; one `LockedHint` read per poll and no
+    `GetActive`. With a `busctl` wrapper that answers only the two lock
+    reads from a file and passes everything else on:
+    - locked, host gone for 32 s: still hidden. Then unlocked with the host
+      back: the item registered with it and the menu re-set followed on the
+      next poll (two registrations), still hidden. Then the host stopped
+      again, unlocked: shown after 2 polls.
+    - host lost while locked and still gone after the unlock: hidden 1 poll
+      after the unlock, shown after 2.
+    - unlocked, host stopped: hidden after 1 poll, shown after 2.
+    - hint `false`, shield `true`, host gone for 32 s: still hidden; shield
+      down: shown after 2 polls.
+    - both reads failing: hidden after 2 polls, shown after 3.
+    - no lock read before the window was hidden, nor while it was hidden
+      with a host.
+  Not verified:
+  - The real lock screen end to end: the machine stayed locked for all of
+    the above, so `LockedHint` was never read as `false` from a real
+    session, the order of "host gone" and "hint set" at lock and at unlock
+    was not timed, and nobody saw the window stay hidden and the icon come
+    back after an unlock.
+  - The shield-without-lock state on a real session (`GetActive` true with
+    the hint false).
+  - Any desktop other than GNOME. KDE sets `LockedHint`; whether its tray
+    host leaves on lock was not looked at.
+  Known gap: a desktop that leaves `LockedHint` true on an unlocked session
+  would keep a window hidden whose tray host has died. Launching GrepFocus
+  again shows it (single instance).
+  **Live verification (owner):** run the new build, then:
+  1. Close the window to the tray, lock the screen for 30 s, unlock. The
+     window is still hidden, the icon is there, and its menu works ("Show
+     GrepFocus" opens the window, "Quit" quits).
+  2. The same with the screen left to blank by itself (idle), if automatic
+     locking is delayed or off on that machine.
+  3. The other direction: window hidden, AppIndicator extension turned OFF
+     (step 1 of the entry above) — the window is back within ~10 s.
+  If the window is on screen after an unlock, capture while locked (e.g.
+  `sleep 20; …` started just before locking):
+  `busctl --system call org.freedesktop.login1 /org/freedesktop/login1/session/auto org.freedesktop.DBus.Properties Get ss org.freedesktop.login1.Session LockedHint`
+  and
+  `busctl --user call org.gnome.ScreenSaver /org/gnome/ScreenSaver org.gnome.ScreenSaver GetActive`,
+  plus `gsettings get org.gnome.desktop.screensaver lock-delay`.
 
 ## Input hardening, health, DoH policies, updates (2026-09-28)
 
@@ -205,38 +296,69 @@ WP6 (GUI/daemon skew advice, AppImage "Update system service", installer
 under bash with package/downgrade guards) and WP7 (daily release check with
 a one-time disclosure and a Settings opt-out, `open_url`, `xdg-utils`
 Recommends). Design record: `docs/plans/hardening-health-updates.md` — its
-live verification checklist is still to be run. Pending release-note lines
-(the next `Release x.y.z` commit owns the changelog files):
+live verification checklist is still to be run.
 
-- Browsers' DNS-over-HTTPS is now switched off through standard
-  enterprise-policy files (Firefox, Mullvad Browser, Chromium, Chrome, Brave)
-  so blocks apply in them; those browsers show a "managed by your
-  organization" notice and must be restarted once. DoH stays off while
-  GrepFocus is installed (Mullvad Browser then uses the OS resolver instead
-  of Mullvad DNS); `grepfocusd cleanup` or uninstalling restores the files.
-  Downgrading: remove the files first (README → Recovery).
-- The Status tab now reports enforcement problems (failed `/etc/hosts`
-  write, failed or stale DoH table, tamper protection off, browser policy
-  failures, instant-break proxy) with a desktop notification on a new
-  failure; the Settings tab shows the app and service versions plus a
-  diagnostics line; `grepfocusd --version` and `grepfocus-gui --version`.
-- Block content is validated: domains must be hostnames (URLs are trimmed to
-  the hostname; IP literals, wildcards and single labels are refused), app
-  matchers must be well-formed and may not target GrepFocus itself, a block
-  needs at least one domain or app; stored entries are canonicalized at
-  startup and unusable legacy entries are dropped with a journal warning.
-- App blocking never kills root processes (system services, `sudo`/`pkexec`-
-  launched apps) or GrepFocus itself.
+### Pending release-note lines (0.6.0)
+
+Everything on this branch since the last tagged release, 0.4.0, in the
+order a changelog lists it (the 0.5.0 and 0.5.1 changelog entries exist,
+but no `v0.5.0` or `v0.5.1` tag does, here or on GitHub). The same ten
+lines, one per line, are `docs/release-notes-0.6.0.txt` — the file for
+`./scripts/bump-version.sh 0.6.0 --notes docs/release-notes-0.6.0.txt`
+(`docs/release.md`, step 1); change the two together. The `Release 0.6.0`
+commit owns the changelog files. Tried in a throwaway clone: the bump takes
+the file as ten bullets and `--check` passes afterwards.
+
+Two things to settle at release time:
+
+- The first and the third line repeat what the 0.5.0 and 0.5.1 entries,
+  which stay below the new one in both changelogs, already say.
+- The tray line ("If the system tray restarts …") describes a mitigation
+  that was never seen to make a difference on the real extension (GUI
+  section above); drop it if the owner's live check shows none. The
+  screen-lock line rests on the live check of that section's last entry.
+
+- Each block's schedule card shows a compact weekly grid of its windows, and
+  a new schedule takes its name from the block it belongs to.
+- New ways to install: an AUR package for Arch Linux, and an AppImage that
+  sets up its background service itself the first time it runs.
+- Blocks now also hold in browsers that use DNS-over-HTTPS: GrepFocus
+  switches it off in Firefox, Mullvad Browser, Chromium, Chrome and Brave
+  through their standard policy files, and the DoH servers it blocks during
+  a block now include Mullvad's and Mozilla's. Those browsers show a
+  "managed by your organization" notice and need one restart; DoH stays off
+  for as long as GrepFocus is installed (Mullvad Browser then uses the
+  system resolver), and uninstalling puts the files back. Before downgrading
+  to an older version, remove the files first (README, Recovery).
+- The Status tab reports blocking problems (a change to /etc/hosts that
+  could not be applied, failed DoH protection, tamper protection that is
+  off, a browser policy that could not be written, the instant-break proxy)
+  and a desktop notification tells you when a new one appears. Settings
+  shows the app and service versions with a diagnostics line; "grepfocusd
+  --version" and "grepfocus-gui --version" print them.
+- Blocks are checked when they are saved: a website must be a host name (a
+  pasted address is trimmed to it; IP addresses, wildcards and single words
+  are refused), an app entry must be well formed and cannot target GrepFocus
+  itself, and a block needs at least one website or app. Entries saved by
+  older versions are tidied at startup, and ones that cannot be used are
+  dropped with a warning in the system journal.
+- App blocking never stops programs running as root (system services, apps
+  started with sudo or pkexec) or GrepFocus itself.
 - AppImage: the Status tab offers "Update system service" when the app is
-  newer than the installed service; the installer runs under bash (fixes the
-  first-run install on Debian/Ubuntu), refuses to run over a package install
-  and refuses downgrades.
-- AppImage: Settings gains "Remove system service" (refused while a block
-  is running; saved data is kept), so the root service no longer outlives a
-  deleted AppImage; the installer no longer fails where `/tmp` is mounted
-  noexec (the downgrade check is skipped there, with a warning).
-- The app checks grepfocus.com once a day for a newer release (version
-  number only; one-time disclosure; opt-out in Settings).
+  newer than the installed service, and Settings gains "Remove system
+  service" (refused while a block is running; saved data is kept; if the
+  service's cleanup fails nothing is removed and the app says why), so the
+  service no longer outlives a deleted AppImage. The installer now works on
+  Debian and Ubuntu and where /tmp does not allow running programs, and
+  refuses to replace a package install or a newer service.
+- The app checks grepfocus.com once a day for a newer release: only the
+  version number is fetched, you are told the first time, and it can be
+  turned off in Settings.
+- If the system tray restarts (for example the AppIndicator extension is
+  re-enabled or updated), the GrepFocus icon and its menu are set up again
+  within about 10 seconds.
+- Locking the screen no longer brings a window that was hidden in the tray
+  back on screen.
 
 ## Decisions
 
@@ -430,8 +552,36 @@ to be redone when the item is picked up.
   ubuntu:24.04, `packaging/appimage/Containerfile` on ubuntu:22.04, with
   `APPIMAGE_EXTRACT_AND_RUN=1` because the container has no FUSE), so those
   two port as container jobs. The job should fail when the tag and the
-  workspace version in `Cargo.toml` disagree. Deferred: no `.github/`
-  exists yet, and the release steps are being scripted first.
+  workspace version in `Cargo.toml` disagree. Deferred. Since then the
+  three builds and their audit have been scripted (`scripts/release.sh`,
+  `docs/release.md`) and `.github/workflows/check.yml` runs the pre-flight
+  checks; neither builds a package in CI.
+- **A removal goes ahead after a cleanup step that only reports `FAILED`**
+  — run as root, `grepfocusd cleanup` exits non-zero in two cases only
+  (`crates/daemon/src/cleanup.rs`): the daemon is, or may be, still running
+  (the unit is active, something accepts on its socket, or the socket
+  cannot be probed), or the managed `/etc/hosts` region could not be
+  removed or restored. A failed nftables
+  clear, browser-policy restore, stale-temp sweep or active-block clear is
+  a `FAILED` line in its summary with exit 0. The AppImage installer's
+  `uninstall` stops, deleting nothing, on a non-zero or timed-out cleanup
+  (exit 96, which the app reports as "The service's cleanup failed, so it
+  was not removed"); after an exit-0 cleanup with a `FAILED` step it
+  deletes the binary all the same. What is left then is covered by the
+  manual commands in README → *Recovery*, and a policy `.orig` stays in
+  `/var/lib/grepfocus/policies`. Closing it needs cleanup to tell "done,
+  with failed steps" apart (a second exit status), which every caller
+  would then see — decide it for all of them together.
+  The rpm `%preun`, the deb `prerm` and the AUR `pre_remove` run the same
+  cleanup with its status ignored (`|| :`, `|| true`) and the package is
+  removed whatever it said. Left that way on purpose: pacman goes on after
+  a failed `pre_remove` regardless; a failing deb `prerm` or rpm `%preun`
+  does stop the removal, but it fails the whole transaction it is part of
+  and leaves a package that cannot be removed for as long as cleanup keeps
+  failing, with the service already stopped. (How the three package
+  managers treat a failing removal script is from their documentation, not
+  tried here.) README → *Uninstalling* says a failed cleanup does not stop
+  a package removal and points at *Recovery*.
 - **Export / import of blocks and schedules** — no way to move a
   configuration to another machine or keep a copy. Copying
   `/var/lib/grepfocus` does not work: the state file is sealed with the

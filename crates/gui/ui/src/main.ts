@@ -3137,8 +3137,18 @@ serviceRemoveConfirmEl.addEventListener("click", async () => {
       // text is `removal_refusal`'s or `installer_error`'s.
       serviceRemoveMsgEl.classList.add("error");
       serviceRemoveMsgEl.textContent = String(e);
-      serviceRemoveConfirmEl.disabled = false;
       serviceRemoveCancelEl.disabled = false;
+      // A removal whose cleanup failed has already stopped the service, and
+      // `uninstall_service` refuses when the daemon cannot be asked: a second
+      // click could only replace the script's recovery steps with that
+      // refusal. The button comes back when the dialog is opened again.
+      let answering = true;
+      try {
+        await invoke<Status>("get_status");
+      } catch {
+        answering = false;
+      }
+      serviceRemoveConfirmEl.disabled = !answering;
       return;
     }
     serviceRemoved = true;

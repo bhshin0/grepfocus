@@ -148,6 +148,162 @@ fn parse_watcher_properties(stdout: &str, object_name: &str) -> HostProbe {
     HostProbe { host, item_listed }
 }
 
+/// Whether the desktop session is locked or behind the screen shield; `None`
+/// when nothing could be read. While it is, a missing tray host is expected
+/// — GNOME Shell disables extensions, the AppIndicator one included, for as
+/// long as its lock screen is up — and says nothing about the tray the user
+/// will find on return.
+///
+/// Two reads, the second only when the first does not already say "locked":
+/// - logind's `LockedHint` for this session (GNOME and KDE set it). The
+///   object is `session/auto`, not `session/self`: an app the desktop
+///   launched runs in a scope under the user manager, outside any session,
+///   where `self` is "unknown object" and `auto` resolves to the user's
+///   display session.
+/// - `org.gnome.ScreenSaver.GetActive`: GNOME's shield also comes up, and
+///   takes the extensions down, without locking — on idle before the lock
+///   delay runs out, or with automatic locking turned off.
+pub fn session_locked() -> Option<bool> {
+    let hint = bool_call(&[
+        "--system",
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1/session/auto",
+        "org.freedesktop.DBus.Properties",
+        "Get",
+        "ss",
+        "org.freedesktop.login1.Session",
+        "LockedHint",
+    ]);
+    let shield = || {
+        bool_call(&[
+            "--user",
+            "org.gnome.ScreenSaver",
+            "/org/gnome/ScreenSaver",
+            "org.gnome.ScreenSaver",
+            "GetActive",
+        ])
+    };
+    locked_from(hint, if hint == Some(true) { None } else { shield() })
+}
+
+/// Locked when either source says so; otherwise whatever logind said. The
+/// shield's "not active" alone is not "unlocked": off GNOME it is unreadable,
+/// and then an unreadable hint must stay unknown.
+fn locked_from(hint: Option<bool>, shield: Option<bool>) -> Option<bool> {
+    if hint == Some(true) || shield == Some(true) {
+        Some(true)
+    } else {
+        hint
+    }
+}
+
+/// One `busctl call` whose reply is a single boolean; `args` is the bus
+/// switch followed by destination, path, interface, method and arguments.
+/// Same `call` verb and flags as `probe_host`, for the same reasons.
+fn bool_call(args: &[&str]) -> Option<bool> {
+    let (bus, call) = args.split_first()?;
+    let out = Command::new("busctl")
+        .args([*bus, "--timeout=2", "--auto-start=no", "call"])
+        .args(call)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_bool_reply(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parses `b true` (a method's return value) or `v b false` (a property read
+/// through `Properties.Get`).
+fn parse_bool_reply(stdout: &str) -> Option<bool> {
+    let toks = tokens(stdout);
+    let value = match toks.as_slice() {
+        [Token::Word(b), Token::Word(value)] if b == "b" => value,
+        [Token::Word(v), Token::Word(b), Token::Word(value)] if v == "v" && b == "b" => value,
+        _ => return None,
+    };
+    match value.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Polls in a row a hidden window's tray host must be missing, with the
+/// session known to be unlocked, before the window is shown. Not 1: the host
+/// leaves a moment before the lock is reported (GNOME pushes its lock-screen
+/// mode, then sets the hint), and a poll landing in between must not show the
+/// window. The poll after it reads "locked".
+const RESCUE_POLLS_UNLOCKED: u8 = 2;
+
+/// The same when the lock state cannot be read (no logind, a failed call).
+/// Nothing then tells a lock from a dead host, so a lock that outlasts this
+/// shows the window as it always did; one more poll than above only keeps a
+/// read that failed once or twice from doing so, and costs a window with no
+/// tray 5 s more of being hidden.
+const RESCUE_POLLS_LOCK_UNKNOWN: u8 = 3;
+
+const _: () = assert!(RESCUE_POLLS_UNLOCKED >= 2);
+const _: () = assert!(RESCUE_POLLS_LOCK_UNKNOWN >= RESCUE_POLLS_UNLOCKED);
+
+/// What the status watcher does about the main window on one poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RescueAction {
+    None,
+    /// Show the window: it is hidden and no tray is there to bring it back.
+    Show,
+}
+
+/// The hidden-window rescue for one poll. `absent_polls` is how many polls
+/// in a row, this one included, found the window hidden, the host missing
+/// and the session not known to be locked.
+pub fn rescue_action(
+    hidden: bool,
+    host_present: bool,
+    locked: Option<bool>,
+    absent_polls: u8,
+) -> RescueAction {
+    if !hidden || host_present {
+        return RescueAction::None;
+    }
+    let needed = match locked {
+        Some(true) => return RescueAction::None,
+        Some(false) => RESCUE_POLLS_UNLOCKED,
+        None => RESCUE_POLLS_LOCK_UNKNOWN,
+    };
+    if absent_polls >= needed {
+        RescueAction::Show
+    } else {
+        RescueAction::None
+    }
+}
+
+/// Counts the polls `rescue_action` wants. A locked poll starts the count
+/// over, so a host that is still missing after the unlock is waited for from
+/// the unlock, and then rescued like any other.
+#[derive(Debug, Default)]
+pub struct RescueWatch {
+    absent_polls: u8,
+}
+
+impl RescueWatch {
+    /// Whether this poll's decision depends on the lock state. The caller
+    /// reads it (two process spawns at worst) only then and passes `None`
+    /// otherwise.
+    pub fn needs_lock_state(hidden: bool, host_present: bool) -> bool {
+        hidden && !host_present
+    }
+
+    pub fn poll(&mut self, hidden: bool, host_present: bool, locked: Option<bool>) -> RescueAction {
+        if !Self::needs_lock_state(hidden, host_present) || locked == Some(true) {
+            self.absent_polls = 0;
+            return RescueAction::None;
+        }
+        self.absent_polls = self.absent_polls.saturating_add(1);
+        rescue_action(hidden, host_present, locked, self.absent_polls)
+    }
+}
+
 /// What the status watcher does to the tray on one poll.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
@@ -229,8 +385,9 @@ impl TrayWatch {
 #[cfg(test)]
 mod tests {
     use super::{
-        item_object_name, parse_watcher_properties, tokens, tray_action, HostProbe, Token,
-        TrayAction, TrayWatch, MAX_ATTEMPTS, TRAY_ID,
+        item_object_name, locked_from, parse_bool_reply, parse_watcher_properties, rescue_action,
+        tokens, tray_action, HostProbe, RescueAction, RescueWatch, Token, TrayAction, TrayWatch,
+        MAX_ATTEMPTS, RESCUE_POLLS_LOCK_UNKNOWN, RESCUE_POLLS_UNLOCKED, TRAY_ID,
     };
 
     const ITEM: &str = "tray_icon_tray_app_grepfocus_tray";
@@ -367,6 +524,188 @@ mod tests {
                 item_listed: Some(false)
             }
         );
+    }
+
+    #[test]
+    fn bool_replies_of_both_shapes() {
+        // `Properties.Get` on logind's LockedHint, as read from a live
+        // session; `GetActive` on org.gnome.ScreenSaver likewise.
+        assert_eq!(parse_bool_reply("v b true\n"), Some(true));
+        assert_eq!(parse_bool_reply("v b false\n"), Some(false));
+        assert_eq!(parse_bool_reply("b true\n"), Some(true));
+        assert_eq!(parse_bool_reply("b false\n"), Some(false));
+    }
+
+    #[test]
+    fn anything_else_is_not_a_bool_reply() {
+        for out in [
+            "",
+            "b",
+            "v b",
+            "b yes",
+            "v s \"true\"",
+            "s \"b true\"",
+            "\"b\" true",
+            "v v b true",
+            "b true b false",
+            "u 1",
+        ] {
+            assert_eq!(parse_bool_reply(out), None, "{out:?}");
+        }
+    }
+
+    #[test]
+    fn either_source_locks_and_only_logind_unlocks() {
+        assert_eq!(locked_from(Some(true), None), Some(true));
+        assert_eq!(locked_from(Some(true), Some(false)), Some(true));
+        // The shield is up without a lock (idle, lock delay not run out).
+        assert_eq!(locked_from(Some(false), Some(true)), Some(true));
+        assert_eq!(locked_from(None, Some(true)), Some(true));
+        assert_eq!(locked_from(Some(false), Some(false)), Some(false));
+        assert_eq!(locked_from(Some(false), None), Some(false));
+        // No logind answer: a shield that is down (or not GNOME's) does not
+        // make the session "unlocked".
+        assert_eq!(locked_from(None, Some(false)), None);
+        assert_eq!(locked_from(None, None), None);
+    }
+
+    #[test]
+    fn rescue_needs_a_hidden_window_and_a_missing_host() {
+        for locked in [Some(true), Some(false), None] {
+            for polls in [0, 1, RESCUE_POLLS_LOCK_UNKNOWN, u8::MAX] {
+                assert_eq!(
+                    rescue_action(false, false, locked, polls),
+                    RescueAction::None
+                );
+                assert_eq!(rescue_action(true, true, locked, polls), RescueAction::None);
+                assert_eq!(
+                    rescue_action(false, true, locked, polls),
+                    RescueAction::None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rescue_never_fires_while_locked() {
+        for polls in [0, 1, RESCUE_POLLS_LOCK_UNKNOWN, u8::MAX] {
+            assert_eq!(
+                rescue_action(true, false, Some(true), polls),
+                RescueAction::None
+            );
+        }
+    }
+
+    #[test]
+    fn rescue_thresholds() {
+        let unlocked = |polls| rescue_action(true, false, Some(false), polls);
+        assert_eq!(unlocked(RESCUE_POLLS_UNLOCKED - 1), RescueAction::None);
+        assert_eq!(unlocked(RESCUE_POLLS_UNLOCKED), RescueAction::Show);
+        assert_eq!(unlocked(u8::MAX), RescueAction::Show);
+        let unknown = |polls| rescue_action(true, false, None, polls);
+        assert_eq!(unknown(RESCUE_POLLS_LOCK_UNKNOWN - 1), RescueAction::None);
+        assert_eq!(unknown(RESCUE_POLLS_LOCK_UNKNOWN), RescueAction::Show);
+    }
+
+    #[test]
+    fn lock_state_is_only_needed_for_a_hidden_window_without_a_host() {
+        assert!(RescueWatch::needs_lock_state(true, false));
+        assert!(!RescueWatch::needs_lock_state(true, true));
+        assert!(!RescueWatch::needs_lock_state(false, false));
+        assert!(!RescueWatch::needs_lock_state(false, true));
+    }
+
+    /// Host missing under a hidden window.
+    fn absent(w: &mut RescueWatch, locked: Option<bool>) -> RescueAction {
+        w.poll(true, false, locked)
+    }
+
+    #[test]
+    fn screen_lock_does_not_show_the_window() {
+        let mut w = RescueWatch::default();
+        assert_eq!(w.poll(true, true, None), RescueAction::None);
+        // The host is gone one poll before the lock is reported.
+        assert_eq!(absent(&mut w, Some(false)), RescueAction::None);
+        for _ in 0..1000 {
+            assert_eq!(absent(&mut w, Some(true)), RescueAction::None);
+        }
+        // Unlocked, and the host is back on the same poll.
+        for _ in 0..10 {
+            assert_eq!(w.poll(true, true, None), RescueAction::None);
+        }
+    }
+
+    #[test]
+    fn host_returning_a_poll_after_the_unlock_does_not_show_the_window() {
+        let mut w = RescueWatch::default();
+        for _ in 0..5 {
+            assert_eq!(absent(&mut w, Some(true)), RescueAction::None);
+        }
+        for _ in 1..RESCUE_POLLS_UNLOCKED {
+            assert_eq!(absent(&mut w, Some(false)), RescueAction::None);
+        }
+        assert_eq!(w.poll(true, true, None), RescueAction::None);
+        // The wait starts over at the next loss.
+        assert_eq!(absent(&mut w, Some(false)), RescueAction::None);
+    }
+
+    #[test]
+    fn host_still_missing_after_the_unlock_shows_the_window() {
+        let mut w = RescueWatch::default();
+        // The polls before the lock do not count towards the wait after it.
+        assert_eq!(absent(&mut w, Some(false)), RescueAction::None);
+        for _ in 0..5 {
+            assert_eq!(absent(&mut w, Some(true)), RescueAction::None);
+        }
+        for _ in 1..RESCUE_POLLS_UNLOCKED {
+            assert_eq!(absent(&mut w, Some(false)), RescueAction::None);
+        }
+        assert_eq!(absent(&mut w, Some(false)), RescueAction::Show);
+    }
+
+    #[test]
+    fn host_lost_in_an_unlocked_session_shows_the_window() {
+        let mut w = RescueWatch::default();
+        assert_eq!(w.poll(true, true, None), RescueAction::None);
+        for _ in 1..RESCUE_POLLS_UNLOCKED {
+            assert_eq!(absent(&mut w, Some(false)), RescueAction::None);
+        }
+        assert_eq!(absent(&mut w, Some(false)), RescueAction::Show);
+        // Shown now: nothing more to do, and a later hide starts from zero.
+        assert_eq!(w.poll(false, false, None), RescueAction::None);
+        assert_eq!(absent(&mut w, Some(false)), RescueAction::None);
+    }
+
+    #[test]
+    fn unreadable_lock_state_waits_longer_then_shows_the_window() {
+        let mut w = RescueWatch::default();
+        for _ in 1..RESCUE_POLLS_LOCK_UNKNOWN {
+            assert_eq!(absent(&mut w, None), RescueAction::None);
+        }
+        assert_eq!(absent(&mut w, None), RescueAction::Show);
+    }
+
+    #[test]
+    fn reads_that_fail_between_locked_polls_do_not_show_the_window() {
+        let mut w = RescueWatch::default();
+        for _ in 0..20 {
+            assert_eq!(absent(&mut w, Some(true)), RescueAction::None);
+            for _ in 1..RESCUE_POLLS_LOCK_UNKNOWN {
+                assert_eq!(absent(&mut w, None), RescueAction::None);
+            }
+        }
+    }
+
+    #[test]
+    fn a_window_that_stays_hidden_is_shown_again() {
+        // The show did not take (or the window was hidden again at once):
+        // the count is not spent.
+        let mut w = RescueWatch::default();
+        for _ in 1..RESCUE_POLLS_UNLOCKED {
+            assert_eq!(absent(&mut w, Some(false)), RescueAction::None);
+        }
+        assert_eq!(absent(&mut w, Some(false)), RescueAction::Show);
+        assert_eq!(absent(&mut w, Some(false)), RescueAction::Show);
     }
 
     #[test]

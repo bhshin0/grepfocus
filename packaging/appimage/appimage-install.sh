@@ -29,14 +29,25 @@
 # payload that cannot be executed where bash can (corrupt, wrong
 # architecture), or that runs but reports no version, is refused (exit 1).
 #
-# `uninstall` stops the service, runs `grepfocusd cleanup` and only then
-# deletes the binary and unit. A cleanup that fails ends the run (exit 1) with
-# nothing deleted: the binary is what a retry needs, and the GUI reports
-# "removed" on exit 0.
+# `uninstall` stops and disables the service, runs `grepfocusd cleanup` and
+# only then deletes the binary, the unit and the drop-ins. A cleanup that
+# fails ends the run (exit 96) with nothing deleted and the service left
+# stopped and disabled — or still running, where stopping it is what failed:
+# the binary is what a retry needs, and the GUI reports "removed" on exit 0.
+# "Fails" means cleanup's own non-zero status — the daemon is still running
+# (the unit is active, or something answers on its socket), or the managed
+# /etc/hosts region could not be removed or restored — or a cleanup that
+# `timeout` had to stop (124, 137). It does NOT mean every failed step:
+# cleanup exits 0 when only the nftables table, a browser policy file, a
+# stale temp file or the persisted active blocks could not be dealt with (it
+# prints those as FAILED in its summary), and the removal then goes ahead.
+# With no executable binary at /usr/local/bin there is no cleanup to run, and
+# the rest is removed.
 #
-# Exit codes: 0 ok · 1 any other failure · 2 usage · 98 a package install
-# owns grepfocusd · 99 would downgrade (97 = payload integrity, raised by the
-# bootstrap). The GUI maps these in `installer_error` (crates/gui/src/main.rs).
+# Exit codes: 0 ok · 1 any other failure · 2 usage · 96 uninstall: cleanup
+# failed, nothing removed · 98 a package install owns grepfocusd · 99 would
+# downgrade (97 = payload integrity, raised by the bootstrap). The GUI maps
+# these in `installer_error` (crates/gui/src/main.rs).
 #
 # It does ONLY the system-side steps the RPM %post / packaging/install.sh do —
 # it never builds. It CANNOT run from the AppImage mount: that mount is
@@ -187,17 +198,36 @@ do_install() {
 do_uninstall() {
     refuse_over_package
     echo "==> Stopping and disabling grepfocusd"
-    systemctl disable --now grepfocusd.service || true
+    # --quiet: everything this run writes to stderr is shown by the GUI when
+    # it fails, and `disable` reports the symlink it removed there.
+    systemctl --quiet disable --now grepfocusd.service || true
     # Tear down enforcement (immutable /etc/hosts bit, nftables, browser DoH
     # policies) while the binary still exists. It exits non-zero when the
     # managed /etc/hosts region could not be removed or the daemon is still
     # running; deleting the binary then would strand what is still enforced.
+    # `timeout` reports a cleanup it had to stop as 124 (TERM was enough) or
+    # 137 (KILL), which are failures like any other.
     if [[ -x "$BIN" ]]; then
-        local rc=0
+        local rc=0 why
         timeout --kill-after=5 30 "$BIN" cleanup || rc=$?
         if (( rc != 0 )); then
-            echo "error: \`grepfocusd cleanup\` failed (status $rc), so nothing was deleted. The service may be stopped: \`sudo systemctl enable --now grepfocusd\` brings it back, \`sudo $BIN cleanup\` retries the teardown (README: Recovery)." >&2
-            exit 1
+            why="failed (status $rc)"
+            if (( rc == 124 || rc == 137 )); then
+                why="did not finish within its time limit and was stopped (status $rc)"
+            fi
+            echo "error: \`grepfocusd cleanup\` $why, so nothing was removed: the binary and the unit are still installed." >&2
+            # The GUI's "Remove system service" asks the daemon whether a
+            # block is running before it runs this script, and refuses when
+            # there is no answer: with the service stopped, the way on is a
+            # terminal, or starting the service first.
+            if systemctl is-active --quiet grepfocusd.service; then
+                echo "The service is still running — stopping it is what failed. Try Remove system service again, or use the terminal steps in the README (Uninstalling)." >&2
+            else
+                echo "The service is stopped and disabled, and Remove system service only works while it is running." >&2
+                echo "To finish from a terminal: sudo $BIN cleanup — and once that succeeds: sudo rm -f $BIN $UNIT /usr/lib/sysusers.d/grepfocus.conf /usr/lib/tmpfiles.d/grepfocus.conf && sudo systemctl daemon-reload" >&2
+                echo "To retry from the app instead, or to keep the service: sudo systemctl enable --now grepfocusd (README: Uninstalling, Recovery)." >&2
+            fi
+            exit 96
         fi
     fi
     echo "==> Removing files"

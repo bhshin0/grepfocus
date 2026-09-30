@@ -55,6 +55,8 @@ packaging/
   install.sh, upgrade.sh, uninstall.sh   dev scripts for a source checkout
   grepfocus.spec, build-*.sh, aur/, appimage/   rpm, deb, AUR and AppImage packaging
 debian/      deb packaging
+scripts/     check.sh (pre-flight checks), bump-version.sh and release.sh
+docs/        release.md (the release procedure), plans/ (design records)
 ```
 
 ## Build and install from source (Fedora)
@@ -162,6 +164,10 @@ autostart entry), use the upgrade loop:
 ./packaging/upgrade.sh   # run as your normal user; uses sudo for system steps
 ```
 
+Cutting a release — bumping the version everywhere it is recorded, building
+and auditing the rpm, deb and AppImage, then the tag, the AUR and the
+website — is a checklist of its own: [docs/release.md](docs/release.md).
+
 ## Updating
 
 The daemon and the GUI ship together and must match: the GUI compares its
@@ -203,7 +209,10 @@ GREPFOCUS_UPDATE_URL=http://127.0.0.1:8099/latest.json cargo run -p grepfocus-gu
 
 - **rpm / deb / AUR:** remove the `grepfocus` package with your package
   manager. Its removal script stops the service and runs `grepfocusd
-  cleanup` before the files go.
+  cleanup` before the files go. A cleanup that fails does not stop the
+  removal — a package manager cannot safely abort one half-way — so if
+  sites stay blocked afterwards, use the manual commands under
+  [Recovery](#recovery).
 - **AppImage:** Settings → *System service* → **Remove system service**,
   then delete the AppImage file. Deleting the file alone leaves the root
   service installed and enforcing. The button asks for confirmation and
@@ -217,9 +226,25 @@ GREPFOCUS_UPDATE_URL=http://127.0.0.1:8099/latest.json cargo run -p grepfocus-gu
   session is running it refuses. To reinstall, run the AppImage again; it
   offers to install the service.
 
-  The button needs the service to answer. If it does not (the app says
-  "Service not running"), or the AppImage file is already gone, the same
-  steps from a terminal:
+  If `grepfocusd cleanup` fails there, nothing is deleted: the service
+  stays installed (stopped and disabled), the app says "The service's
+  cleanup failed, so it was not removed" with cleanup's own error, and
+  blocks may still be in effect. That is the case when cleanup exits
+  non-zero — the daemon is still running, or the managed `/etc/hosts` region
+  could not be removed or restored — or does not finish within 30 seconds.
+  The button cannot retry from there, because it needs the service to
+  answer. Either finish from a terminal: run `sudo /usr/local/bin/grepfocusd
+  cleanup` and, once it succeeds, the `rm` and `daemon-reload` lines of the
+  block below. Or start the service again with `sudo systemctl enable --now
+  grepfocusd` — which is also how to keep it — and press the button once
+  more. Only where stopping the service is what failed is it still running,
+  and the button can be pressed again as it is. A step that cleanup only
+  reports as `FAILED` while exiting 0 (the nftables table, a browser policy
+  file) does not stop the removal; [Recovery](#recovery) has the manual
+  commands for those.
+
+  If the service does not answer (the app says "Service not running"), or
+  the AppImage file is already gone, the same steps from a terminal:
 
   ```bash
   sudo systemctl disable --now grepfocusd
@@ -304,11 +329,13 @@ older version with more entries than the caps allow keeps working but cannot
 be re-saved until it is trimmed.
 
 `get_status` carries a `health` object: every enforcement outcome the daemon
-used to log and forget, plus its identity. What a healthy daemon emits:
+used to log and forget, plus its identity. An example of what a daemon
+emits (`daemon_version` is that daemon's release, `X.Y.Z` here; one browser
+policy is shown failing):
 
 ```json
 "health": {
-  "daemon_version": "0.6.0",
+  "daemon_version": "X.Y.Z",
   "daemon_exe": "/usr/local/bin/grepfocusd",
   "install_kind": "local",
   "nft":   {"kind": "ok"},
@@ -547,9 +574,12 @@ that Cold Turkey beats either.
   KStatusNotifierItem Support". Without one, closing the window quits the
   app — enforcement is daemon-side and unaffected; minimize instead of
   closing to keep getting block start/end notifications. With one, closing
-  hides to the tray; if the tray host
-  vanishes while the window is hidden, the window reappears within ~5
-  seconds. Launching GrepFocus again always surfaces the existing instance.
+  hides to the tray; if the tray host vanishes while the window is hidden
+  (the extension is turned off), the window reappears within ~10 seconds.
+  Locking the screen does not count: GNOME switches extensions off for as
+  long as the lock screen is up, and the window stays hidden until the tray
+  is back after the unlock. Launching GrepFocus again always surfaces the
+  existing instance.
 - **The update check fails behind a TLS-intercepting proxy.** It trusts the
   Mozilla root store bundled with the app (webpki-roots), not the system
   trust store, so a proxy that re-signs traffic with a private CA makes the
