@@ -4,6 +4,7 @@
   --fg: #1b1d21;
   --accent: #2a6df4;
   --danger: #c93b3b;
+  --warn: #b7791f;
   --muted: #6b7280;
   --card: #ffffff;
   --border: #e5e7eb;
@@ -15,10 +16,15 @@
     --card: #1f2227;
     --border: #2a2d33;
     --muted: #9ca3af;
+    --warn: #d69e2e;
   }
 }
 
 * { box-sizing: border-box; }
+/* The UA's [hidden] rule is a plain author-overridable declaration, so any
+   `display: grid/flex` rule below would win over the attribute (e.g. the grid
+   `label` rule on #old-pw-label). Make the attribute always mean hidden. */
+[hidden] { display: none !important; }
 body {
   margin: 0;
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -298,6 +304,30 @@ dialog .row { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
 /* Non-blocking warning (e.g. password-locked breaks with no password set).
    Distinct from .msg.error: the save still goes through. */
 .msg.warn { color: var(--fg); opacity: 0.9; }
+
+/* Status-tab enforcement notices (healthNotices in main.ts): one card per
+   notice, severity carried by the left edge and text colour. RED (error) is
+   blocking that may not hold; YELLOW (warn) is degraded but enforced; INFO is
+   something worth knowing that needs no action. */
+#health-banner { display: grid; gap: 6px; margin-bottom: 14px; }
+.health-notice {
+  margin: 0;
+  font-size: 13px;
+  padding: 8px 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--muted);
+  border-radius: 8px;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+.health-notice.error { border-left-color: var(--danger); color: var(--danger); }
+.health-notice.warn { border-left-color: var(--warn); color: var(--warn); }
+.health-notice.info { border-left-color: var(--accent); }
+
+/* Settings: versions + diagnostics, set off from the password form above. */
+#about { margin-top: 20px; border-top: 1px solid var(--border); padding-top: 10px; }
+#about .hint { margin: 4px 0; overflow-wrap: anywhere; }
 
 /* Challenge dialog: wider than the 360px default so a 40-char string can
    breathe on one or two lines. */

@@ -408,7 +408,7 @@ const listEl = document.querySelector<HTMLUListElement>("#block-list")!;
 const listMsg = document.querySelector<HTMLParagraphElement>("#list-msg")!;
 
 async function refreshList() {
-  listMsg.classList.remove("error");
+  listMsg.classList.remove("error", "warn");
   listMsg.textContent = "";
   listEl.innerHTML = "";
   try {
@@ -425,16 +425,26 @@ async function refreshList() {
     //
     // A failed status read is not fatal here — fall back to no active blocks
     // and no allowance views (each card then renders its static policy
-    // summary) and let the daemon have the last word on save.
+    // summary) and let the daemon have the last word on save. But it is not
+    // silent either: a card that reads "idle, full allowance" because the
+    // read failed is misinformation, so the failure is stated above the list.
     //
     // Schedules ride along for the same reason they now live inside the cards:
     // a schedule has no meaning apart from the block it drives. Storage is
     // still one flat list keyed by `block_id`, so grouping happens here.
-    const [blocks, status, schedules] = await Promise.all([
+    const [blocks, statusRead, schedules] = await Promise.all([
       invoke<Block[]>("list_blocks"),
-      invoke<Status>("get_status").catch(() => null),
+      invoke<Status>("get_status").then(
+        (status) => ({ status, err: "" }),
+        (e: unknown) => ({ status: null, err: String(e) }),
+      ),
       invoke<Schedule[]>("list_schedules"),
     ]);
+    const status = statusRead.status;
+    if (status === null) {
+      listMsg.classList.add("warn");
+      listMsg.textContent = `Live status could not be read (${statusRead.err}) — which blocks are active and their remaining allowance are unknown; cards show saved configuration only.`;
+    }
     const active = new Set((status?.active ?? []).map((a) => a.block.id));
     // Absent on an OLD daemon that predates the field, in which case this map
     // stays empty and every card falls back to its static summary.
@@ -610,7 +620,7 @@ function renderBlockCard(
   const dur = li.querySelector<HTMLInputElement>(".duration")!;
   li.querySelector<HTMLButtonElement>(".start-btn")!.addEventListener("click", async () => {
     const minutes = Math.max(1, parseInt(dur.value, 10) || 30);
-    listMsg.classList.remove("error");
+    listMsg.classList.remove("error", "warn");
     try {
       await invoke("start_block", { id: b.id, durationSecs: minutes * 60 });
       listMsg.textContent = `started for ${minutes} minute(s)`;
@@ -621,7 +631,7 @@ function renderBlockCard(
     }
   });
   li.querySelector<HTMLButtonElement>(".delete-btn")!.addEventListener("click", async () => {
-    listMsg.classList.remove("error");
+    listMsg.classList.remove("error", "warn");
     if (!(await ensureUnlocked())) return;
     try {
       await invoke("delete_block", { id: b.id });
@@ -746,11 +756,260 @@ function statusInteractionBusy(): boolean {
   return el instanceof HTMLInputElement && statusEl.contains(el);
 }
 
+// ─── Health: Status banner, Settings about + diagnostics lines ─────────────
+//
+// `healthNotices`, `healthSummary` and `aboutLine` are pure (status in, text
+// out) so every severity rule reads in one place; the render functions after
+// them are the only DOM writers. All of it is silent on a daemon too old to
+// report (`health.daemon_version === ""`) and for any `unknown` value.
+
+const healthBannerEl = document.querySelector<HTMLDivElement>("#health-banner")!;
+const aboutLineEl = document.querySelector<HTMLParagraphElement>("#about-line")!;
+const healthDiagEl = document.querySelector<HTMLParagraphElement>("#health-diag")!;
+
+/// RED = blocking may not hold; YELLOW = enforced but degraded; INFO = worth
+/// knowing, nothing to do.
+type NoticeLevel = "error" | "warn" | "info";
+
+interface HealthNotice {
+  level: NoticeLevel;
+  text: string;
+}
+
+/// Display names for the daemon's browser slugs. An unknown slug (a newer
+/// daemon's browser) renders raw rather than being dropped.
+const BROWSER_NAME: Record<string, string> = {
+  firefox: "Firefox",
+  "firefox-flatpak": "Firefox (Flatpak)",
+  "mullvad-browser": "Mullvad Browser",
+  chromium: "Chromium",
+  "chromium-snap": "Chromium (snap)",
+  chrome: "Google Chrome",
+  brave: "Brave",
+};
+
+function browserName(slug: string): string {
+  return BROWSER_NAME[slug] ?? slug;
+}
+
+/// "Firefox" · "Firefox and Chromium" · "Firefox, Mullvad Browser and Chromium".
+function joinNames(names: string[]): string {
+  if (names.length <= 1) return names.join("");
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+/// How long after a policy file was written the "restart your browser" hint
+/// stays up. Firefox-based browsers read policies only at start, so one that
+/// was open at write time keeps DoH until restarted; past this window assume
+/// it has been.
+const RESTART_HINT_SECS = 900;
+
+/// The Status-tab notices for a status, RED → YELLOW → INFO.
+///
+/// The two RED rules are mirrored by `enforcement_red` in src/main.rs, which
+/// drives the tray notification — change together.
+function healthNotices(s: Status): HealthNotice[] {
+  const h = s.health;
+  if (h.daemon_version === "") return [];
+  const domainBlockActive = s.active.some((a) => a.block.domains.length > 0);
+  const red: HealthNotice[] = [];
+  const yellow: HealthNotice[] = [];
+  const info: HealthNotice[] = [];
+
+  // RED: the hosts write itself failed. Always shown — with no domain block
+  // active it is a failed teardown, and the previous block's entries may
+  // still be in /etc/hosts.
+  if (h.last_error != null) {
+    red.push({
+      level: "error",
+      text: domainBlockActive
+        ? `Website blocking may not be enforced: the /etc/hosts change could not be applied (${h.last_error}). The daemon retries every second; see journalctl -u grepfocusd`
+        : `The last /etc/hosts change could not be applied (${h.last_error}) — previously blocked sites may still be blocked. The daemon retries every second; see journalctl -u grepfocusd`,
+    });
+  }
+  // RED: no DoH table under a live domain block. Without one there is nothing
+  // to bypass, and the state clears at the next apply.
+  if (h.nft.kind === "failed" && domainBlockActive) {
+    red.push({
+      level: "error",
+      text: `Active blocks can be bypassed: DoH protection (nftables) failed — ${h.nft.reason}. Browsers using DNS-over-HTTPS (Firefox, Mullvad Browser) may still reach blocked sites.`,
+    });
+  }
+
+  if (h.hosts.kind === "unlocked") {
+    yellow.push({
+      level: "warn",
+      text: `Tamper protection off: /etc/hosts is not locked (${h.hosts.reason}). Blocking still works, but the file can be edited while a block is active.`,
+    });
+  }
+  if (h.nft.kind === "stale_table") {
+    yellow.push({
+      level: "warn",
+      text: `The DoH block table could not be removed after the last block (${h.nft.reason}) — DNS-over-HTTPS resolvers stay blocked (Mullvad Browser loses DNS). The daemon retries every 30 s; to remove it now: sudo nft delete table inet grepfocus_doh`,
+    });
+  }
+
+  // Browser policies: a fixable failure is YELLOW with its remedy, one the
+  // daemon cannot fix on this layout is INFO, and a fresh write earns the
+  // one-time restart hint.
+  const recentlyWritten: string[] = [];
+  let lastWriteUnix = 0;
+  for (const bp of h.browser_policies) {
+    const name = browserName(bp.browser);
+    const st = bp.state;
+    if (st.kind === "failed") {
+      switch (st.fail_kind) {
+        case "not_json":
+        case "symlink":
+        case "io": {
+          const remedy =
+            st.fail_kind === "not_json"
+              ? `Fix or remove ${bp.path}; GrepFocus retries every minute.`
+              : st.fail_kind === "symlink"
+                ? `Replace ${bp.path} with a real file or add DNSOverHTTPS there yourself.`
+                : "GrepFocus retries every minute.";
+          yellow.push({
+            level: "warn",
+            text: `${name}: DoH policy not installed (${st.reason}). ${name} may bypass blocks via DNS-over-HTTPS. ${remedy}`,
+          });
+          break;
+        }
+        case "unsupported":
+          info.push({
+            level: "info",
+            text: `${name} is present but not covered (${st.reason}). DoH may bypass blocks in it — see README → Known limits.`,
+          });
+          break;
+        case "read_only_fs":
+          info.push({
+            level: "info",
+            text: `Cannot write ${bp.path}: read-only filesystem. DoH may bypass blocks in ${name}; not fixable on this system layout.`,
+          });
+          break;
+        default:
+          // `unknown`: a newer daemon's kind this build cannot judge.
+          break;
+      }
+    } else if (
+      (st.kind === "written" || st.kind === "merged") &&
+      s.now_unix - bp.since_unix < RESTART_HINT_SECS
+    ) {
+      recentlyWritten.push(name);
+      // The latest write is the conservative cut-off for "open before".
+      lastWriteUnix = Math.max(lastWriteUnix, bp.since_unix);
+    }
+  }
+
+  if (h.startup_notes.length > 0) {
+    yellow.push({
+      level: "warn",
+      text: `${h.startup_notes.length} stored block entries were changed or dropped when the daemon started (invalid domains or app matchers from an older version). Details: journalctl -u grepfocusd | grep sanitized`,
+    });
+  }
+  if (recentlyWritten.length > 0) {
+    info.push({
+      level: "info",
+      text: `GrepFocus switched DNS-over-HTTPS off in ${joinNames(recentlyWritten)} through a system policy so blocks apply there (they will say 'managed by your organization'). Restart Firefox-based browsers once if they were open before ${fmtClock(lastWriteUnix)}.`,
+    });
+  }
+  // The Settings tab carries the same note off the legacy bool; this one is
+  // on the Status tab because that is where a lagging break is noticed.
+  if (h.proxy === "degraded" && s.settings.instant_breaks) {
+    info.push({
+      level: "info",
+      text: "Instant breaks unavailable — port 80 or 443 is in use, so breaks may take up to a minute to show in an already-open tab. Blocking is unaffected.",
+    });
+  }
+  return [...red, ...yellow, ...info];
+}
+
+/// The Settings diagnostics line: every enforcement state on one row, for a
+/// bug report or a journal cross-check. The drift counters are diagnostics
+/// only — they never raise a notice. "off (premium feature)" is this side's
+/// reading of a hosts lock that was never attempted; the daemon stays the only
+/// source of "NOT locked" (attempted and failed).
+function healthSummary(s: Status): string {
+  const h = s.health;
+  const domainBlockActive = s.active.some((a) => a.block.domains.length > 0);
+  const tamperLicensed = s.license_valid && s.licensed_features.includes("tamper_protection");
+  let nft: string;
+  switch (h.nft.kind) {
+    case "ok":
+      nft = "ok";
+      break;
+    case "failed":
+      nft = "FAILED";
+      break;
+    case "stale_table":
+      nft = `stale table (${h.nft.reason})`;
+      break;
+    case "not_applicable":
+      nft = "not applicable";
+      break;
+    default:
+      nft = "unknown";
+  }
+  let hosts: string;
+  switch (h.hosts.kind) {
+    case "locked":
+      hosts = "locked";
+      break;
+    case "unlocked":
+      hosts = "NOT locked";
+      break;
+    case "not_applicable":
+      hosts = domainBlockActive && !tamperLicensed ? "off (premium feature)" : "not applicable";
+      break;
+    default:
+      hosts = "unknown";
+  }
+  return `Enforcement — DoH block (nft): ${nft} · /etc/hosts lock: ${hosts} · instant-break proxy: ${h.proxy} · re-applies since daemon start: hosts ${h.hosts_reapplies}, nft ${h.nft_reinstalls}`;
+}
+
+/// The Settings about line: our version beside the daemon's. `h` null means
+/// the daemon could not be reached; an empty `daemon_version` means it
+/// answered but predates health reporting. `gui` null means `app_env` itself
+/// failed, which leaves the version out rather than guessing one.
+function aboutLine(gui: string | null, h: Health | null): string {
+  const app = gui ? `GrepFocus ${gui}` : "GrepFocus";
+  if (h === null) return `${app} · daemon unreachable`;
+  if (h.daemon_version === "") return `${app} · daemon: older version (no health reporting)`;
+  return `${app} · daemon ${h.daemon_version} (${h.daemon_exe || h.install_kind})`;
+}
+
+/// What the banner currently shows, so a poll that changes nothing leaves the
+/// DOM alone (a rewrite every 5 s flickers and re-announces to screen readers
+/// through the aria-live region).
+let healthBannerKey = "";
+
+function renderHealthBanner(notices: HealthNotice[]) {
+  const key = notices.map((n) => `${n.level}\u0000${n.text}`).join("\u0001");
+  if (key === healthBannerKey) return;
+  healthBannerKey = key;
+  healthBannerEl.innerHTML = "";
+  for (const n of notices) {
+    const p = document.createElement("p");
+    p.className = `health-notice ${n.level}`;
+    p.textContent = n.text;
+    healthBannerEl.appendChild(p);
+  }
+  healthBannerEl.hidden = notices.length === 0;
+}
+
+/// `null` from the status poll's catch branch: the daemon is unreachable.
+function renderAboutLine(s: Status | null) {
+  aboutLineEl.textContent = aboutLine(appEnv?.gui_version ?? null, s?.health ?? null);
+}
+
 async function refreshStatus() {
   try {
     const s = await invoke<Status>("get_status");
     // Reaching the daemon means any first-run installer prompt is now moot.
     hideFirstRun();
+    // Before the no-active-block early return below: a failed teardown must
+    // show above "No active block", not vanish with it.
+    renderAboutLine(s);
+    renderHealthBanner(healthNotices(s));
     activeServerSkew = s.now_unix - Math.floor(Date.now() / 1000);
     // Premium is all-or-nothing: a valid license reveals the Stats tab, an
     // invalid/absent one hides it. This poll is the single place license
@@ -776,6 +1035,10 @@ async function refreshStatus() {
       countdownTimer = window.setInterval(tickCountdowns, 1000);
     }
   } catch (e) {
+    // Notices describe a daemon we can talk to; with none, the error below
+    // is the whole story.
+    renderAboutLine(null);
+    renderHealthBanner([]);
     statusEl.innerHTML = "";
     const p = document.createElement("p");
     p.className = "msg error";
@@ -1238,7 +1501,7 @@ function renderScheduleRow(s: Schedule): HTMLLIElement {
   // Row actions report into the block list's message line, not the dialog's:
   // the dialog is closed while a row is being toggled or deleted.
   toggle.addEventListener("click", async () => {
-    listMsg.classList.remove("error");
+    listMsg.classList.remove("error", "warn");
     if (!(await ensureUnlocked())) return;
     try {
       await invoke("update_schedule", { schedule: { ...s, enabled: !s.enabled } });
@@ -1252,7 +1515,7 @@ function renderScheduleRow(s: Schedule): HTMLLIElement {
     openScheduleDialog({ mode: "edit", sched: s });
   });
   li.querySelector<HTMLButtonElement>(".delete-btn")!.addEventListener("click", async () => {
-    listMsg.classList.remove("error");
+    listMsg.classList.remove("error", "warn");
     if (!(await ensureUnlocked())) return;
     try {
       await invoke("delete_schedule", { id: s.id });
@@ -1547,13 +1810,24 @@ function buildWeekGrid(
 
 /// Rebuild the Week grid from scratch: one 7-day × 24-hour column set showing
 /// every schedule's windows, colour-coded per block. Read-only apart from
-/// click-to-edit. Mirrors `refreshList`'s fetch (degrade to empty on failure).
+/// click-to-edit. A failed fetch renders as the error it is — a dead daemon
+/// must never read as "No schedules yet".
 async function refreshWeek() {
   weekEl.innerHTML = "";
-  const [blocks, schedules] = await Promise.all([
-    invoke<Block[]>("list_blocks").catch(() => []),
-    invoke<Schedule[]>("list_schedules").catch(() => []),
-  ]);
+  let blocks: Block[];
+  let schedules: Schedule[];
+  try {
+    [blocks, schedules] = await Promise.all([
+      invoke<Block[]>("list_blocks"),
+      invoke<Schedule[]>("list_schedules"),
+    ]);
+  } catch (e) {
+    const p = document.createElement("p");
+    p.className = "msg error";
+    p.textContent = String(e);
+    weekEl.appendChild(p);
+    return;
+  }
 
   if (schedules.length === 0) {
     weekEl.appendChild(emptyDiv("No schedules yet — add one from a block's card."));
@@ -1690,6 +1964,8 @@ async function refreshSettings() {
       instantBreaksNote.hidden = true;
       instantBreaksNote.textContent = "";
     }
+    // The about line beside it is kept by the status poll.
+    healthDiagEl.textContent = s.health.daemon_version === "" ? "" : healthSummary(s);
     if (!s.password_set) {
       lockStateEl.textContent = "No settings password is set. Configuration can be changed freely.";
       lockStateEl.className = "lock-state";
@@ -1708,6 +1984,7 @@ async function refreshSettings() {
   } catch (e) {
     lockStateEl.textContent = String(e);
     lockStateEl.className = "lock-state locked";
+    healthDiagEl.textContent = "";
   }
 }
 
@@ -2440,6 +2717,8 @@ function emptyLi(text: string): HTMLLIElement {
 
 interface AppEnv {
   appimage: boolean;
+  /// The app's own version, for the Settings about line (`aboutLine`).
+  gui_version: string;
 }
 
 let appEnv: AppEnv | null = null;

@@ -9,11 +9,16 @@ use std::time::Duration;
 
 use grepfocus_core::{
     ActiveBlock, AllowanceLedger, AllowanceStatus, Block, DayStat, FocusSession, Health,
-    LifetimeTotals, PomodoroStatus, Request, Response, Schedule, Settings,
+    LifetimeTotals, NftStatus, PomodoroStatus, Request, Response, Schedule, Settings,
 };
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+
+/// The workspace version: what `--version` prints and what the Settings about
+/// line shows beside the daemon's. `tauri.conf.json` carries its own copy
+/// (Tauri reads that one for the bundle), pinned to this by a test.
+const GUI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[tauri::command]
 async fn list_blocks() -> Result<Vec<Block>, String> {
@@ -326,19 +331,22 @@ async fn delete_schedule(id: u64) -> Result<(), String> {
     }
 }
 
-/// What the frontend needs to know about how the app is running. Today only
-/// whether we're an AppImage — which gates the first-run "install the system
-/// service" flow: the pkexec installer only makes sense from an AppImage
-/// (package installs already set the daemon up). AppRun sets $APPIMAGE.
+/// What the frontend needs to know about how the app is running: whether
+/// we're an AppImage — which gates the first-run "install the system service"
+/// flow, since the pkexec installer only makes sense from an AppImage (package
+/// installs already set the daemon up; AppRun sets $APPIMAGE) — and our own
+/// version, shown beside the daemon's on the Settings tab.
 #[derive(serde::Serialize)]
 struct AppEnv {
     appimage: bool,
+    gui_version: String,
 }
 
 #[tauri::command]
 fn app_env() -> AppEnv {
     AppEnv {
         appimage: std::env::var_os("APPIMAGE").is_some(),
+        gui_version: GUI_VERSION.to_string(),
     }
 }
 
@@ -505,6 +513,28 @@ fn notify(app: &AppHandle, title: &str, body: &str) {
     let _ = app.notification().builder().title(title).body(body).show();
 }
 
+/// The notification body while enforcement is in a RED state, `None`
+/// otherwise. Mirrors exactly the two RED rules of `healthNotices` in
+/// ui/src/main.ts — change together: a state the banner paints red that this
+/// does not (or the reverse) is a notification the window cannot explain.
+/// Silent on a daemon too old to report (empty `daemon_version`).
+fn enforcement_red(health: &Health, domain_block_active: bool) -> Option<&'static str> {
+    if health.daemon_version.is_empty() {
+        return None;
+    }
+    if health.last_error.is_some() {
+        return Some(
+            "The /etc/hosts change could not be applied — website blocking may not be enforced. Open GrepFocus for details.",
+        );
+    }
+    if domain_block_active && matches!(health.nft, NftStatus::Failed { .. }) {
+        return Some(
+            "DoH protection (nftables) failed — browsers using DNS-over-HTTPS can bypass the active block. Open GrepFocus for details.",
+        );
+    }
+    None
+}
+
 /// Show + focus the main window. Every un-hide path must go through here:
 /// tao 0.35's Wayland client-side decorations go stale across hide()/show() —
 /// the titlebar buttons render but ignore clicks until something forces a
@@ -526,15 +556,21 @@ fn show_main_window(app: &AppHandle) {
 }
 
 /// Background task: poll the daemon every 5s, keep the tray tooltip in sync,
-/// and fire a notification whenever a block starts or ends. Runs for the life
-/// of the process (when a tray host is present, the window hides to tray
-/// rather than closing), so notifications keep flowing even with no window
-/// open. Also re-shows a hidden window if its tray host vanishes.
+/// and fire a notification whenever a block starts or ends, or enforcement
+/// newly goes RED (see `enforcement_red`). Runs for the life of the process
+/// (when a tray host is present, the window hides to tray rather than
+/// closing), so notifications keep flowing even with no window open. Also
+/// re-shows a hidden window if its tray host vanishes.
 fn spawn_status_watcher(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         // id -> block name. `None` until the first successful poll so we
         // establish a baseline without notifying for already-active blocks.
         let mut prev: Option<HashMap<u64, String>> = None;
+        // Whether the last successful poll was RED; `None` until the first
+        // one, for the same baseline reason. Only the false→true edge
+        // notifies: the fault stays up until it clears, so repeating it every
+        // poll would be noise.
+        let mut prev_red: Option<bool> = None;
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         loop {
             ticker.tick().await;
@@ -554,15 +590,19 @@ fn spawn_status_watcher(app: AppHandle) {
                 }
             }
 
-            let (active, settings) = match client::call(Request::GetStatus {}).await {
+            let (active, settings, health) = match client::call(Request::GetStatus {}).await {
                 Ok(Response::Status {
-                    active, settings, ..
-                }) => (active, settings),
+                    active,
+                    settings,
+                    health,
+                    ..
+                }) => (active, settings, health),
                 _ => {
                     // Daemon down / transient error. Surface it in the tooltip
                     // instead of leaving the stale "N active" text, but do NOT
-                    // touch `prev`: keeping the notification baseline avoids a
-                    // spurious burst of "block started/ended" when it recovers.
+                    // touch `prev` or `prev_red`: keeping the notification
+                    // baselines avoids a spurious burst of "block started/
+                    // ended" (or a repeated RED) when it recovers.
                     if let Some(tray) = app.tray_by_id("grepfocus-tray") {
                         let _ = tray.set_tooltip(Some("GrepFocus — daemon unreachable"));
                     }
@@ -573,6 +613,8 @@ fn spawn_status_watcher(app: AppHandle) {
                 .iter()
                 .map(|a| (a.block.id, a.block.name.clone()))
                 .collect();
+            let domain_block_active = active.iter().any(|a| !a.block.domains.is_empty());
+            let red = enforcement_red(&health, domain_block_active);
 
             if let Some(tray) = app.tray_by_id("grepfocus-tray") {
                 let tip = if cur.is_empty() {
@@ -599,8 +641,12 @@ fn spawn_status_watcher(app: AppHandle) {
                         }
                     }
                 }
+                if let (Some(false), Some(body)) = (prev_red, red) {
+                    notify(&app, "GrepFocus: blocking problem", body);
+                }
             }
             prev = Some(cur);
+            prev_red = Some(red.is_some());
         }
     });
 }
@@ -641,6 +687,16 @@ fn set_env_if_unset(key: &str, val: &std::ffi::OsStr) {
 }
 
 fn main() {
+    // Answered before any Tauri init: the single-instance plugin would
+    // otherwise surface an already-running window instead of printing.
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("--version") | Some("-V")
+    ) {
+        println!("grepfocus-gui {GUI_VERSION}");
+        return;
+    }
+
     // AppImage-only webview env fixes; must precede any GTK/webkit init below.
     configure_appimage_webview_env();
 
@@ -775,4 +831,72 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{enforcement_red, GUI_VERSION};
+    use grepfocus_core::{Health, NftStatus};
+
+    /// A daemon new enough to report health, everything else at rest.
+    fn reporting() -> Health {
+        Health {
+            daemon_version: "0.5.1".to_string(),
+            ..Health::default()
+        }
+    }
+
+    #[test]
+    fn enforcement_red_mirrors_frontend_rules() {
+        // A daemon too old to report says nothing, whatever the fields hold.
+        let old = Health {
+            last_error: Some("hosts: read-only file system".to_string()),
+            ..Health::default()
+        };
+        assert_eq!(enforcement_red(&old, true), None);
+
+        // last_error is RED with or without a domain block.
+        let hosts = Health {
+            last_error: Some("hosts: read-only file system".to_string()),
+            ..reporting()
+        };
+        assert!(enforcement_red(&hosts, true).is_some());
+        assert!(enforcement_red(&hosts, false).is_some());
+
+        // nft Failed is RED only while a domain block is active.
+        let nft = Health {
+            nft: NftStatus::Failed {
+                reason: "nft: command not found".to_string(),
+            },
+            ..reporting()
+        };
+        assert!(enforcement_red(&nft, true).is_some());
+        assert_eq!(enforcement_red(&nft, false), None);
+
+        // StaleTable is the banner's YELLOW, never a notification.
+        let stale = Health {
+            nft: NftStatus::StaleTable {
+                reason: "table busy".to_string(),
+            },
+            ..reporting()
+        };
+        assert_eq!(enforcement_red(&stale, true), None);
+        assert_eq!(enforcement_red(&reporting(), true), None);
+    }
+
+    #[test]
+    fn tauri_conf_version_matches_cargo() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("valid JSON");
+        assert_eq!(conf["version"], GUI_VERSION);
+    }
+
+    #[test]
+    fn gui_version_parses() {
+        let parts: Vec<u64> = GUI_VERSION
+            .split('.')
+            .map(|p| p.parse().expect("numeric component"))
+            .collect();
+        assert_eq!(parts.len(), 3, "MAJOR.MINOR.PATCH: {GUI_VERSION}");
+    }
 }

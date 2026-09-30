@@ -64,11 +64,18 @@ review findings — so they don't have to be re-derived later.
 Status: **in progress** — WP1 (core validators, `State::sanitize`, health
 wire types), WP2 (daemon + GUI input hardening, procwatch guards), WP3
 (daemon health state, `get_status.health`, `grepfocusd --version`, GUI
-pass-through) and WP4 (daemon `browser_policy` module, cleanup/uninstall
-parity) landed on `hardening-health`; WP5–WP7 pending. Design record:
+pass-through), WP4 (daemon `browser_policy` module, cleanup/uninstall
+parity) and WP5 (Status-tab health banner, tray RED notification, Settings
+about/diagnostics lines, `grepfocus-gui --version`) landed on
+`hardening-health`; WP6–WP7 pending. Design record:
 `docs/plans/hardening-health-updates.md`. Pending release-note lines (the
 next `Release x.y.z` commit owns the changelog files):
 
+- The Status tab now reports enforcement problems (failed `/etc/hosts`
+  write, failed or stale DoH table, tamper protection off, browser policy
+  failures, instant-break proxy) with a desktop notification on a new
+  failure; the Settings tab shows the app and service versions plus a
+  diagnostics line; `grepfocusd --version` and `grepfocus-gui --version`.
 - Browsers' DNS-over-HTTPS is now switched off through standard
   enterprise-policy files (Firefox, Mullvad Browser, Chromium, Chrome, Brave)
   so blocks apply in them; those browsers show a "managed by your

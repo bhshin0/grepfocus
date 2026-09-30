@@ -23,6 +23,12 @@
     <main>
       <section id="status" class="tab active">
         <h2>Status</h2>
+        <!--
+          Enforcement notices (see healthNotices in main.ts). A sibling ABOVE
+          #status-content, which refreshStatus rewrites every poll — this one
+          is rewritten only when its notices change.
+        -->
+        <div id="health-banner" role="status" aria-live="polite" hidden></div>
         <div id="status-content">Loading…</div>
       </section>
 
@@ -119,6 +125,12 @@
           <button type="button" id="password-clear" class="ghost" hidden>Remove password</button>
           <p id="password-msg" class="msg"></p>
         </form>
+
+        <!-- Versions (GUI + daemon) and the enforcement diagnostics line. -->
+        <div id="about">
+          <p id="about-line" class="hint"></p>
+          <p id="health-diag" class="hint"></p>
+        </div>
       </section>
 
       <section id="license" class="tab">

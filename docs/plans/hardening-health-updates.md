@@ -18,7 +18,7 @@ leaves `./scripts/check.sh` green and is shippable on its own):
 | 1 | core: `validate` module, `State::sanitize`, health wire types | `9e0fb39` |
 | 2 | daemon + GUI input hardening, procwatch guards | `97bb9d7` |
 | 3 | daemon health state, `GetStatus.health`, `--version`, GUI pass-through | `eb8e25e` |
-| 4 | daemon `browser_policy` module, unit comment, cleanup parity | — |
+| 4 | daemon `browser_policy` module, unit comment, cleanup parity | `5bb072a` |
 | 5 | GUI health banner, tray RED notification, about/diagnostics line, error-state fixes | — |
 | 6 | GUI/daemon skew advice + AppImage "Update system service" | — |
 | 7 | daily update check, Settings toggle, `open_url`, website hand-off | — |

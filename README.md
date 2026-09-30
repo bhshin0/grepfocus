@@ -87,8 +87,15 @@ Verify it's running:
 ```bash
 systemctl status grepfocusd
 journalctl -u grepfocusd -f
-grepfocusd --version   # prints "grepfocusd <version>"
+grepfocusd --version     # prints "grepfocusd <version>"
+grepfocus-gui --version  # prints "grepfocus-gui <version>", no window
 ```
+
+The GUI's Settings tab shows both versions (`GrepFocus <gui> · daemon <ver>
+(<path>)`) and, below them, an enforcement diagnostics line — the nft and
+`/etc/hosts` lock state, the instant-break proxy, and the re-apply counters
+since the daemon started. Enforcement problems themselves show on the Status
+tab (see *Known limits*).
 
 ## Running the GUI (dev mode)
 
@@ -361,11 +368,15 @@ that Cold Turkey beats either.
   table: if your system resolver does DNS-over-TLS to one of the listed
   public resolver IPs (e.g. systemd-resolved with `DNSOverTLS=yes`
   pointed at `1.1.1.1`), DNS breaks entirely during active blocks. Use
-  plain DNS or an unlisted resolver.
+  plain DNS or an unlisted resolver. If the DoH table is ever left behind
+  after a block ends, the Status tab says so and the daemon retries
+  removing it.
 - **Systems that forbid the immutable flag.** Where policy (e.g. SELinux)
   or the filesystem denies `chattr +i`, blocks still work — the hosts
   *content* is the enforcement — but tamper protection is degraded. The
-  daemon logs a warning when this happens.
+  daemon logs a warning when this happens, the Status tab shows a yellow
+  "Tamper protection off" notice and the Settings diagnostics line says
+  so.
 - **VPNs over IP literals.** If the user knows the IP address of a blocked
   site and types it directly, hosts-file blocking won't catch them.
 - **Root processes are never killed.** App blocking skips pid 0 and 1,
