@@ -18,6 +18,7 @@ Depends: ${shlibs:Depends},
          ${misc:Depends},
          nftables,
          libayatana-appindicator3-1
+Recommends: xdg-utils
 Description: Website and app blocker for Linux
  GrepFocus is a website and application blocker for Linux. A root daemon
  (grepfocusd) enforces blocks via /etc/hosts and nftables and keeps them in

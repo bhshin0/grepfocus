@@ -31,6 +31,9 @@ Requires:       nftables
 # dlopened by the tray at runtime, invisible to the ELF dependency
 # generator — the tray silently fails without it.
 Requires:       libayatana-appindicator-gtk3
+# The app opens its grepfocus.com links ("What's new", "Download") by
+# spawning xdg-open; without it those buttons report the link to open by hand.
+Recommends:     xdg-utils
 %{?systemd_requires}
 
 %description

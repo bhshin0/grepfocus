@@ -30,6 +30,12 @@
     "allow-stop-pomodoro",
     "allow-app-env",
     "allow-install-service",
-    "allow-uninstall-service"
+    "allow-uninstall-service",
+    "allow-get-update-info",
+    "allow-acknowledge-update-check",
+    "allow-check-for-update",
+    "allow-set-update-check-enabled",
+    "allow-dismiss-update",
+    "allow-open-url"
   ]
 }

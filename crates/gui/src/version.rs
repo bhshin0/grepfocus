@@ -1,7 +1,7 @@
 //! Version comparison and the GUI/daemon skew decision.
 //!
 //! The one place versions are compared: the skew banner (here) and the
-//! release check (WP7) both go through `parse_version`/`compare`, on the
+//! release check (`update.rs`) both go through `parse_version`/`compare`, on the
 //! `semver` crate rather than a hand-rolled triple so prerelease ordering is
 //! semver's. The daemon never compares versions; the installer script's
 //! `sort -V` downgrade guard is the only other comparison and must work as
@@ -30,8 +30,7 @@ pub fn compare(a: &str, b: &str) -> Option<Ordering> {
 }
 
 /// Strict `>`: an equal version is never "newer", so a release check on the
-/// running version stays quiet. Used by the release check (WP7).
-#[cfg_attr(not(test), allow(dead_code))]
+/// running version stays quiet. Used by the release check (`update.rs`).
 pub fn newer_than(latest: &Version, current: &Version) -> bool {
     latest > current
 }

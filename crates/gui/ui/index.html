@@ -37,8 +37,30 @@
           <p id="update-text"></p>
           <div class="row">
             <button type="button" id="update-action" hidden>Update system service</button>
+            <button type="button" id="update-download" class="ghost" hidden>Download</button>
           </div>
           <p id="update-msg" class="msg"></p>
+        </div>
+        <!--
+          Release check (renderUpdateNotice in main.ts): the one-time
+          disclosure, then the newer-release notice. Same sibling rule as
+          #health-banner; the notice yields to an active block and to
+          #update-banner.
+        -->
+        <div id="update-disclosure" class="update-strip" hidden>
+          <p>GrepFocus checks grepfocus.com once a day for a newer release. Only the version number is exchanged and nothing is downloaded; you can turn this off in Settings.</p>
+          <div class="row">
+            <button type="button" id="update-disclosure-ok" class="ghost">Got it</button>
+            <button type="button" id="update-disclosure-off" class="ghost">Turn off</button>
+          </div>
+        </div>
+        <div id="update-notice" class="update-strip" hidden>
+          <p id="update-notice-text"></p>
+          <div class="row">
+            <button type="button" id="update-notes" class="ghost" hidden>What's new</button>
+            <button type="button" id="update-dismiss" class="ghost">Dismiss</button>
+          </div>
+          <p id="update-notice-msg" class="msg error" hidden></p>
         </div>
         <div id="status-content">Loading…</div>
       </section>
@@ -119,6 +141,17 @@
             Instant breaks (a blocked site becomes reachable the moment a break starts, even in an already-open tab)
           </label>
           <p id="instant-breaks-note" class="msg warn" hidden></p>
+          <!-- GUI-local and per user (renderUpdateSettings in main.ts): not a
+               daemon setting, so the settings password does not gate it. -->
+          <label class="checkbox-row">
+            <input type="checkbox" id="update-check-toggle" />
+            Check grepfocus.com once a day for a newer release (version number only; nothing is downloaded)
+          </label>
+          <div id="update-check-row" class="update-check-row" hidden>
+            <button type="button" id="update-check-now" class="ghost">Check now</button>
+            <span id="update-check-status" class="hint"></span>
+          </div>
+          <p id="update-check-persist" class="msg error" hidden></p>
           <p id="prefs-msg" class="msg"></p>
         </div>
 

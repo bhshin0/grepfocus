@@ -16,12 +16,18 @@ tauri-build = { version = "2", features = [] }
 grepfocus-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "io-util", "time"] }
 tauri = { version = "2", features = ["devtools", "tray-icon", "image-png"] }
-tauri-plugin-shell = "2"
 tauri-plugin-localhost = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
 portpicker = "0.1"
 # Already compiled into the GUI via tauri-utils; this adds a lock edge, not a crate.
 semver = "1"
+# The daily release check: one GET a day over rustls with the bundled Mozilla
+# root store (webpki-roots), so it works the same on every distro and never
+# touches the system trust store.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+tempfile = "3"

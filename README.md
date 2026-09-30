@@ -185,6 +185,14 @@ but drops what lives only in memory: the settings unlock (the daemon
 relocks), a pending break challenge, and app-kill counts not yet flushed to
 the usage stats.
 
+The app also looks for a newer release once a day — see
+[Update notifications](#update-notifications). To exercise that check in
+dev mode against a local stub instead of the site:
+
+```bash
+GREPFOCUS_UPDATE_URL=http://127.0.0.1:8099/latest.json cargo run -p grepfocus-gui
+```
+
 ## Wire protocol
 
 The daemon listens on a Unix socket. Each frame is a 4-byte big-endian
@@ -356,6 +364,43 @@ the block is not re-applied and the saved block can be edited or deleted
 from the GUI. Root processes are never killed, so the console login itself
 is safe.
 
+## Update notifications
+
+Once a day the GUI fetches `https://grepfocus.com/downloads/latest.json`
+and compares the version in it with its own. Only the version number is
+exchanged and nothing is downloaded: the request carries no identifier, no
+query string and no cookies, just the User-Agent `GrepFocus/<version>
+(linux)` — and, like any request, your IP address is visible to the site's
+host. The daemon is not involved.
+
+- **Disclosure and opt-out.** The first launch shows a one-line notice on
+  the Status tab before the first request is made ("Got it" / "Turn off").
+  The switch is in Settings ("Check grepfocus.com once a day…"), per user
+  and not behind the settings password; "Check now" beside it runs a check
+  on demand and the line next to it reports the last outcome.
+- **Where it is stored.** `~/.config/grepfocus/update-check.json`
+  (`$XDG_CONFIG_HOME` honoured; directory 0700, file 0600): the switch,
+  the time of the last check, and what the site last answered. Uninstalling
+  and `grepfocusd cleanup --purge` leave it alone — it is yours, not the
+  system's. If the file exists but cannot be read, checks stay off for that
+  session and Settings says so; turning the switch on rewrites it.
+- **What you see.** A newer release shows a strip on the Status tab with
+  "What's new" (when the site names a release-notes page) and "Dismiss"
+  (dismissing hides it until the next release).
+  It stays out of the way while a block is active or while the Status tab
+  is reporting a GUI/daemon version mismatch. Nothing is installed for you:
+  update the way you installed (see [Updating](#updating)).
+- **Cadence.** One request per running GUI per 24 hours. Any answer from
+  the site — including a 404 or an unusable reply — counts as that day's
+  check; only a failure to reach it at all (DNS, connect, timeout) is
+  retried, hourly.
+- **Links.** "What's new" and the AppImage "Download" button open
+  grepfocus.com pages through `xdg-open` (the packages recommend
+  `xdg-utils`); no other address is ever opened. Without `xdg-open` the
+  button reports the link to open by hand.
+- **Mirrors and testing.** `GREPFOCUS_UPDATE_URL` replaces the address for
+  that launch; an `http://` URL is accepted for a local stub.
+
 ## Known limits
 
 We're honest about what we don't defend against. None of these are bypasses
@@ -434,6 +479,11 @@ that Cold Turkey beats either.
   hides to the tray; if the tray host
   vanishes while the window is hidden, the window reappears within ~5
   seconds. Launching GrepFocus again always surfaces the existing instance.
+- **The update check fails behind a TLS-intercepting proxy.** It trusts the
+  Mozilla root store bundled with the app (webpki-roots), not the system
+  trust store, so a proxy that re-signs traffic with a private CA makes the
+  check fail; the Settings row says "secure connection to grepfocus.com
+  failed". Blocking is unaffected.
 
 ## License
 

@@ -61,15 +61,18 @@ review findings — so they don't have to be re-derived later.
 
 ## Input hardening, health, DoH policies, updates (2026-09-28)
 
-Status: **in progress** — WP1 (core validators, `State::sanitize`, health
-wire types), WP2 (daemon + GUI input hardening, procwatch guards), WP3
-(daemon health state, `get_status.health`, `grepfocusd --version`, GUI
-pass-through), WP4 (daemon `browser_policy` module, cleanup/uninstall
-parity), WP5 (Status-tab health banner, tray RED notification, Settings
-about/diagnostics lines, `grepfocus-gui --version`) and WP6 (GUI/daemon
-skew advice, AppImage "Update system service", installer under bash with
-package/downgrade guards) landed on `hardening-health`; WP7 pending. Design
-record: `docs/plans/hardening-health-updates.md`. Pending release-note lines
+Status: **implemented, live verification and release pending** — all seven
+work packages landed on `hardening-health`: WP1 (core validators,
+`State::sanitize`, health wire types), WP2 (daemon + GUI input hardening,
+procwatch guards), WP3 (daemon health state, `get_status.health`,
+`grepfocusd --version`, GUI pass-through), WP4 (daemon `browser_policy`
+module, cleanup/uninstall parity), WP5 (Status-tab health banner, tray RED
+notification, Settings about/diagnostics lines, `grepfocus-gui --version`),
+WP6 (GUI/daemon skew advice, AppImage "Update system service", installer
+under bash with package/downgrade guards) and WP7 (daily release check with
+a one-time disclosure and a Settings opt-out, `open_url`, `xdg-utils`
+Recommends). Design record: `docs/plans/hardening-health-updates.md` — its
+live verification checklist is still to be run. Pending release-note lines
 (the next `Release x.y.z` commit owns the changelog files):
 
 - The Status tab now reports enforcement problems (failed `/etc/hosts`
@@ -95,6 +98,8 @@ record: `docs/plans/hardening-health-updates.md`. Pending release-note lines
   newer than the installed service; the installer runs under bash (fixes the
   first-run install on Debian/Ubuntu), refuses to run over a package install
   and refuses downgrades.
+- The app checks grepfocus.com once a day for a newer release (version
+  number only; one-time disclosure; opt-out in Settings).
 
 ## Decisions
 
@@ -242,6 +247,30 @@ to be redone when the item is picked up.
   matcher at `AddBlock`/`UpdateBlock` time and refuse above a threshold (or
   when it would hit the caller's own session). Reads `/proc` under the IPC
   lock, so it needs the same `spawn_blocking` treatment as Argon2.
+- **`GREPFOCUS_NO_UPDATE_CHECK` packager kill switch** — a distro that
+  forbids phoning home has no build- or install-time way to turn the daily
+  release check off; today it is the per-user Settings toggle only. An
+  environment variable (or a file under `/etc/grepfocus`) read in
+  `update::Store::open` that forces `enabled: false` and hides the toggle
+  and the disclosure strip would do; decide whether it also hides the
+  Settings row.
+- **Version-mismatch YELLOW in `healthNotices`** — when both versions are
+  known but differ, a one-line rule in `healthNotices` would put the skew
+  in the health banner too. The Status tab's skew card (`#update-banner`)
+  already covers differing versions with the remedy, so this is only worth
+  it if the card proves easy to overlook.
+- **Read-only `~/.config` and the update-check opt-out** — the preference
+  lives in `~/.config/grepfocus/update-check.json`. If it cannot be written
+  the opt-out holds for the session only (Settings says "could not be
+  saved"), and the next launch starts from the defaults: checks on, the
+  disclosure strip shown again. A file that exists but cannot be read
+  fails closed; a directory that never accepts the file cannot.
+- **`min_supported` / `security` flag in `latest.json`** — the contract
+  carries `version` only, so a dismissed release stays dismissed even when
+  it fixes a bypass. A flag the client treats as undismissable (and a
+  floor below which the notice cannot be dismissed) needs a website change
+  and a `Release` field; unknown fields are already ignored, so old
+  clients are unaffected.
 - **[FIXED — UX polish] GNOME tray invisibility** — stock GNOME ships no
   StatusNotifier host, so the tray icon never appeared and close-to-tray made
   the app invisible after its first close. The GUI now probes for a host at

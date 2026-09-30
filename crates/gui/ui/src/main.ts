@@ -233,6 +233,39 @@ type UpdateAdvice =
   | { kind: "manual"; from: string | null; to: string }
   | { kind: "gui_outdated"; gui: string; daemon: string };
 
+/// Mirrors `update::Release` in src/update.rs: what the GUI keeps of the
+/// site's `latest.json`. `notes_url` arrives only when it is a grepfocus.com
+/// link — the Rust side drops anything else before it gets here.
+interface Release {
+  version: string;
+  published: string | null;
+  notes_url: string | null;
+}
+
+/// Mirrors `update::UpdateInfo`: the daily release check as the Rust side
+/// sees it. `status` and `notice` are finished copy; this side only decides
+/// where and when they show.
+interface UpdateInfo {
+  enabled: boolean;
+  /// The one-time disclosure strip has been rendered (this launch or an
+  /// earlier one).
+  disclosed: boolean;
+  current: string;
+  latest: Release | null;
+  available: boolean;
+  dismissed: boolean;
+  checking: boolean;
+  last_check_unix: number | null;
+  /// The Settings row.
+  status: string;
+  /// The Status-tab strip; null unless a newer, undismissed release is known
+  /// and checks are on.
+  notice: string | null;
+  /// A preference file that could not be read or saved — its own line,
+  /// never mixed into `status`.
+  persist_error: string | null;
+}
+
 interface Schedule {
   id: number;
   name: string;
@@ -1026,6 +1059,9 @@ async function refreshStatus() {
     renderAboutLine(s);
     renderHealthBanner(healthNotices(s));
     renderUpdateBanner(s.update, s.health.install_kind);
+    // Only a successful poll moves this: a daemon restart mid-block must not
+    // flash the release notice.
+    blockActive = s.active.length > 0;
     activeServerSkew = s.now_unix - Math.floor(Date.now() / 1000);
     // Premium is all-or-nothing: a valid license reveals the Stats tab, an
     // invalid/absent one hides it. This poll is the single place license
@@ -1074,6 +1110,11 @@ async function refreshStatus() {
     stopCountdownTimer();
     // A daemon-unreachable error is the first-run / service-down signal.
     handleDaemonUnreachable(e);
+  } finally {
+    // The release check is the GUI's own and needs no daemon, so it rides
+    // this poll whether the daemon answered or not — after the skew banner
+    // and `blockActive` above, which decide whether the notice may show.
+    void refreshUpdateInfo();
   }
 }
 
@@ -1975,6 +2016,9 @@ async function refreshSettings() {
   pwForm.reset();
   prefsMsg.classList.remove("error");
   prefsMsg.textContent = "";
+  // Before the daemon round trip: the update-check row is GUI-local and must
+  // be current even when the daemon is down.
+  void refreshUpdateInfo();
   try {
     const s = await invoke<Status>("get_status");
     // Reflect current preferences. Setting `.checked` in code does not fire a
@@ -2958,9 +3002,11 @@ const updateBannerEl = document.querySelector<HTMLDivElement>("#update-banner")!
 const updateTextEl = document.querySelector<HTMLParagraphElement>("#update-text")!;
 const updateActionEl = document.querySelector<HTMLButtonElement>("#update-action")!;
 const updateMsgEl = document.querySelector<HTMLParagraphElement>("#update-msg")!;
+const updateDownloadEl = document.querySelector<HTMLButtonElement>("#update-download")!;
 
-/// Where an outdated AppImage is sent. Plain selectable text for now; a
-/// "Download" button that opens it arrives with the release check.
+/// Where an outdated AppImage is sent: selectable text in the advice, and
+/// the "Download" button beside it opens the same page (`open_url`). The
+/// website keeps this route stable for exactly that.
 const DOWNLOAD_URL = "https://grepfocus.com/download";
 
 /// How long a finished update's outcome stays readable before the poll's
@@ -3028,7 +3074,8 @@ function renderUpdateBanner(a: UpdateAdvice, kind: InstallKind) {
     hideUpdateBanner();
     return;
   }
-  const text = updateAdviceText(a, appEnv?.appimage === true, kind);
+  const appimage = appEnv?.appimage === true;
+  const text = updateAdviceText(a, appimage, kind);
   const key = `${a.kind}\u0000${text}`;
   if (key === updateBannerKey) return;
   updateBannerKey = key;
@@ -3038,6 +3085,10 @@ function renderUpdateBanner(a: UpdateAdvice, kind: InstallKind) {
   updateActionEl.hidden = !offer;
   updateActionEl.disabled = false;
   updateActionEl.textContent = offer ? `Update system service to ${a.to}` : "Update system service";
+  // The one `gui_outdated` copy that names DOWNLOAD_URL — see
+  // `updateAdviceText`; a packaged daemon's copy says to launch the packaged
+  // app instead.
+  updateDownloadEl.hidden = !(a.kind === "gui_outdated" && appimage && kind !== "package");
   updateTarget = offer ? a.to : "";
   updateMsgEl.classList.remove("error");
   updateMsgEl.textContent = "";
@@ -3050,9 +3101,21 @@ function hideUpdateBanner() {
   updateTarget = "";
   updateBannerEl.hidden = true;
   updateActionEl.hidden = true;
+  updateDownloadEl.hidden = true;
   updateMsgEl.classList.remove("error");
   updateMsgEl.textContent = "";
 }
+
+updateDownloadEl.addEventListener("click", async () => {
+  updateMsgEl.classList.remove("error");
+  updateMsgEl.textContent = "";
+  try {
+    await invoke("open_url", { url: DOWNLOAD_URL });
+  } catch (e) {
+    updateMsgEl.classList.add("error");
+    updateMsgEl.textContent = String(e);
+  }
+});
 
 updateActionEl.addEventListener("click", async () => {
   if (installBusy) return;
@@ -3095,6 +3158,183 @@ updateActionEl.addEventListener("click", async () => {
     }
   } finally {
     installBusy = false;
+  }
+});
+
+// ─── Release check: disclosure, notice strip, Settings row ───────────────────
+//
+// The Rust side (src/update.rs) owns the fetch, the cadence, the preference
+// file and every sentence; this side polls `get_update_info` alongside the
+// status poll and decides where the answer shows. Two rules live only here:
+// the disclosure strip is on screen before `acknowledge_update_check` lets
+// the checker contact the site, and the notice yields to an active block and
+// to the skew banner (fix what is installed first — the Settings row still
+// reports the release).
+
+const updateDisclosureEl = document.querySelector<HTMLDivElement>("#update-disclosure")!;
+const updateDisclosureOkEl = document.querySelector<HTMLButtonElement>("#update-disclosure-ok")!;
+const updateDisclosureOffEl = document.querySelector<HTMLButtonElement>("#update-disclosure-off")!;
+const updateNoticeEl = document.querySelector<HTMLDivElement>("#update-notice")!;
+const updateNoticeTextEl = document.querySelector<HTMLParagraphElement>("#update-notice-text")!;
+const updateNotesEl = document.querySelector<HTMLButtonElement>("#update-notes")!;
+const updateDismissEl = document.querySelector<HTMLButtonElement>("#update-dismiss")!;
+const updateNoticeMsgEl = document.querySelector<HTMLParagraphElement>("#update-notice-msg")!;
+const updateCheckToggle = document.querySelector<HTMLInputElement>("#update-check-toggle")!;
+const updateCheckRowEl = document.querySelector<HTMLDivElement>("#update-check-row")!;
+const updateCheckNowEl = document.querySelector<HTMLButtonElement>("#update-check-now")!;
+const updateCheckStatusEl = document.querySelector<HTMLSpanElement>("#update-check-status")!;
+const updateCheckPersistEl = document.querySelector<HTMLParagraphElement>("#update-check-persist")!;
+
+/// A block is running, as of the last status poll that got an answer.
+let blockActive = false;
+/// The disclosure strip is up and waiting for a click; it outranks the notice.
+let disclosureOpen = false;
+/// The strip has been put up this launch. It goes up once: a poll that has
+/// to repeat the acknowledgement (the call failed) must not reopen a strip
+/// the user already closed.
+let disclosureShown = false;
+/// The last answer, for the handlers that re-render without a round trip.
+let lastUpdateInfo: UpdateInfo | null = null;
+/// What the notice currently shows, so a poll that changes nothing leaves the
+/// strip (and an `open_url` failure line under it) alone.
+let updateNoticeKey = "";
+/// A toggle write is in flight: a poll answered before it landed must not
+/// flip the checkbox back under the user's click.
+let updateToggleBusy = false;
+
+function renderUpdateNotice(info: UpdateInfo) {
+  if (disclosureOpen || blockActive || !updateBannerEl.hidden || info.notice === null) {
+    updateNoticeEl.hidden = true;
+    return;
+  }
+  const notesUrl = info.latest?.notes_url ?? null;
+  const key = `${info.notice}\u0000${notesUrl ?? ""}`;
+  if (key !== updateNoticeKey) {
+    updateNoticeKey = key;
+    updateNoticeTextEl.textContent = info.notice;
+    updateNotesEl.hidden = notesUrl === null;
+    updateNoticeMsgEl.hidden = true;
+    updateNoticeMsgEl.textContent = "";
+  }
+  updateNoticeEl.hidden = false;
+}
+
+function renderUpdateSettings(info: UpdateInfo) {
+  if (!updateToggleBusy) updateCheckToggle.checked = info.enabled;
+  updateCheckRowEl.hidden = !info.enabled;
+  updateCheckNowEl.disabled = info.checking;
+  updateCheckStatusEl.textContent = info.status;
+  updateCheckPersistEl.textContent = info.persist_error ?? "";
+  updateCheckPersistEl.hidden = info.persist_error === null;
+}
+
+function renderUpdate(info: UpdateInfo) {
+  lastUpdateInfo = info;
+  renderUpdateNotice(info);
+  renderUpdateSettings(info);
+}
+
+/// Polled from `refreshStatus` (every 5 s, daemon up or down) and on opening
+/// Settings.
+async function refreshUpdateInfo() {
+  try {
+    let info = await invoke<UpdateInfo>("get_update_info");
+    // Checks that are off need no disclosure — and acknowledging would
+    // rewrite a preference file that failed to load, taking its "could not
+    // be read" line away before anyone saw it.
+    if (info.enabled && !info.disclosed) {
+      if (!disclosureShown) {
+        disclosureShown = true;
+        disclosureOpen = true;
+        updateDisclosureEl.hidden = false;
+      }
+      // Only after the strip is up: this is what permits the first request.
+      info = await invoke<UpdateInfo>("acknowledge_update_check");
+    }
+    renderUpdate(info);
+  } catch {
+    // The last render stands; the next poll asks again.
+  }
+}
+
+function closeDisclosure() {
+  disclosureOpen = false;
+  updateDisclosureEl.hidden = true;
+  if (lastUpdateInfo) renderUpdateNotice(lastUpdateInfo);
+}
+
+/// The one writer of the preference (Settings toggle and the disclosure's
+/// "Turn off"). No settings-password gate: it is a per-user privacy choice
+/// the daemon never sees. False when the write could not be sent; the reason
+/// goes to the Settings message line and the checkbox returns to what is in
+/// effect.
+async function setUpdateCheckEnabled(enabled: boolean): Promise<boolean> {
+  prefsMsg.classList.remove("error");
+  prefsMsg.textContent = "";
+  updateToggleBusy = true;
+  let info: UpdateInfo;
+  try {
+    info = await invoke<UpdateInfo>("set_update_check_enabled", { enabled });
+  } catch (e) {
+    updateToggleBusy = false;
+    updateCheckToggle.checked = lastUpdateInfo?.enabled ?? !enabled;
+    prefsMsg.classList.add("error");
+    prefsMsg.textContent = String(e);
+    return false;
+  }
+  updateToggleBusy = false;
+  renderUpdate(info);
+  return true;
+}
+
+/// A check now, whatever the cadence says ("Check now", and the toggle going
+/// on). The poll keeps the row on "Checking…" while it runs.
+async function runUpdateCheck() {
+  updateCheckNowEl.disabled = true;
+  updateCheckStatusEl.textContent = "Checking…";
+  try {
+    renderUpdate(await invoke<UpdateInfo>("check_for_update"));
+  } catch (e) {
+    updateCheckNowEl.disabled = false;
+    updateCheckStatusEl.textContent = String(e);
+  }
+}
+
+updateDisclosureOkEl.addEventListener("click", closeDisclosure);
+
+updateDisclosureOffEl.addEventListener("click", async () => {
+  // A write that could not be sent leaves the strip up: the click did not
+  // take.
+  if (await setUpdateCheckEnabled(false)) closeDisclosure();
+});
+
+updateCheckToggle.addEventListener("change", async () => {
+  const enabled = updateCheckToggle.checked;
+  if ((await setUpdateCheckEnabled(enabled)) && enabled) void runUpdateCheck();
+});
+
+updateCheckNowEl.addEventListener("click", () => void runUpdateCheck());
+
+updateDismissEl.addEventListener("click", async () => {
+  try {
+    renderUpdate(await invoke<UpdateInfo>("dismiss_update"));
+  } catch (e) {
+    updateNoticeMsgEl.textContent = String(e);
+    updateNoticeMsgEl.hidden = false;
+  }
+});
+
+updateNotesEl.addEventListener("click", async () => {
+  const url = lastUpdateInfo?.latest?.notes_url;
+  if (!url) return;
+  updateNoticeMsgEl.hidden = true;
+  updateNoticeMsgEl.textContent = "";
+  try {
+    await invoke("open_url", { url });
+  } catch (e) {
+    // Typically xdg-open missing; the message names the link to open by hand.
+    updateNoticeMsgEl.textContent = String(e);
+    updateNoticeMsgEl.hidden = false;
   }
 });
 

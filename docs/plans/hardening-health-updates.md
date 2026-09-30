@@ -1,6 +1,7 @@
 # Hardening, health signals, browser DoH policies and update paths — implementation plan
 
-Status: **designed, implementation pending** (2026-09-28). Written against commit
+Status: **implemented** (2026-09-30; live verification pending — see the
+checklist below). Designed 2026-09-28 and written against commit
 `3dff97e` on branch `hardening-health` (same HEAD as `release-0.5.1`, clean tree).
 Line references are as of that commit — treat symbols as authoritative, lines as
 hints. Five item designs (browser DoH policies, input hardening, health signals,
@@ -20,8 +21,8 @@ leaves `./scripts/check.sh` green and is shippable on its own):
 | 3 | daemon health state, `GetStatus.health`, `--version`, GUI pass-through | `eb8e25e` |
 | 4 | daemon `browser_policy` module, unit comment, cleanup parity | `5bb072a` |
 | 5 | GUI health banner, tray RED notification, about/diagnostics line, error-state fixes | `0eb67a2` |
-| 6 | GUI/daemon skew advice + AppImage "Update system service" | — |
-| 7 | daily update check, Settings toggle, `open_url`, website hand-off | — |
+| 6 | GUI/daemon skew advice + AppImage "Update system service" | `a10589b` |
+| 7 | daily update check, Settings toggle, `open_url`, website hand-off | the commit that adds `crates/gui/src/update.rs` (it cannot name its own hash) |
 
 ## Context
 

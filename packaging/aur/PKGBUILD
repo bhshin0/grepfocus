@@ -19,6 +19,9 @@ url="https://grepfocus.com"
 license=('custom:PolyForm-Shield-1.0.0')
 depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3' 'nftables' 'libayatana-appindicator')
 makedepends=('rust' 'nodejs' 'pnpm')
+# The app opens its grepfocus.com links ("What's new", "Download") by spawning
+# xdg-open; without it those buttons report the link to open by hand.
+optdepends=('xdg-utils: open grepfocus.com links from the app')
 install="$pkgname.install"
 source=("$pkgname-$pkgver.tar.gz::https://github.com/bhshin0/grepfocus/archive/refs/tags/v$pkgver.tar.gz")
 # TODO: set after tagging v0.5.1 (see README.md):

@@ -3,6 +3,7 @@
 
 mod client;
 mod tray;
+mod update;
 mod version;
 
 use std::collections::HashMap;
@@ -411,6 +412,54 @@ async fn uninstall_service(app: AppHandle) -> Result<(), String> {
     run_service_script(&app, "uninstall", None).await
 }
 
+// The daily release check (see update.rs). Every command but `open_url`
+// returns the fresh `UpdateInfo` so the frontend renders what it just
+// changed without a second round trip.
+
+#[tauri::command]
+fn get_update_info(store: tauri::State<'_, update::Store>) -> update::UpdateInfo {
+    store.info(update::now_unix())
+}
+
+/// The frontend calls this after the disclosure strip has been rendered
+/// once; only then may the checker make its first network contact.
+#[tauri::command]
+fn acknowledge_update_check(app: AppHandle) -> update::UpdateInfo {
+    update::acknowledge_then_check(&app)
+}
+
+/// The Settings button: a check now, whatever the cadence says. `Err`
+/// only when checks are turned off.
+#[tauri::command]
+async fn check_for_update(app: AppHandle) -> Result<update::UpdateInfo, String> {
+    update::check_now(&app).await
+}
+
+/// GUI-local, per user, no password gate: it is a privacy preference, not
+/// a blocking one.
+#[tauri::command]
+fn set_update_check_enabled(
+    store: tauri::State<'_, update::Store>,
+    enabled: bool,
+) -> update::UpdateInfo {
+    store.set_enabled(enabled, update::now_unix())
+}
+
+/// Dismisses the release currently known; no argument, so a stale
+/// frontend cannot dismiss a version it never showed.
+#[tauri::command]
+fn dismiss_update(store: tauri::State<'_, update::Store>) -> update::UpdateInfo {
+    store.dismiss(update::now_unix())
+}
+
+/// Open a grepfocus.com link in the user's browser via `xdg-open`
+/// (allowlisted in `update::link_allowed`; the AppImage's environment is
+/// scrubbed first so the browser does not load the bundled GTK).
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    update::open_link(&url)
+}
+
 /// The payload files the privileged installer needs. The script must be first —
 /// the bootstrap executes `$tmp/appimage-install.sh` after verifying everything.
 const PAYLOAD_FILES: [&str; 5] = [
@@ -802,6 +851,22 @@ fn main() {
             }
         })
         .setup(move |app| {
+            // The release-check store is managed before the window exists,
+            // so the first `get_update_info` from the page never races it.
+            let update_url = std::env::var("GREPFOCUS_UPDATE_URL")
+                .ok()
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(|| update::DEFAULT_URL.to_string());
+            app.manage(update::Store::open(
+                update::config_path(
+                    std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+                    std::env::var_os("HOME").as_deref(),
+                ),
+                update_url,
+                GUI_VERSION,
+                std::env::var_os("APPIMAGE").is_some(),
+            ));
+
             let url = format!("http://localhost:{port}/index.html")
                 .parse()
                 .unwrap();
@@ -870,6 +935,7 @@ fn main() {
             });
 
             spawn_status_watcher(app.handle().clone());
+            update::spawn_checker(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -895,6 +961,12 @@ fn main() {
             app_env,
             install_service,
             uninstall_service,
+            get_update_info,
+            acknowledge_update_check,
+            check_for_update,
+            set_update_check_enabled,
+            dismiss_update,
+            open_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

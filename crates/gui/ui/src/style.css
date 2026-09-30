@@ -236,6 +236,27 @@ form label > input[type="checkbox"] { width: auto; margin-right: 6px; }
 .update-banner .row > button { margin-top: 8px; }
 .update-banner .msg { margin-top: 6px; }
 
+/* Status: release-check strips (renderUpdateNotice in main.ts) — the one-time
+   disclosure and the newer-release notice. Quieter than the skew card above:
+   nothing here is wrong with the install. */
+.update-strip {
+  font-size: 13px;
+  padding: 8px 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  margin-bottom: 14px;
+  overflow-wrap: anywhere;
+}
+.update-strip p { margin: 0; }
+.update-strip .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+.update-strip .msg { margin-top: 6px; }
+
+/* Settings: "Check now" beside the last check's outcome. */
+.update-check-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.update-check-row .hint { margin: 0; }
+
 /* Unlock dialog */
 dialog {
   border: 1px solid var(--border);
