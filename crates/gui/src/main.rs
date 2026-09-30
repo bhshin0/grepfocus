@@ -7,13 +7,14 @@ mod update;
 mod version;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use grepfocus_core::{
     ActiveBlock, AllowanceLedger, AllowanceStatus, Block, DayStat, FocusSession, Health,
     LifetimeTotals, NftStatus, PomodoroStatus, Request, Response, Schedule, Settings,
 };
-use tauri::menu::MenuBuilder;
+use tauri::menu::{Menu, MenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
@@ -763,12 +764,112 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+/// Brings the main window back if it is hidden in a tray that cannot be
+/// relied on to bring it back: a hidden window never gets a close event, so
+/// without this it would be stranded.
+fn show_main_window_if_hidden(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        if matches!(window.is_visible(), Ok(false)) {
+            show_main_window(app);
+        }
+    }
+}
+
+fn tray_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    MenuBuilder::new(app)
+        .text("show", "Show GrepFocus")
+        .separator()
+        .text("quit", "Quit")
+        .build()
+}
+
+/// Builds the tray icon. Call once per process: libappindicator's Rust
+/// wrapper never unrefs the C indicator, so a removed tray keeps its item and
+/// DBusMenu exported, a second one built under the same id fails to export
+/// its own, and the host is left with the stale one — passive, empty menu.
+/// To put the item back in front of a host, use `reregister_tray`.
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    let menu = tray_menu(app)?;
+    TrayIconBuilder::with_id(tray::TRAY_ID)
+        .icon(app.default_window_icon().expect("bundled icon").clone())
+        .tooltip("GrepFocus — no active blocks")
+        .menu(&menu)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let app = tray.app_handle();
+                if let Some(w) = app.get_webview_window("main") {
+                    if w.is_visible().unwrap_or(false) {
+                        let _ = w.hide();
+                    } else {
+                        show_main_window(app);
+                    }
+                }
+            }
+        })
+        .build(app)?;
+    reregister_tray(app);
+    Ok(())
+}
+
+/// Whether the most recent tray menu re-set failed. The status watcher feeds
+/// it to `tray::TrayWatch`, which tries again on a later poll.
+static TRAY_RESET_FAILED: AtomicBool = AtomicBool::new(false);
+static TRAY_RESET_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Swaps a freshly built menu into the tray 1.5 s from now, which also makes
+/// libappindicator call RegisterStatusNotifierItem again. Wanted every time a
+/// StatusNotifier host meets the item — at startup and whenever the host
+/// comes (back) up (on GNOME: the extension re-enabled, the screen unlocked):
+///
+/// - muda/appindicator on GNOME (tauri#8825): the host can render the first
+///   menu BLANK even though the exported DBusMenu is correct (verified:
+///   identical structure to apps that render fine). A freshly built menu
+///   (new internal ids → bumped revision) is a genuine "second menu", not a
+///   no-op re-assign.
+/// - libappindicator registers on its own when the watcher name appears, but
+///   once per appearance: a host that answers with an error is not asked
+///   again. Seen with a stub watcher only. The GNOME extension has not been
+///   seen rejecting the item, and it answers a repeated registration of an
+///   item it already holds by resetting that item, not by creating an icon.
+///
+/// The `on_menu_event` handler matches by item id, which stays the same, so
+/// it survives the swap.
+fn reregister_tray(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let result = match app.tray_by_id(tray::TRAY_ID) {
+            Some(tray) => tray_menu(&app)
+                .and_then(|fresh| tray.set_menu(Some(fresh)))
+                .map_err(|e| e.to_string()),
+            None => Err("no tray icon to re-set".to_string()),
+        };
+        TRAY_RESET_FAILED.store(result.is_err(), Ordering::Relaxed);
+        if let Err(e) = result {
+            if !TRAY_RESET_FAILURE_LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!("grepfocus-gui: could not re-set the tray menu: {e}");
+            }
+        }
+    });
+}
+
 /// Background task: poll the daemon every 5s, keep the tray tooltip in sync,
 /// and fire a notification whenever a block starts or ends, or enforcement
 /// newly goes RED (see `enforcement_red`). Runs for the life of the process
 /// (when a tray host is present, the window hides to tray rather than
 /// closing), so notifications keep flowing even with no window open. Also
-/// re-shows a hidden window if its tray host vanishes.
+/// re-shows a hidden window if its tray host vanishes, and puts the tray item
+/// back in front of a host that (re)appears (see `tray::TrayWatch`).
 fn spawn_status_watcher(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         // id -> block name. `None` until the first successful poll so we
@@ -779,23 +880,36 @@ fn spawn_status_watcher(app: AppHandle) {
         // notifies: the fault stays up until it clears, so repeating it every
         // poll would be noise.
         let mut prev_red: Option<bool> = None;
+        let mut tray_watch = tray::TrayWatch::default();
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         loop {
             ticker.tick().await;
 
-            // Hidden-window rescue: a hidden window never gets a close event,
-            // so a tray that vanishes underneath it (extension disabled
-            // mid-session) would strand the app without this.
-            if let Some(window) = app.get_webview_window("main") {
-                if matches!(window.is_visible(), Ok(false)) {
-                    let present =
-                        tauri::async_runtime::spawn_blocking(tray::status_notifier_host_present)
-                            .await
-                            .unwrap_or(false);
-                    if !present {
-                        show_main_window(&app);
-                    }
+            let probe = tauri::async_runtime::spawn_blocking(tray::probe_host)
+                .await
+                .unwrap_or_default();
+
+            // Hidden-window rescue: the tray vanished underneath the window
+            // (extension disabled mid-session).
+            if !probe.host {
+                show_main_window_if_hidden(&app);
+            }
+
+            match tray_watch.poll(
+                probe.host,
+                probe.item_listed,
+                TRAY_RESET_FAILED.load(Ordering::Relaxed),
+            ) {
+                tray::TrayAction::Reregister => reregister_tray(&app),
+                tray::TrayAction::GiveUp => {
+                    eprintln!(
+                        "grepfocus-gui: the tray icon could not be confirmed with the tray host after repeated registrations; not retrying until the host restarts"
+                    );
+                    // Same fail-open as the rescue above: a tray that may not
+                    // be showing the icon must not be holding the window.
+                    show_main_window_if_hidden(&app);
                 }
+                tray::TrayAction::None => {}
             }
 
             let (active, settings, health) = match client::call(Request::GetStatus {}).await {
@@ -811,7 +925,7 @@ fn spawn_status_watcher(app: AppHandle) {
                     // touch `prev` or `prev_red`: keeping the notification
                     // baselines avoids a spurious burst of "block started/
                     // ended" (or a repeated RED) when it recovers.
-                    if let Some(tray) = app.tray_by_id("grepfocus-tray") {
+                    if let Some(tray) = app.tray_by_id(tray::TRAY_ID) {
                         let _ = tray.set_tooltip(Some("GrepFocus — daemon unreachable"));
                     }
                     continue;
@@ -824,7 +938,7 @@ fn spawn_status_watcher(app: AppHandle) {
             let domain_block_active = active.iter().any(|a| !a.block.domains.is_empty());
             let red = enforcement_red(&health, domain_block_active);
 
-            if let Some(tray) = app.tray_by_id("grepfocus-tray") {
+            if let Some(tray) = app.tray_by_id(tray::TRAY_ID) {
                 let tip = if cur.is_empty() {
                     "GrepFocus — no active blocks".to_string()
                 } else {
@@ -968,64 +1082,7 @@ fn main() {
                 .min_inner_size(600.0, 480.0)
                 .build()?;
 
-            let menu = MenuBuilder::new(app)
-                .text("show", "Show GrepFocus")
-                .separator()
-                .text("quit", "Quit")
-                .build()?;
-
-            TrayIconBuilder::with_id("grepfocus-tray")
-                .icon(app.default_window_icon().expect("bundled icon").clone())
-                .tooltip("GrepFocus — no active blocks")
-                .menu(&menu)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => show_main_window(app),
-                    "quit" => app.exit(0),
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        if let Some(w) = app.get_webview_window("main") {
-                            if w.is_visible().unwrap_or(false) {
-                                let _ = w.hide();
-                            } else {
-                                show_main_window(app);
-                            }
-                        }
-                    }
-                })
-                .build(app)?;
-
-            // Workaround for muda/appindicator on GNOME (tauri#8825): the
-            // StatusNotifier host can render the initial tray menu BLANK even
-            // though the exported DBusMenu is correct (verified: identical
-            // structure to apps that render fine). Re-setting the menu shortly
-            // after startup emits a fresh LayoutUpdated, forcing the host to
-            // re-read a populated layout. A freshly built menu (new internal
-            // ids → bumped revision) is a genuine "second menu", not a no-op
-            // re-assign. The tray icon and its `on_menu_event` handler (matched
-            // by item id, which we keep identical) persist across the swap.
-            let menu_reset_app = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(1500)).await;
-                if let Some(tray) = menu_reset_app.tray_by_id("grepfocus-tray") {
-                    if let Ok(fresh) = MenuBuilder::new(&menu_reset_app)
-                        .text("show", "Show GrepFocus")
-                        .separator()
-                        .text("quit", "Quit")
-                        .build()
-                    {
-                        let _ = tray.set_menu(Some(fresh));
-                    }
-                }
-            });
-
+            build_tray(app.handle())?;
             spawn_status_watcher(app.handle().clone());
             update::spawn_checker(app.handle().clone());
             Ok(())

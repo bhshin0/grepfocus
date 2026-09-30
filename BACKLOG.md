@@ -58,6 +58,139 @@ review findings — so they don't have to be re-derived later.
   tooltip kept reporting the last-known "N active". On poll failure it now sets
   "GrepFocus — daemon unreachable" (without touching the notification
   baseline `prev`).
+- **[MITIGATION — 2026-09-30; root cause not identified, owner's live check
+  pending] Tray icon reported lost after the tray host restarts** —
+  `crates/gui/src/tray.rs` (`probe_host`, `TrayWatch`),
+  `crates/gui/src/main.rs` (`reregister_tray`). Reported: after the
+  StatusNotifier host went away and came back (GNOME: the AppIndicator
+  extension disabled and re-enabled, or updated), the icon stayed gone until
+  the app was relaunched, with the app still running hidden. This has not
+  been reproduced, and the evidence below says the item normally comes back
+  by itself — so the entry stays open until the live check says whether the
+  icon is ever actually missing under a returned host.
+  What is known:
+  - libappindicator (libayatana-appindicator 0.6.0) registers the item by
+    itself each time the watcher name appears, also when no host existed at
+    startup. It makes that call once per appearance and does not retry after
+    an error reply (seen in an isolated session; it prints `Unable to connect
+    to the Notification Watcher` when that happens).
+  - Nothing shows that error ever happening against the real extension. On
+    the dev machine the user journal carries the GUI's stderr (its other
+    libayatana and GTK warnings are there) from 2026-07-11 on, and has no
+    `Unable to connect to the Notification Watcher` line from any process and
+    no extension message naming the item (`tray_icon_tray_app_…`), while host
+    restarts were routine (every screen lock, see the next entry).
+  - Extension v66 (`statusNotifierWatcher.js`): an item is stored before the
+    steps that can throw and stays stored after a throw; every stored item is
+    listed in `RegisteredStatusNotifierItems`; a repeated registration of a
+    stored item only resets it and creates no icon; and 2 s after each enable
+    the extension scans the bus and registers any item it does not hold
+    ("Using Brute-force mode"). So on this host a registration that was
+    rejected leaves the item listed without an icon, and registering again
+    does not repair that.
+  - The one incident on record — `gnome-extensions disable … && enable …` in
+    one line — left no tray host at all, which is a different failure.
+  What the change does: the 5 s status watcher reads the watcher's
+  properties on every poll (one `busctl call … Properties.GetAll`, where it
+  used to read one property and only while the window was hidden).
+  - On the host's absent→present edge (the first poll is a baseline) it
+    re-sets the tray menu after the same 1.5 s delay as at startup. That
+    re-applies the blank-menu workaround to the new host and makes
+    libappindicator register again.
+  - While the host stays up and does not list the item (a registration that
+    never arrived or was refused outright, or a restart that fit between two
+    polls), it re-sets again on that poll — three attempts, then one log
+    line, a hidden window is shown once (the tray cannot be trusted to bring
+    it back), and nothing more until the host next restarts. A listing that
+    cannot be read counts as unknown, not as missing. A re-set that fails on
+    the GUI's side is logged once and retried the same way.
+  - One action per poll at most. Startup and the re-set share one path
+    (`build_tray` once, `reregister_tray` for the menu swap).
+  What it does not do:
+  - Recover an item the host has recorded and failed to show (the extension
+    case above): the item is listed, so nothing retries, and a retry would
+    only be a reset. That would need the host to drop the item first — a new
+    object path, or the item's bus name going away.
+  - Notice a host restart that fits between two polls when the item's own
+    registration is accepted: no edge, the item is listed, so no menu re-set
+    for the new host (a lock/unlock under 5 s is such a restart). Polling
+    cannot see it — on GNOME the name's owner is gnome-shell before and
+    after. Only a `NameOwnerChanged` subscription would; `gio` and `zbus`
+    are already in `Cargo.lock` as transitive dependencies, a direct one is
+    the owner's call.
+  - Stop treating "host present" as "tray usable" at close time after the
+    give-up: closing still hides. Quitting instead would take hide-to-tray
+    away on any host whose listing is readable but formatted unexpectedly.
+  - Remove the tray and build a new one. The libappindicator Rust wrapper
+    never unrefs the C object, so the removed item and its DBusMenu stay
+    exported, the replacement fails to export under the same id, and the
+    host is left with the old item — passive, empty menu (tried; see
+    `docs/plans/uxpolish.md`).
+  Verified (private `dbus-run-session`, headless mutter, a stub
+  `org.kde.StatusNotifierWatcher`; closes injected through mutter's
+  RemoteDesktop API; menu clicks sent over DBusMenu): host restart; host
+  appearing after startup; a watcher without a host replaced by one with a
+  host; a restarted stub that refuses the first registration outright and
+  does not list the item (the build without this change did not register
+  again in 20 s, this one did ~6 s after the host returned); three restarts
+  in 4 s (one extra registration); both listing formats (bus name + path,
+  bare path); a host that never lists the item (three retries, the log line,
+  and a window hidden in the tray came back); a listing property that errors
+  (no retries, close still hides); a steady host (the two startup
+  registrations, as before). Except where noted the item ended `Active` with
+  the three-entry menu and "Quit" / "Show GrepFocus" worked. Close with a
+  host hides, close without one quits, a hidden window comes back when the
+  host goes, a second launch exits — unchanged.
+  Verified not to help (same session, stub switched to the extension's
+  semantics: a refused item stays stored and listed, a repeat is a reset):
+  after a restart with a refused first registration the item stayed listed,
+  the edge re-set was answered as a reset, and no further attempt followed.
+  Not verified: anything on the real extension — whether the icon and its
+  menu render after a host return, with or without this change — and any
+  host other than the stub.
+  No release-note line and no README sentence until the live check shows a
+  difference a user would see; if it does, in the user's terms: "if the tray
+  comes back (the extension is re-enabled, or you unlock the screen), the
+  GrepFocus icon returns within about 10 seconds".
+  **Live verification (owner):** run the new build, close the window to the
+  tray, then:
+  1. Extension toggle. Turn the AppIndicator extension OFF (Extensions app,
+     or `gnome-extensions disable appindicatorsupport@rgcjonas.gmail.com`).
+     The window should reappear within ~5 s (hidden-window rescue). Wait
+     10 s, then turn the extension ON as a SEPARATE command or click — never
+     `disable … && enable …` in one line; that once left no tray host at
+     all. Within ~10 s the icon should be back with a working menu ("Show
+     GrepFocus" and "Quit" both visible and both doing their job), and
+     closing the window should hide it to the tray again.
+  2. Quick toggle. OFF, then ON within 5 s (still two separate commands).
+     Icon back? Menu populated, or blank? This is the between-two-polls gap.
+  3. Screen lock. Lock, wait more than 10 s, unlock. Icon there, menu works?
+     Note whether the window was back on screen (next entry).
+  4. If the icon is ever missing while the extension is on, capture before
+     relaunching:
+     `busctl --user call org.kde.StatusNotifierWatcher /StatusNotifierWatcher org.freedesktop.DBus.Properties GetAll s org.kde.StatusNotifierWatcher`
+     and
+     `journalctl --user -b -g 'Notification Watcher|appindicator|grepfocus-gui'`.
+     An item that is listed but invisible means the recovery has to make the
+     host drop the item, not register it again.
+  Steps 1–3 on the previous build as well would show whether the icon was
+  ever lost without this change.
+- **[OPEN — host loss observed 2026-09-30; the window re-show needs the
+  owner's eyes] Locking the screen is a tray host restart** — observed on
+  the dev machine with the screen locked: `org.gnome.ScreenSaver.GetActive`
+  true, the AppIndicator extension `Enabled: Yes` / `State: INACTIVE`, and no
+  `org.kde.StatusNotifierWatcher` on the bus (the extension declares no
+  `unlock-dialog` session mode, so GNOME Shell disables it while locked; its
+  source calls out "entering/leaving the lock screen"). This is the everyday
+  host restart, and it predates the entry above. By the code, every lock
+  longer than one poll makes the hidden-window rescue (`!probe.host` →
+  `show_main_window`, which also focuses) re-show a window that was hidden in
+  the tray, undoing hide-to-tray; not yet seen with the owner's eyes. Every
+  unlock is a host return, now followed by a menu re-set. Check with step 3
+  above. If the window does come back: gate the rescue — skip it while
+  `org.gnome.ScreenSaver.GetActive` is true (same `busctl call` helper), or
+  require the host to be absent for N consecutive polls after unlock — as
+  its own change, then say so in the README's tray paragraph.
 
 ## Input hardening, health, DoH policies, updates (2026-09-28)
 

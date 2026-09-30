@@ -65,3 +65,50 @@ design; exercised implicitly during the matrix (unit-tested classifier).
 - `systemctl start frostbited && chmod …sock` races the daemon's socket
   bind — the unit reports started before the socket exists. Test EACCES by
   chmodding the socket of an already-running daemon.
+
+## 2026-09-30 — tray host restarts
+
+Follow-up to the tray fallback above. The status, what was and was not
+verified, the known gaps and the owner's live check are in `BACKLOG.md`
+(GUI); in short, the reported "icon gone until relaunch" was not reproduced
+and the change is a mitigation. What an isolated session (private
+`dbus-run-session`, headless mutter, a stub StatusNotifierWatcher,
+`dbus-monitor`) showed about tray-icon 0.23 / libayatana-appindicator 0.6:
+
+- libappindicator watches `org.kde.StatusNotifierWatcher` and calls
+  `RegisterStatusNotifierItem` on its own whenever the name appears, at
+  startup or later. It does so once per appearance and does not retry after
+  an error reply.
+- `app_indicator_set_menu` runs the same registration again. The startup
+  menu re-set (the blank-menu workaround) has therefore always been a second
+  registration as well.
+- tray-icon's `set_tooltip` is a no-op on Linux, so the tooltip text never
+  reaches the host there.
+- A tray cannot be rebuilt in place. `remove_tray_by_id` followed by a new
+  `TrayIconBuilder` with the same id logs "An object is already exported for
+  the interface org.kde.StatusNotifierItem" (and the same for
+  `com.canonical.dbusmenu`): the libappindicator Rust wrapper has no `Drop`,
+  the C object lives on, and what the host then reads at that path is the old
+  item with `Status = Passive` and an empty menu. A new id per rebuild would
+  avoid the clash but leak one exported, self-re-registering item each time.
+
+And what the GNOME extension's source (v66, `statusNotifierWatcher.js`) and
+the dev machine's bus and journal say about the real host — read from
+outside, not exercised:
+
+- The extension is disabled for as long as the screen is locked, so every
+  lock/unlock is a host restart (watcher name gone, then back).
+- An item is stored, and from then on listed, before the steps that can
+  fail; a repeated registration of a stored item is a reset, not a new icon;
+  2 s after each enable the extension scans the bus for items it does not
+  hold. A rejected registration was never logged on the dev machine.
+
+Hence the change keeps the one tray and re-sets its menu (`reregister_tray`):
+on the host's absent→present edge, and while a present host does not list
+the item, bounded to three attempts (`tray::TrayWatch`). On the extension the
+second case only arises when the host has no record of the item; an item it
+recorded and failed to show stays listed, and registering again would not
+bring it back. A host restart that fits between two 5 s polls and accepts
+the item's own registration is not seen at all (no menu re-set for the new
+host); only a `NameOwnerChanged` subscription would close that. The tray
+probe is one `busctl call … Properties.GetAll` per poll.
