@@ -19,6 +19,18 @@
 > (`LD_LIBRARY_PATH=<AppDir>/usr/lib python3 -c "import ctypes;
 > ctypes.CDLL('/usr/lib64/libEGL_mesa.so.0')"`), and the shadow audit (AppDir
 > sonames ∩ GPU-stack DT_NEEDED). This file is the design record.
+>
+> **Updates (hardening-health, WP6):** the daemon reports
+> `health.daemon_version` and `health.install_kind` on `get_status`
+> (`grepfocusd --version` prints the same), the GUI compares it with its own
+> `CARGO_PKG_VERSION` through `crates/gui/src/version.rs` (semver; one
+> decision table, `advise`) and the Status tab offers *Update system service*
+> when an AppImage is newer than a `/usr/local/bin` daemon — the same pkexec
+> installer re-run. The bootstrap now runs the installer with `bash` (it was
+> `/bin/sh`, which is dash on Debian/Ubuntu and killed the first-run install
+> there); the installer refuses to run over a package install (exit 98) and
+> to downgrade (exit 99, `--force` from the CLI only), and saves a customised
+> unit as `.bak`. Design: `docs/plans/hardening-health-updates.md` (§8, WP6).
 
 ## Why
 
@@ -63,8 +75,10 @@ exactly like the RPM/deb; an afternoon, mostly the existing build steps).
   restart). Build scripts: `packaging/build-rpm.sh` (clean-tree git archive →
   rpmbuild → dist/), `packaging/build-deb.sh` (podman ubuntu:24.04 →
   dpkg-buildpackage → dist/).
-- Version lives in 4 hand-synced places: root Cargo.toml, tauri.conf.json,
-  spec, debian/changelog. No CI (`.github/` absent).
+- Version lives in 5 hand-synced places (root Cargo.toml, tauri.conf.json,
+  spec, debian/changelog, PKGBUILD); the binaries read it via
+  `CARGO_PKG_VERSION` and a gui test pins tauri.conf.json to it. No CI
+  (`.github/` absent).
 
 ## Scope
 
@@ -107,7 +121,10 @@ Plan:
   in" state distinctly.
 - Upgrades: on version mismatch (GUI newer than daemon — needs a
   daemon-version field in get_status if absent), offer "Update system
-  service" via the same pkexec path.
+  service" via the same pkexec path. DONE — see hardening-health-updates.md
+  WP6; note `install_kind` is `local` for BOTH the AppImage installer and
+  the dev scripts, so the offer keys off `$APPIMAGE` plus the two binary
+  probes, never off `install_kind` alone.
 - Uninstall parity: ship the teardown (`grepfocusd cleanup` + file removal)
   as a flag of the same script; mention it on the first-run screen.
 

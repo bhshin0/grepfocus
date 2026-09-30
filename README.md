@@ -156,6 +156,35 @@ autostart entry), use the upgrade loop:
 ./packaging/upgrade.sh   # run as your normal user; uses sudo for system steps
 ```
 
+## Updating
+
+The daemon and the GUI ship together and must match: the GUI compares its
+version with the daemon's (`get_status.health.daemon_version`) on every poll
+and, when they differ, the Status tab says what to do.
+
+- **rpm / deb / AUR:** update the `grepfocus` package with your package
+  manager; it carries both binaries and restarts the service.
+- **AppImage:** download the new file from
+  [grepfocus.com/download](https://grepfocus.com/download) and run it. While
+  the app is newer than the installed service, the Status tab offers *Update
+  system service*: the same pkexec installer that ran on first use, re-run
+  with the bundled daemon (you authorize once). It never runs over a package
+  install (`/usr/bin/grepfocusd` present — update the package instead) and
+  never downgrades the service (`--force` exists only on the script's command
+  line: `sudo bash appimage-install.sh install $USER --force`, with the
+  payload files beside it). A `grepfocusd.service` you customised is saved as
+  `grepfocusd.service.bak` before being replaced — keep such changes in a
+  drop-in (`systemctl edit grepfocusd`) instead. An AppImage that is *older*
+  than the service only tells you to download the current one.
+- **Source checkout:** `./packaging/upgrade.sh` (above) rebuilds and
+  redeploys both.
+
+Any daemon restart — package upgrade, the AppImage update, `upgrade.sh` —
+keeps active blocks enforced (they are persisted and re-applied on start)
+but drops what lives only in memory: the settings unlock (the daemon
+relocks), a pending break challenge, and app-kill counts not yet flushed to
+the usage stats.
+
 ## Wire protocol
 
 The daemon listens on a Unix socket. Each frame is a 4-byte big-endian

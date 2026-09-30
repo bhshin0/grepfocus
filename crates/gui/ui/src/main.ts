@@ -216,7 +216,22 @@ interface Status {
   instant_breaks_degraded: boolean;
   /// Enforcement health and daemon identity — see `Health`.
   health: Health;
+  /// GUI/daemon version skew advice, computed by the Rust side on every poll
+  /// — see `UpdateAdvice`.
+  update: UpdateAdvice;
 }
+
+/// Mirrors `version::UpdateAdvice` in src/main.rs: what the GUI/daemon
+/// version skew calls for. `from` is the daemon's version (null = it predates
+/// version reporting), `to` this app's. Only `update_service` comes with a
+/// button; `gui_outdated` is never an install offer.
+type UpdateAdvice =
+  | { kind: "up_to_date" }
+  | { kind: "update_service"; from: string | null; to: string }
+  | { kind: "package_manager"; from: string | null; to: string }
+  | { kind: "both_installs"; from: string | null; to: string }
+  | { kind: "manual"; from: string | null; to: string }
+  | { kind: "gui_outdated"; gui: string; daemon: string };
 
 interface Schedule {
   id: number;
@@ -1010,6 +1025,7 @@ async function refreshStatus() {
     // show above "No active block", not vanish with it.
     renderAboutLine(s);
     renderHealthBanner(healthNotices(s));
+    renderUpdateBanner(s.update, s.health.install_kind);
     activeServerSkew = s.now_unix - Math.floor(Date.now() / 1000);
     // Premium is all-or-nothing: a valid license reveals the Stats tab, an
     // invalid/absent one hides it. This poll is the single place license
@@ -1041,11 +1057,22 @@ async function refreshStatus() {
     renderHealthBanner([]);
     statusEl.innerHTML = "";
     const p = document.createElement("p");
-    p.className = "msg error";
-    p.textContent = String(e);
+    if (installBusy) {
+      // The installer is restarting the service: this connect failure is
+      // expected and momentary, not a fault to paint red. The skew banner
+      // keeps its progress line.
+      p.className = "msg";
+      p.textContent = "Restarting service…";
+    } else {
+      p.className = "msg error";
+      p.textContent = String(e);
+      // A skew read off the last answer is stale once there is no answer;
+      // the hold keeps a just-finished update's outcome readable.
+      if (Date.now() >= updateHoldUntil) hideUpdateBanner();
+    }
     statusEl.appendChild(p);
     stopCountdownTimer();
-    // In an AppImage a daemon-unreachable error is the first-run signal.
+    // A daemon-unreachable error is the first-run / service-down signal.
     handleDaemonUnreachable(e);
   }
 }
@@ -2707,18 +2734,27 @@ function emptyLi(text: string): HTMLLIElement {
   return li;
 }
 
-// ─── First-run system-service installer ──────────────────────────────────────
+// ─── System-service installer: first run, service down, update ───────────────
 //
-// Shown when the daemon is unreachable. In an AppImage that means either "not
-// installed yet" (offer the pkexec installer via install_service) or, right
-// after installing, "log out and back in" — the new grepfocus group membership
-// needs a fresh login. Package installs already set the daemon up so this never
-// appears; on a non-AppImage dev run we leave the existing per-tab error alone.
+// The daemon-unreachable dialog and the Status-tab skew banner share one
+// installer path (`installServiceAndWait`, the only `install_service` caller)
+// and one busy flag. The dialog is shown when the daemon is unreachable: "not
+// installed yet" offers the pkexec installer (AppImage only — a package GUI
+// has no payload), "installed but this login predates the group" asks for a
+// relogin, and an installed daemon that is not running asks for a systemctl
+// start, with "Reinstall service" as the fallback when the install is the
+// AppImage's own. A non-AppImage run with no daemon binary anywhere keeps the
+// per-tab error, which already names install.sh.
 
 interface AppEnv {
   appimage: boolean;
   /// The app's own version, for the Settings about line (`aboutLine`).
   gui_version: string;
+  /// `/usr/bin/grepfocusd` exists — a package install owns the daemon.
+  packaged_daemon: boolean;
+  /// `/usr/local/bin/grepfocusd` exists — the AppImage installer's or the
+  /// dev scripts' daemon.
+  local_daemon: boolean;
 }
 
 let appEnv: AppEnv | null = null;
@@ -2728,15 +2764,17 @@ const firstRunTitle = document.querySelector<HTMLElement>("#firstrun-title")!;
 const firstRunBody = document.querySelector<HTMLElement>("#firstrun-body")!;
 const firstRunMsg = document.querySelector<HTMLElement>("#firstrun-msg")!;
 const firstRunAction = document.querySelector<HTMLButtonElement>("#firstrun-action")!;
+const firstRunSecondary = document.querySelector<HTMLButtonElement>("#firstrun-secondary")!;
 
-type FirstRunMode = "install" | "relogin";
+type FirstRunMode = "install" | "relogin" | "packaged" | "stopped";
 let firstRunMode: FirstRunMode | null = null;
-// True while the install click owns the dialog (pkexec in flight or waiting for
-// the fresh daemon to answer). Blocks the background status poll's error
-// handler from resetting the dialog state mid-flow — without this, a poll
-// landing between "install finished" and "daemon accepting connections" flips
-// the dialog back to the install screen.
-let firstRunBusy = false;
+// True while an install click owns the UI (pkexec in flight or waiting for
+// the fresh daemon to answer), from either the dialog or the skew banner.
+// Blocks the background status poll's error handler from resetting the dialog
+// mid-flow — a poll landing between "install finished" and "daemon accepting
+// connections" would otherwise flip the dialog back to the install screen —
+// and keeps the poll from repainting the skew banner under a click.
+let installBusy = false;
 
 // Esc must not dismiss this into an unusable app.
 firstRunDialog.addEventListener("cancel", (ev) => ev.preventDefault());
@@ -2746,16 +2784,41 @@ function showFirstRun(mode: FirstRunMode) {
   firstRunMsg.classList.remove("error");
   firstRunMsg.textContent = "";
   firstRunAction.disabled = false;
-  if (mode === "install") {
-    firstRunTitle.textContent = "Set up GrepFocus";
-    firstRunBody.textContent =
-      "GrepFocus needs a small background service to enforce blocks. Install it now? You'll be asked to authorize with your password. It also switches DNS-over-HTTPS off in Firefox, Chromium and similar browsers through a system policy so blocks apply there — those browsers will say they are \"managed by your organization\"; restart them once after installing.";
-    firstRunAction.textContent = "Install system service";
-  } else {
-    firstRunTitle.textContent = "Almost there";
-    firstRunBody.textContent =
-      "The GrepFocus service is installed. Log out and back in to finish — your new group membership needs a fresh login — then reopen GrepFocus.";
-    firstRunAction.textContent = "Retry";
+  firstRunSecondary.hidden = true;
+  firstRunSecondary.disabled = false;
+  switch (mode) {
+    case "install":
+      firstRunTitle.textContent = "Set up GrepFocus";
+      firstRunBody.textContent =
+        "GrepFocus needs a small background service to enforce blocks. Install it now? You'll be asked to authorize with your password. It also switches DNS-over-HTTPS off in Firefox, Chromium and similar browsers through a system policy so blocks apply there — those browsers will say they are \"managed by your organization\"; restart them once after installing.";
+      firstRunAction.textContent = "Install system service";
+      break;
+    case "relogin":
+      firstRunTitle.textContent = "Almost there";
+      firstRunBody.textContent =
+        "The GrepFocus service is installed. Log out and back in to finish — your new group membership needs a fresh login — then reopen GrepFocus.";
+      firstRunAction.textContent = "Retry";
+      break;
+    case "packaged":
+      firstRunTitle.textContent = "Service not running";
+      firstRunBody.textContent =
+        "GrepFocus is installed by your package manager (/usr/bin/grepfocusd), but its service is not running. Start it with: sudo systemctl start grepfocusd — then press Retry.";
+      firstRunAction.textContent = "Retry";
+      break;
+    case "stopped": {
+      // The reinstall re-runs the bundled installer, which only an AppImage
+      // carries.
+      const reinstall = appEnv?.appimage === true;
+      firstRunTitle.textContent = "Service not running";
+      firstRunBody.textContent =
+        "The GrepFocus service is installed (/usr/local/bin/grepfocusd) but not running. Start it with: sudo systemctl start grepfocusd — then press Retry." +
+        (reinstall
+          ? " If it will not start, Reinstall service re-runs the installer (you'll be asked to authorize)."
+          : "");
+      firstRunAction.textContent = "Retry";
+      firstRunSecondary.hidden = !reinstall;
+      break;
+    }
   }
   if (!firstRunDialog.open) firstRunDialog.showModal();
 }
@@ -2765,19 +2828,24 @@ function hideFirstRun() {
   if (firstRunDialog.open) firstRunDialog.close();
 }
 
-// Classify a daemon-unreachable error and show the right first-run state. The
-// error strings come from crates/gui/src/client.rs.
+// Classify a daemon-unreachable error and show the right dialog state. The
+// error strings come from crates/gui/src/client.rs; only the two connect-class
+// failures pick a mode — a deserialize or protocol error is a daemon we DID
+// reach, and never opens the dialog.
 function handleDaemonUnreachable(err: unknown) {
-  if (firstRunBusy) return; // the install flow owns the dialog right now
+  if (installBusy) return; // the install flow owns the dialog right now
   const msg = String(err);
   if (msg.includes("not allowed to talk")) {
     // Socket exists but we lack group membership — installed, needs relogin.
     showFirstRun("relogin");
-  } else if (appEnv?.appimage) {
-    // Nothing listening on the socket + we're an AppImage → not installed yet.
-    showFirstRun("install");
+  } else if (msg.includes("daemon is not running")) {
+    // Nothing listening on the socket: which binary exists says whether that
+    // is "not installed" or "installed but stopped".
+    if (appEnv?.packaged_daemon) showFirstRun("packaged");
+    else if (appEnv?.local_daemon) showFirstRun("stopped");
+    else if (appEnv?.appimage) showFirstRun("install");
+    // Otherwise (non-AppImage, no daemon binary): leave the per-tab error.
   }
-  // Otherwise (non-AppImage): leave today's per-tab error visible, no modal.
 }
 
 /// Poll the daemon until it answers, the socket denies us (needs relogin), or
@@ -2798,22 +2866,43 @@ async function waitForDaemon(timeoutMs: number): Promise<"ok" | "denied" | "time
   }
 }
 
-firstRunAction.addEventListener("click", async () => {
-  if (firstRunMode === "relogin") {
-    // The user says they've logged back in — re-poll; success hides the dialog.
-    firstRunMsg.classList.remove("error");
-    firstRunMsg.textContent = "Checking…";
-    refreshStatus();
-    return;
-  }
-  firstRunBusy = true;
-  firstRunAction.disabled = true;
-  firstRunMsg.classList.remove("error");
-  firstRunMsg.textContent = "Installing… authorize when prompted.";
+/// The one `install_service` caller: run the pkexec installer, then wait for
+/// the (re)started daemon to answer. `report` gets every progress line and,
+/// on "error", the installer's message with `error` set; the caller decides
+/// what each outcome means for its own surface. The caller owns `installBusy`.
+async function installServiceAndWait(
+  report: (text: string, error?: boolean) => void,
+  waitMs: number,
+): Promise<"ok" | "denied" | "timeout" | "error"> {
+  report("Installing… authorize when prompted.");
   try {
     await invoke("install_service");
-    firstRunMsg.textContent = "Service installed — waiting for it to start…";
-    switch (await waitForDaemon(15000)) {
+  } catch (e) {
+    report(String(e), true);
+    return "error";
+  }
+  // The binaries on disk just changed; the dialog's mode picker and the skew
+  // advice read them from here.
+  try {
+    appEnv = await invoke<AppEnv>("app_env");
+  } catch {
+    // Keep the boot-time answer.
+  }
+  report("Service installed — waiting for it to start…");
+  return waitForDaemon(waitMs);
+}
+
+/// The dialog's install (or reinstall) flow.
+async function runFirstRunInstall() {
+  installBusy = true;
+  firstRunAction.disabled = true;
+  firstRunSecondary.disabled = true;
+  try {
+    const outcome = await installServiceAndWait((text, error) => {
+      firstRunMsg.classList.toggle("error", error === true);
+      firstRunMsg.textContent = text;
+    }, 15000);
+    switch (outcome) {
       case "ok":
         // Already in the grepfocus group (e.g. reinstall) — done, no relogin.
         hideFirstRun();
@@ -2828,14 +2917,184 @@ firstRunAction.addEventListener("click", async () => {
         firstRunMsg.textContent =
           "The service was installed but isn't answering yet. It may still be starting — this screen will close by itself once it's reachable.";
         firstRunAction.disabled = false;
+        firstRunSecondary.disabled = false;
+        break;
+      case "error":
+        // The message is already on the dialog.
+        firstRunAction.disabled = false;
+        firstRunSecondary.disabled = false;
         break;
     }
-  } catch (e) {
-    firstRunMsg.classList.add("error");
-    firstRunMsg.textContent = String(e);
-    firstRunAction.disabled = false;
   } finally {
-    firstRunBusy = false;
+    installBusy = false;
+  }
+}
+
+firstRunAction.addEventListener("click", () => {
+  if (firstRunMode === "install") {
+    void runFirstRunInstall();
+    return;
+  }
+  // relogin / packaged / stopped: the user says the service should answer
+  // now — re-poll; success hides the dialog.
+  firstRunMsg.classList.remove("error");
+  firstRunMsg.textContent = "Checking…";
+  refreshStatus();
+});
+
+firstRunSecondary.addEventListener("click", () => {
+  void runFirstRunInstall();
+});
+
+// ─── Status tab: GUI/daemon version skew banner ──────────────────────────────
+//
+// `get_status` computes the advice (Rust `version::advise`, one decision
+// table); this side turns it into copy and, for `update_service` only, a
+// button that re-runs the AppImage's pkexec installer. `updateAdviceText` is
+// pure; `renderUpdateBanner` is the only DOM writer and, like the health
+// banner, rewrites only when the advice changes.
+
+const updateBannerEl = document.querySelector<HTMLDivElement>("#update-banner")!;
+const updateTextEl = document.querySelector<HTMLParagraphElement>("#update-text")!;
+const updateActionEl = document.querySelector<HTMLButtonElement>("#update-action")!;
+const updateMsgEl = document.querySelector<HTMLParagraphElement>("#update-msg")!;
+
+/// Where an outdated AppImage is sent. Plain selectable text for now; a
+/// "Download" button that opens it arrives with the release check.
+const DOWNLOAD_URL = "https://grepfocus.com/download";
+
+/// How long a finished update's outcome stays readable before the poll's
+/// `up_to_date` (or a renewed unreachable error) takes the card away.
+const UPDATE_HOLD_MS = 10_000;
+
+/// The opening sentence: which service, how it compares. A pre-reporting
+/// daemon (`from` null) is older than any app that asks.
+function serviceOlder(from: string | null, to: string): string {
+  return from === null
+    ? `The installed GrepFocus service predates version reporting and is older than this app (${to})`
+    : `The GrepFocus service (${from}) is older than this app (${to})`;
+}
+
+/// The skew card's copy. `gui_outdated` branches on how this app and the
+/// daemon were installed: a packaged app should be launched instead, an
+/// AppImage replaced, a checkout rebuilt. A pre-reporting daemon's
+/// `install_kind` is necessarily `unknown`, so `manual` with `from` null
+/// names every install path rather than a location.
+function updateAdviceText(a: UpdateAdvice, appimage: boolean, kind: InstallKind): string {
+  const restartNote =
+    "Active blocks stay enforced across the restart; settings relock, and a pending break challenge is lost.";
+  switch (a.kind) {
+    case "up_to_date":
+      return "";
+    case "update_service":
+      return `${serviceOlder(a.from, a.to)}. Update the service so both match — you'll be asked to authorize with your password. ${restartNote}`;
+    case "package_manager":
+      return `${serviceOlder(a.from, a.to)}. It was installed by your package manager — update the grepfocus package (rpm/deb/AUR) to ${a.to}; this app cannot replace a packaged service.`;
+    case "both_installs":
+      return `${serviceOlder(a.from, a.to)}. grepfocusd is installed twice — by a package (/usr/bin/grepfocusd) and locally (/usr/local/bin/grepfocusd) — and the installer will not run over a package install: remove one of the two (the package with your package manager), then update the other.`;
+    case "manual":
+      if (a.from === null || kind === "local") {
+        return `${serviceOlder(a.from, a.to)}. Update it the way it was installed: ./packaging/upgrade.sh from a source checkout, your package manager, or the newer AppImage, which offers the update on this tab.`;
+      }
+      return `${serviceOlder(a.from, a.to)} and is not at a location this app can update. Update it the way it was installed.`;
+    case "gui_outdated": {
+      const lead = `The GrepFocus service (${a.daemon}) is newer than this app (${a.gui})`;
+      if (kind === "package") {
+        return `${lead}. Launch the GrepFocus that came with the package instead of this ${appimage ? "AppImage" : "build"}.`;
+      }
+      if (appimage) {
+        return `${lead}. Download the latest AppImage from ${DOWNLOAD_URL}.`;
+      }
+      if (kind === "local") {
+        return `${lead} — quit and relaunch GrepFocus; if this notice stays, ./packaging/upgrade.sh from the checkout rebuilds both.`;
+      }
+      return `${lead} — quit and relaunch GrepFocus; if this notice stays, update the app the way it was installed.`;
+    }
+  }
+}
+
+/// What the card currently shows, so an unchanged advice leaves the DOM (and
+/// a message from the last click) alone.
+let updateBannerKey = "";
+/// Until when `renderUpdateBanner` must not repaint — a finished update's
+/// outcome line is being read.
+let updateHoldUntil = 0;
+/// The version the visible button installs, for the outcome line.
+let updateTarget = "";
+
+function renderUpdateBanner(a: UpdateAdvice, kind: InstallKind) {
+  if (installBusy || Date.now() < updateHoldUntil) return;
+  if (a.kind === "up_to_date") {
+    hideUpdateBanner();
+    return;
+  }
+  const text = updateAdviceText(a, appEnv?.appimage === true, kind);
+  const key = `${a.kind}\u0000${text}`;
+  if (key === updateBannerKey) return;
+  updateBannerKey = key;
+  const offer = a.kind === "update_service";
+  updateTextEl.textContent = text;
+  updateBannerEl.className = `lock-state update-banner${a.kind === "gui_outdated" ? " locked" : ""}`;
+  updateActionEl.hidden = !offer;
+  updateActionEl.disabled = false;
+  updateActionEl.textContent = offer ? `Update system service to ${a.to}` : "Update system service";
+  updateTarget = offer ? a.to : "";
+  updateMsgEl.classList.remove("error");
+  updateMsgEl.textContent = "";
+  updateBannerEl.hidden = false;
+}
+
+function hideUpdateBanner() {
+  if (updateBannerEl.hidden && updateBannerKey === "") return;
+  updateBannerKey = "";
+  updateTarget = "";
+  updateBannerEl.hidden = true;
+  updateActionEl.hidden = true;
+  updateMsgEl.classList.remove("error");
+  updateMsgEl.textContent = "";
+}
+
+updateActionEl.addEventListener("click", async () => {
+  if (installBusy) return;
+  installBusy = true;
+  updateActionEl.disabled = true;
+  const to = updateTarget;
+  try {
+    const outcome = await installServiceAndWait((text, error) => {
+      updateMsgEl.classList.toggle("error", error === true);
+      updateMsgEl.textContent = text;
+    }, 20000);
+    switch (outcome) {
+      case "ok":
+        updateMsgEl.textContent = `Service updated to ${to}.`;
+        updateActionEl.hidden = true;
+        // Hold the outcome; the next poll would otherwise take the card away
+        // (up_to_date) before it could be read. The key reset makes the
+        // first repaint after the hold unconditional.
+        updateHoldUntil = Date.now() + UPDATE_HOLD_MS;
+        updateBannerKey = "";
+        break;
+      case "denied":
+        updateMsgEl.classList.add("error");
+        updateMsgEl.textContent =
+          "The service restarted, but this login is not allowed to talk to it — log out and back in.";
+        break;
+      case "timeout":
+        updateMsgEl.classList.add("error");
+        updateMsgEl.textContent =
+          "The service was updated but isn't answering yet. It may still be starting — this notice clears by itself once it is reachable.";
+        updateActionEl.disabled = false;
+        // Keep this readable through the next unreachable polls; after the
+        // hold the service-down dialog takes over.
+        updateHoldUntil = Date.now() + UPDATE_HOLD_MS;
+        break;
+      case "error":
+        // The installer's message is already on the card.
+        updateActionEl.disabled = false;
+        break;
+    }
+  } finally {
+    installBusy = false;
   }
 });
 

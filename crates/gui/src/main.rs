@@ -3,6 +3,7 @@
 
 mod client;
 mod tray;
+mod version;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -19,6 +20,13 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 /// line shows beside the daemon's. `tauri.conf.json` carries its own copy
 /// (Tauri reads that one for the bundle), pinned to this by a test.
 const GUI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Where a package install (rpm/deb/AUR) puts the daemon; also hardcoded in
+/// `debian/grepfocus.prerm` and the installer's `PACKAGED_BIN`.
+const PACKAGED_DAEMON_BIN: &str = "/usr/bin/grepfocusd";
+/// Where the AppImage's pkexec installer AND the dev scripts put it — its
+/// presence alone is not evidence of an AppImage install.
+const LOCAL_DAEMON_BIN: &str = "/usr/local/bin/grepfocusd";
 
 #[tauri::command]
 async fn list_blocks() -> Result<Vec<Block>, String> {
@@ -147,6 +155,10 @@ struct StatusOut {
     /// old daemon never emits it, in which case core's default arrives here
     /// with an empty `daemon_version`.
     health: Health,
+    /// GUI/daemon version skew advice (see `version::advise`). Computed
+    /// here, on every poll, so the banner tracks an install the moment it
+    /// lands; never license-gated.
+    update: version::UpdateAdvice,
 }
 
 #[tauri::command]
@@ -169,24 +181,37 @@ async fn get_status() -> Result<StatusOut, String> {
             settings,
             instant_breaks_degraded,
             health,
-        } => Ok(StatusOut {
-            active,
-            now_unix,
-            password_set,
-            unlocked,
-            allowance,
-            allowance_used,
-            license_present,
-            license_valid,
-            license_kind,
-            license_email,
-            license_expires_at,
-            licensed_features,
-            pomodoro,
-            settings,
-            instant_breaks_degraded,
-            health: *health,
-        }),
+        } => {
+            let env = probe_app_env();
+            let update = version::advise(version::Probe {
+                gui: GUI_VERSION,
+                daemon: (!health.daemon_version.is_empty())
+                    .then_some(health.daemon_version.as_str()),
+                install_kind: health.install_kind,
+                appimage: env.appimage,
+                packaged_binary: env.packaged_daemon,
+                local_binary: env.local_daemon,
+            });
+            Ok(StatusOut {
+                active,
+                now_unix,
+                password_set,
+                unlocked,
+                allowance,
+                allowance_used,
+                license_present,
+                license_valid,
+                license_kind,
+                license_email,
+                license_expires_at,
+                licensed_features,
+                pomodoro,
+                settings,
+                instant_breaks_degraded,
+                health: *health,
+                update,
+            })
+        }
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),
     }
@@ -334,27 +359,45 @@ async fn delete_schedule(id: u64) -> Result<(), String> {
 /// What the frontend needs to know about how the app is running: whether
 /// we're an AppImage — which gates the first-run "install the system service"
 /// flow, since the pkexec installer only makes sense from an AppImage (package
-/// installs already set the daemon up; AppRun sets $APPIMAGE) — and our own
-/// version, shown beside the daemon's on the Settings tab.
+/// installs already set the daemon up; AppRun sets $APPIMAGE) — our own
+/// version, shown beside the daemon's on the Settings tab, and which daemon
+/// binaries exist, which picks the first-run dialog's mode when the daemon is
+/// down (a package install is started, not installed) and feeds the skew
+/// advice.
 #[derive(serde::Serialize)]
 struct AppEnv {
     appimage: bool,
     gui_version: String,
+    /// `/usr/bin/grepfocusd` exists.
+    packaged_daemon: bool,
+    /// `/usr/local/bin/grepfocusd` exists.
+    local_daemon: bool,
+}
+
+/// Re-probed on every call (two stats): the binaries change under a running
+/// GUI exactly when it matters — the installer just put one there.
+fn probe_app_env() -> AppEnv {
+    AppEnv {
+        appimage: std::env::var_os("APPIMAGE").is_some(),
+        gui_version: GUI_VERSION.to_string(),
+        packaged_daemon: std::path::Path::new(PACKAGED_DAEMON_BIN).exists(),
+        local_daemon: std::path::Path::new(LOCAL_DAEMON_BIN).exists(),
+    }
 }
 
 #[tauri::command]
 fn app_env() -> AppEnv {
-    AppEnv {
-        appimage: std::env::var_os("APPIMAGE").is_some(),
-        gui_version: GUI_VERSION.to_string(),
-    }
+    probe_app_env()
 }
 
-/// Install the system service from inside an AppImage by running the bundled
-/// installer as root via pkexec. The daemon binary + unit/config files ride
-/// along in the AppImage as Tauri resources (bundle.resources ->
+/// Install or update the system service from inside an AppImage by running
+/// the bundled installer as root via pkexec. The daemon binary + unit/config
+/// files ride along in the AppImage as Tauri resources (bundle.resources ->
 /// resource_dir()/payload/); the script relocates them and enables the unit.
-/// See packaging/appimage/appimage-install.sh.
+/// A re-run is an update: the script refuses to run over a package install
+/// (exit 98) and to downgrade (exit 99) — see `installer_error` and
+/// packaging/appimage/appimage-install.sh. Called by the first-run dialog and
+/// the Status tab's skew banner.
 #[tauri::command]
 async fn install_service(app: AppHandle) -> Result<(), String> {
     // Resolve the target user in-process (the desktop user running the GUI),
@@ -382,6 +425,11 @@ const PAYLOAD_FILES: [&str; 5] = [
 /// path> <sha256>]...`. Copies each staged file into a fresh ROOT-owned temp
 /// dir, verifies the sha256 of the root-owned copy, and only then executes the
 /// installer from that dir. Exit 97 = integrity mismatch.
+///
+/// This text itself must stay POSIX: `/bin/sh` is dash on Debian/Ubuntu (the
+/// AppImage's audience). The installer is bash and is run as such — not
+/// `exec`ed, so the EXIT trap still removes `$tmp`. `--force` (the installer's
+/// downgrade override) is deliberately never forwarded from here.
 const BOOTSTRAP: &str = r#"
 set -eu
 action="$1"; tgt_user="$2"; shift 2
@@ -394,7 +442,7 @@ while [ "$#" -ge 2 ]; do
     printf '%s  %s\n' "$sha" "$tmp/$base" | sha256sum -c - >/dev/null 2>&1 \
         || { printf 'integrity check failed: %s\n' "$base" >&2; exit 97; }
 done
-/bin/sh "$tmp/appimage-install.sh" "$action" "$tgt_user"
+bash "$tmp/appimage-install.sh" "$action" "$tgt_user"
 "#;
 
 /// Run the bundled appimage-install.sh as root via pkexec.
@@ -485,24 +533,43 @@ async fn run_service_script(
     if output.status.success() {
         return Ok(());
     }
-    // pkexec itself: 126 = auth dialog dismissed, 127 = not authorized — but
-    // once the program runs, the exit code is the program's, so only trust
-    // those meanings when the run produced no stderr of its own.
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(installer_error(
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stderr),
+    ))
+}
+
+/// The user-facing text for a failed installer run. pkexec itself: 126 = auth
+/// dialog dismissed, 127 = not authorized — but once the program runs, the
+/// exit code is the program's, so those meanings are only trusted when the
+/// run produced no stderr of its own. 97/98/99 are the bootstrap's and the
+/// script's own codes (integrity, package install present, downgrade).
+fn installer_error(code: Option<i32>, stderr: &str) -> String {
     let stderr = stderr.trim();
-    match output.status.code() {
-        Some(126) if stderr.is_empty() => Err("Authorization was dismissed.".to_string()),
-        Some(127) if stderr.is_empty() => {
-            Err("Authentication failed or not authorized.".to_string())
+    let detail = |msg: &str| {
+        if stderr.is_empty() {
+            msg.to_string()
+        } else {
+            format!("{msg}\n({stderr})")
         }
-        Some(97) => Err(
-            "Installer bundle failed its integrity check — re-download the AppImage.".to_string(),
+    };
+    match code {
+        Some(126) if stderr.is_empty() => "Authorization was dismissed.".to_string(),
+        Some(127) if stderr.is_empty() => "Authentication failed or not authorized.".to_string(),
+        Some(97) => {
+            "Installer bundle failed its integrity check — re-download the AppImage.".to_string()
+        }
+        Some(98) => detail(
+            "A package install of GrepFocus owns /usr/bin/grepfocusd — update it with your package manager instead of from this app.",
         ),
-        code => Err(format!(
+        Some(99) => detail(
+            "The installed service is newer than the one bundled in this app, so the installer refused to downgrade it. Use a newer AppImage.",
+        ),
+        code => format!(
             "Installer failed (exit {}): {}",
             code.unwrap_or(-1),
             stderr
-        )),
+        ),
     }
 }
 
@@ -835,8 +902,17 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{enforcement_red, GUI_VERSION};
+    use super::{
+        enforcement_red, installer_error, version, BOOTSTRAP, GUI_VERSION, LOCAL_DAEMON_BIN,
+        PACKAGED_DAEMON_BIN, PAYLOAD_FILES,
+    };
     use grepfocus_core::{Health, NftStatus};
+
+    // The packaging files this binary's constants must agree with. Test-only:
+    // the release binary must not embed them.
+    const STAGE_SCRIPT: &str = include_str!("../../../packaging/appimage/stage-payload.sh");
+    const INSTALL_SCRIPT: &str = include_str!("../../../packaging/appimage/appimage-install.sh");
+    const DEBIAN_PRERM: &str = include_str!("../../../debian/grepfocus.prerm");
 
     /// A daemon new enough to report health, everything else at rest.
     fn reporting() -> Health {
@@ -891,12 +967,110 @@ mod tests {
         assert_eq!(conf["version"], GUI_VERSION);
     }
 
+    /// The skew advice compares `GUI_VERSION` through `version::parse_version`;
+    /// a workspace version it cannot parse would silence the banner for good.
     #[test]
     fn gui_version_parses() {
-        let parts: Vec<u64> = GUI_VERSION
-            .split('.')
-            .map(|p| p.parse().expect("numeric component"))
-            .collect();
-        assert_eq!(parts.len(), 3, "MAJOR.MINOR.PATCH: {GUI_VERSION}");
+        let v = version::parse_version(GUI_VERSION).expect("MAJOR.MINOR.PATCH");
+        assert!(
+            v.pre.is_empty() && v.build.is_empty(),
+            "plain release: {GUI_VERSION}"
+        );
+    }
+
+    #[test]
+    fn installer_error_maps_pkexec_codes() {
+        assert_eq!(
+            installer_error(Some(126), ""),
+            "Authorization was dismissed."
+        );
+        assert_eq!(
+            installer_error(Some(127), "  \n"),
+            "Authentication failed or not authorized."
+        );
+        // Once the program ran, 126 is its own exit code, not pkexec's.
+        let generic = installer_error(Some(126), "bash: permission denied");
+        assert!(generic.starts_with("Installer failed (exit 126): bash: permission denied"));
+        assert!(!generic.contains("dismissed"));
+    }
+
+    #[test]
+    fn installer_error_97_integrity() {
+        let msg = installer_error(Some(97), "integrity check failed: grepfocusd");
+        assert!(msg.contains("integrity check"));
+        assert!(msg.contains("re-download"));
+    }
+
+    #[test]
+    fn installer_error_98_package_present() {
+        let msg = installer_error(Some(98), "error: /usr/bin/grepfocusd exists");
+        assert!(msg.contains("package manager"));
+        assert!(msg.ends_with("(error: /usr/bin/grepfocusd exists)"));
+        // Without stderr the message stands alone.
+        assert!(!installer_error(Some(98), "").contains('('));
+    }
+
+    #[test]
+    fn installer_error_99_downgrade() {
+        let msg = installer_error(Some(99), "refusing to downgrade grepfocusd 0.6.1 -> 0.6.0");
+        assert!(msg.contains("refused to downgrade"));
+        assert!(msg.contains("0.6.1 -> 0.6.0"));
+    }
+
+    #[test]
+    fn installer_error_other_includes_code_and_stderr() {
+        assert_eq!(
+            installer_error(Some(2), "usage: install <user> [--force] | uninstall"),
+            "Installer failed (exit 2): usage: install <user> [--force] | uninstall"
+        );
+        assert_eq!(
+            installer_error(None, "killed"),
+            "Installer failed (exit -1): killed"
+        );
+    }
+
+    /// The bootstrap runs under `pkexec /bin/sh -c`, which is dash on
+    /// Debian/Ubuntu, so it must stay POSIX; the installer is bash and must
+    /// be run as such (bash arrays and `[[` die under dash).
+    #[test]
+    fn bootstrap_runs_installer_under_bash_and_is_posix() {
+        let last = BOOTSTRAP
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .expect("non-empty bootstrap");
+        assert!(
+            last.starts_with("bash \"$tmp/appimage-install.sh\""),
+            "last line: {last}"
+        );
+        assert!(!last.starts_with("exec"), "the EXIT trap must still run");
+        assert!(!BOOTSTRAP.contains("[["));
+        assert!(!BOOTSTRAP.contains("pipefail"));
+        assert!(!BOOTSTRAP.contains("--force"));
+    }
+
+    /// Every file `run_service_script` stages must be one `stage-payload.sh`
+    /// bundles, or the AppImage build ships an installer that cannot run.
+    #[test]
+    fn payload_files_are_staged() {
+        for name in PAYLOAD_FILES {
+            assert!(
+                STAGE_SCRIPT.contains(&format!("\"$DEST/{name}\"")),
+                "{name} is not staged by stage-payload.sh"
+            );
+        }
+    }
+
+    /// The paths and exit codes `installer_error` and the skew advice rely
+    /// on are spelled out in the script and the deb maintainer script.
+    #[test]
+    fn installer_script_agrees_on_paths_and_codes() {
+        assert!(INSTALL_SCRIPT.contains(&format!("\nPACKAGED_BIN={PACKAGED_DAEMON_BIN}\n")));
+        assert!(INSTALL_SCRIPT.contains(&format!("\nBIN={LOCAL_DAEMON_BIN}\n")));
+        assert!(INSTALL_SCRIPT.contains("exit 98"));
+        assert!(INSTALL_SCRIPT.contains("exit 99"));
+        assert!(INSTALL_SCRIPT.contains("sort -V"));
+        assert!(INSTALL_SCRIPT.starts_with("#!/usr/bin/env bash\n"));
+        assert!(DEBIAN_PRERM.contains(PACKAGED_DAEMON_BIN));
     }
 }

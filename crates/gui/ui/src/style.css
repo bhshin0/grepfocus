@@ -228,6 +228,14 @@ form label > input[type="checkbox"] { width: auto; margin-right: 6px; }
 .lock-state.locked { border-color: var(--danger); color: var(--danger); }
 .lock-state.unlocked { border-color: var(--accent); color: var(--accent); }
 
+/* Status: GUI/daemon version skew card (renderUpdateBanner in main.ts). A
+   .lock-state card with the advice, an optional button row and a message
+   line; `locked` (red) marks a daemon newer than this app. */
+.update-banner p { margin: 0; }
+.update-banner .row { display: flex; gap: 8px; align-items: center; }
+.update-banner .row > button { margin-top: 8px; }
+.update-banner .msg { margin-top: 6px; }
+
 /* Unlock dialog */
 dialog {
   border: 1px solid var(--border);

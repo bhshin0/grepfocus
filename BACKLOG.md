@@ -65,11 +65,12 @@ Status: **in progress** — WP1 (core validators, `State::sanitize`, health
 wire types), WP2 (daemon + GUI input hardening, procwatch guards), WP3
 (daemon health state, `get_status.health`, `grepfocusd --version`, GUI
 pass-through), WP4 (daemon `browser_policy` module, cleanup/uninstall
-parity) and WP5 (Status-tab health banner, tray RED notification, Settings
-about/diagnostics lines, `grepfocus-gui --version`) landed on
-`hardening-health`; WP6–WP7 pending. Design record:
-`docs/plans/hardening-health-updates.md`. Pending release-note lines (the
-next `Release x.y.z` commit owns the changelog files):
+parity), WP5 (Status-tab health banner, tray RED notification, Settings
+about/diagnostics lines, `grepfocus-gui --version`) and WP6 (GUI/daemon
+skew advice, AppImage "Update system service", installer under bash with
+package/downgrade guards) landed on `hardening-health`; WP7 pending. Design
+record: `docs/plans/hardening-health-updates.md`. Pending release-note lines
+(the next `Release x.y.z` commit owns the changelog files):
 
 - The Status tab now reports enforcement problems (failed `/etc/hosts`
   write, failed or stale DoH table, tamper protection off, browser policy
@@ -90,6 +91,10 @@ next `Release x.y.z` commit owns the changelog files):
   startup and unusable legacy entries are dropped with a journal warning.
 - App blocking never kills root processes (system services, `sudo`/`pkexec`-
   launched apps) or GrepFocus itself.
+- AppImage: the Status tab offers "Update system service" when the app is
+  newer than the installed service; the installer runs under bash (fixes the
+  first-run install on Debian/Ubuntu), refuses to run over a package install
+  and refuses downgrades.
 
 ## Decisions
 

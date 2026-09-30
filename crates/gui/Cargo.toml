@@ -23,3 +23,5 @@ tauri-plugin-localhost = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
 portpicker = "0.1"
+# Already compiled into the GUI via tauri-utils; this adds a lock edge, not a crate.
+semver = "1"

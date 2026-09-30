@@ -29,6 +29,17 @@
           is rewritten only when its notices change.
         -->
         <div id="health-banner" role="status" aria-live="polite" hidden></div>
+        <!--
+          GUI/daemon version skew (renderUpdateBanner in main.ts): the one
+          banner with a pkexec button. Same sibling rule as #health-banner.
+        -->
+        <div id="update-banner" class="lock-state update-banner" hidden>
+          <p id="update-text"></p>
+          <div class="row">
+            <button type="button" id="update-action" hidden>Update system service</button>
+          </div>
+          <p id="update-msg" class="msg"></p>
+        </div>
         <div id="status-content">Loading…</div>
       </section>
 
@@ -243,11 +254,12 @@
     </dialog>
 
     <!--
-      First-run system-service installer. Shown only when the daemon is
-      unreachable — in an AppImage that means either "not installed yet" (offer
-      the pkexec installer) or, right after installing, "log out and back in"
-      for the new group membership. Package installs already set the daemon up,
-      so this never appears there. Driven from main.ts's refreshStatus.
+      Daemon-unreachable dialog (modes in main.ts's showFirstRun): "not
+      installed yet" offers the pkexec installer (AppImage only), "installed
+      but this login predates the group" asks for a relogin, and an installed
+      daemon that is not running asks for a systemctl start — with a
+      "Reinstall service" fallback when it is the AppImage's own install.
+      Driven from main.ts's refreshStatus.
     -->
     <dialog id="firstrun-dialog">
       <form id="firstrun-form" method="dialog">
@@ -255,6 +267,7 @@
         <p class="hint" id="firstrun-body"></p>
         <div class="row">
           <button type="button" id="firstrun-action">Install system service</button>
+          <button type="button" id="firstrun-secondary" class="ghost" hidden>Reinstall service</button>
         </div>
         <p id="firstrun-msg" class="msg"></p>
       </form>
