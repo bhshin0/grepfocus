@@ -1242,9 +1242,8 @@ For the next `Release x.y.z` commit (`debian/changelog`, `packaging/grepfocus.sp
 
 ## Live verification checklist (dev machine: Fedora 44, Local daemon at /usr/local/bin, Firefox rpm, Mullvad Browser rpm, Chromium rpm)
 
-Steps marked **[user]** need sudo or podman and are run by the owner; the rest
-the assistant runs (the user is in group `grepfocus`, the socket is
-`/run/grepfocus/sock`).
+Steps marked **[user]** need sudo or podman; the rest run unprivileged (the user
+is in group `grepfocus`, the socket is `/run/grepfocus/sock`).
 
 **After WP2 (hardening)**
 
@@ -1487,7 +1486,7 @@ skew banner; the RED tray notification baselines on the first poll; the
 Status-only; `xdg-utils` becomes a Recommends; the settings password does not
 gate the update-check toggle.
 
-## Hand-off note for the website session (`/home/scada/projects/grepfocus-web` — no edits planned here)
+## Hand-off note for the website repo (grepfocus-web — no edits planned here)
 
 1. **Publish `GET https://grepfocus.com/downloads/latest.json`** exactly as in
    *Shared contracts §9* — ship it with `"version": "0.5.1"` **before** the

@@ -132,7 +132,7 @@ Plan:
   service" (AppImage installs only, refused while a block runs, saved data
   kept) — see README → *Uninstalling*.
 
-### 3. Website follow-up (grepfocus-web, separate session)
+### 3. Website follow-up (grepfocus-web repo)
 
 - Fill the AppImage "Coming soon" row on /download: href, sha256, hint
   (`chmod +x && ./`), note about first-run installer prompting for the
@@ -153,7 +153,6 @@ Plan:
   touched.
 - License note: artifacts are PolyForm Shield; keep LICENSE inside the
   AppImage like the deb does (`/usr/share/doc/grepfocus/LICENSE`).
-- Commit-message policy: no AI attribution (repo CLAUDE.md).
 
 ## Order
 
