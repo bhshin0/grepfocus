@@ -1059,9 +1059,10 @@ async function refreshStatus() {
     renderAboutLine(s);
     renderHealthBanner(healthNotices(s));
     renderUpdateBanner(s.update, s.health.install_kind);
-    // Only a successful poll moves this: a daemon restart mid-block must not
-    // flash the release notice.
+    // Only a successful poll moves these: a daemon stop or restart must not
+    // flash the release notice over a block or a version skew it was hiding.
     blockActive = s.active.length > 0;
+    skewActive = s.update.kind !== "up_to_date";
     activeServerSkew = s.now_unix - Math.floor(Date.now() / 1000);
     // Premium is all-or-nothing: a valid license reveals the Stats tab, an
     // invalid/absent one hides it. This poll is the single place license
@@ -3021,6 +3022,12 @@ function serviceOlder(from: string | null, to: string): string {
     : `The GrepFocus service (${from}) is older than this app (${to})`;
 }
 
+/// The one advice answered with `DOWNLOAD_URL`: an AppImage older than a
+/// service no package owns. Decides both the copy and the "Download" button.
+function adviceOffersDownload(a: UpdateAdvice, appimage: boolean, kind: InstallKind): boolean {
+  return a.kind === "gui_outdated" && appimage && kind !== "package";
+}
+
 /// The skew card's copy. `gui_outdated` branches on how this app and the
 /// daemon were installed: a packaged app should be launched instead, an
 /// AppImage replaced, a checkout rebuilt. A pre-reporting daemon's
@@ -3048,7 +3055,7 @@ function updateAdviceText(a: UpdateAdvice, appimage: boolean, kind: InstallKind)
       if (kind === "package") {
         return `${lead}. Launch the GrepFocus that came with the package instead of this ${appimage ? "AppImage" : "build"}.`;
       }
-      if (appimage) {
+      if (adviceOffersDownload(a, appimage, kind)) {
         return `${lead}. Download the latest AppImage from ${DOWNLOAD_URL}.`;
       }
       if (kind === "local") {
@@ -3085,10 +3092,7 @@ function renderUpdateBanner(a: UpdateAdvice, kind: InstallKind) {
   updateActionEl.hidden = !offer;
   updateActionEl.disabled = false;
   updateActionEl.textContent = offer ? `Update system service to ${a.to}` : "Update system service";
-  // The one `gui_outdated` copy that names DOWNLOAD_URL — see
-  // `updateAdviceText`; a packaged daemon's copy says to launch the packaged
-  // app instead.
-  updateDownloadEl.hidden = !(a.kind === "gui_outdated" && appimage && kind !== "package");
+  updateDownloadEl.hidden = !adviceOffersDownload(a, appimage, kind);
   updateTarget = offer ? a.to : "";
   updateMsgEl.classList.remove("error");
   updateMsgEl.textContent = "";
@@ -3187,8 +3191,10 @@ const updateCheckPersistEl = document.querySelector<HTMLParagraphElement>("#upda
 
 /// A block is running, as of the last status poll that got an answer.
 let blockActive = false;
-/// The disclosure strip is up and waiting for a click; it outranks the notice.
-let disclosureOpen = false;
+/// GUI and daemon versions differ, as of the last status poll that got an
+/// answer. The skew card itself is taken down while the daemon is
+/// unreachable, so its visibility alone would let the notice through then.
+let skewActive = false;
 /// The strip has been put up this launch. It goes up once: a poll that has
 /// to repeat the acknowledgement (the call failed) must not reopen a strip
 /// the user already closed.
@@ -3203,7 +3209,9 @@ let updateNoticeKey = "";
 let updateToggleBusy = false;
 
 function renderUpdateNotice(info: UpdateInfo) {
-  if (disclosureOpen || blockActive || !updateBannerEl.hidden || info.notice === null) {
+  // `!updateBannerEl.hidden` on top of `skewActive`: a finished service
+  // update holds the card for its outcome line after the skew is gone.
+  if (blockActive || skewActive || !updateBannerEl.hidden || info.notice === null) {
     updateNoticeEl.hidden = true;
     return;
   }
@@ -3245,10 +3253,11 @@ async function refreshUpdateInfo() {
     if (info.enabled && !info.disclosed) {
       if (!disclosureShown) {
         disclosureShown = true;
-        disclosureOpen = true;
         updateDisclosureEl.hidden = false;
       }
-      // Only after the strip is up: this is what permits the first request.
+      // Only after the strip is up: this is what permits the first request,
+      // which the Rust side still holds back for a few seconds ("Turn off"
+      // inside them means it is never made).
       info = await invoke<UpdateInfo>("acknowledge_update_check");
     }
     renderUpdate(info);
@@ -3258,9 +3267,7 @@ async function refreshUpdateInfo() {
 }
 
 function closeDisclosure() {
-  disclosureOpen = false;
   updateDisclosureEl.hidden = true;
-  if (lastUpdateInfo) renderUpdateNotice(lastUpdateInfo);
 }
 
 /// The one writer of the preference (Settings toggle and the disclosure's
@@ -3310,7 +3317,9 @@ updateDisclosureOffEl.addEventListener("click", async () => {
 
 updateCheckToggle.addEventListener("change", async () => {
   const enabled = updateCheckToggle.checked;
-  if ((await setUpdateCheckEnabled(enabled)) && enabled) void runUpdateCheck();
+  // The answer, not the click, decides: without a config directory the
+  // switch stays off.
+  if ((await setUpdateCheckEnabled(enabled)) && lastUpdateInfo?.enabled) void runUpdateCheck();
 });
 
 updateCheckNowEl.addEventListener("click", () => void runUpdateCheck());

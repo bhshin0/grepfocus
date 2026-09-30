@@ -13,18 +13,18 @@
 //!
 //! Cadence: "due" means at least 24 h since the last *completed* check and
 //! at least 1 h since the last attempt. A server reply or an unusable body
-//! (404/5xx, HTML, oversize, TLS failure) completes a check and is recorded
-//! in the file; only DNS/connect/timeout/io failures are transient — they
-//! never touch the file and retry at the next hourly tick.
+//! (404/5xx, HTML, oversize, cut short, TLS failure) completes a check and is
+//! recorded in the file; only DNS/connect/timeout failures and io errors
+//! before the reply are transient — they never touch the file and retry at
+//! the next hourly tick.
 
 use std::ffi::{OsStr, OsString};
-use std::fmt;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
@@ -52,6 +52,12 @@ pub const TICK_SECS: u64 = 3600;
 pub const TICK_JITTER_SECS: u64 = 300;
 /// The on-disk format version, written always and ignored on read.
 pub const SCHEMA: u32 = 1;
+/// A release version is a dozen bytes; the cap keeps a hostile reply's
+/// `version` out of the preference file and the Settings row.
+pub const MAX_VERSION_BYTES: usize = 64;
+/// Error text kept from a fetch (persisted as `check_error`, or shown as the
+/// transient line) is cut to this many characters.
+pub const MAX_ERROR_CHARS: usize = 300;
 
 // ─── Pure: the reply ────────────────────────────────────────────────────────
 
@@ -76,6 +82,9 @@ pub fn parse_latest(body: &[u8]) -> Result<Release, String> {
         .get("version")
         .and_then(|v| v.as_str())
         .ok_or("no version field")?;
+    if raw.len() > MAX_VERSION_BYTES {
+        return Err("version field too long".to_string());
+    }
     let version = version::parse_version(raw).ok_or_else(|| format!("bad version {raw:?}"))?;
     let string_field = |key: &str| {
         obj.get(key)
@@ -97,11 +106,13 @@ pub enum FetchOutcome {
     Release(Release),
     /// 404 or 5xx: the site answered, it just has nothing for us (yet).
     NoInfo(u16),
-    /// Any other reply we cannot use: HTML, oversize, a redirect off https.
+    /// Any other reply we cannot use: HTML, oversize, a body cut short, a
+    /// redirect off https.
     Unusable(String),
     /// The handshake failed: a wrong certificate, or a middlebox.
     Tls(String),
-    /// DNS, connect, timeout, io: nothing reached the origin. Retried hourly.
+    /// DNS, connect, timeout, io before the reply: no answer from the
+    /// origin. Retried hourly.
     Unreachable(String),
 }
 
@@ -138,7 +149,8 @@ pub fn classify(err: &ureq::Error) -> FetchOutcome {
     }
 }
 
-/// An io error before or during the reply: the socket, not the site.
+/// An io error before the reply, or a timeout during it: the socket, not
+/// the site. (Other io errors after a 200 go through `classify_body`.)
 pub fn classify_io(e: &std::io::Error) -> FetchOutcome {
     use std::io::ErrorKind::*;
     let text = match e.kind() {
@@ -150,6 +162,22 @@ pub fn classify_io(e: &std::io::Error) -> FetchOutcome {
         _ => e.to_string(),
     };
     FetchOutcome::Unreachable(text)
+}
+
+/// A failure while reading the body of a 200 reply. The site has answered,
+/// so this completes the check like any other unusable reply — a body that
+/// keeps breaking must cost one GET a day, not one an hour. The exception is
+/// a timeout, which stays transient. ureq hands its own errors (timeout,
+/// protocol) through the reader wrapped in an `io::Error`; `Error::from`
+/// unwraps them.
+pub fn classify_body(e: std::io::Error) -> FetchOutcome {
+    use std::io::ErrorKind::{TimedOut, WouldBlock};
+    match ureq::Error::from(e) {
+        ureq::Error::Io(io) if !matches!(io.kind(), TimedOut | WouldBlock) => {
+            FetchOutcome::Unusable(format!("reply cut short: {io}"))
+        }
+        other => classify(&other),
+    }
 }
 
 /// TLS is enforced (including for redirects) whenever the configured URL is
@@ -200,6 +228,14 @@ pub fn fmt_when(now: u64, then: u64) -> String {
                 format!("{days} days ago")
             }
         }
+    }
+}
+
+/// `text` cut to `MAX_ERROR_CHARS` characters, with an ellipsis when cut.
+fn capped(text: String) -> String {
+    match text.char_indices().nth(MAX_ERROR_CHARS) {
+        Some((i, _)) => format!("{}…", &text[..i]),
+        None => text,
     }
 }
 
@@ -335,10 +371,25 @@ pub fn scrub_env(vars: Vec<(OsString, OsString)>, appdir: &Path) -> Vec<(OsStrin
         .collect()
 }
 
+/// Where a browser launched from an AppImage starts: the directory the
+/// user ran the AppImage from (`$OWD`, which AppRun exports before it
+/// changes into the mount), else `$HOME`, else `/` — the first that is a
+/// directory.
+fn launch_dir(env: &[(OsString, OsString)]) -> PathBuf {
+    ["OWD", "HOME"]
+        .iter()
+        .filter_map(|name| env.iter().find(|(k, _)| k == name))
+        .map(|(_, v)| PathBuf::from(v))
+        .find(|dir| dir.is_dir())
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
 /// `xdg-open <url>` with every stdio detached. Under an AppImage (`appdir`
 /// given) the child gets the scrubbed environment instead of ours; setting
 /// `PATH` on the `Command` also makes `xdg-open` itself resolve against the
-/// scrubbed list rather than the mount's `usr/bin`.
+/// scrubbed list rather than the mount's `usr/bin`. It also gets a working
+/// directory outside the mount: ours is inside it, and a browser that
+/// inherited it would keep the FUSE mount busy after the GUI quits.
 pub fn launcher(url: &str, env: Vec<(OsString, OsString)>, appdir: Option<&Path>) -> Command {
     let mut cmd = Command::new("xdg-open");
     cmd.arg(url)
@@ -346,6 +397,7 @@ pub fn launcher(url: &str, env: Vec<(OsString, OsString)>, appdir: Option<&Path>
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if let Some(appdir) = appdir {
+        cmd.current_dir(launch_dir(&env));
         let mut scrubbed = scrub_env(env, appdir);
         if !scrubbed.iter().any(|(k, _)| k == "PATH") {
             scrubbed.push((OsString::from("PATH"), OsString::from(FALLBACK_PATH)));
@@ -435,15 +487,17 @@ pub struct Loaded {
 /// re-enabling a check the user may have turned off.
 pub fn load_prefs(path: &Path) -> Loaded {
     let fail_closed = |why: String| {
+        let msg = format!(
+            "The update-check preference file could not be read ({why}); \
+             checks are off for this session — turning them on rewrites it."
+        );
         Loaded {
-        prefs: Prefs {
-            enabled: false,
-            ..Prefs::default()
-        },
-        persist_error: Some(format!(
-            "The update-check preference file could not be read ({why}); checks are off for this session — turning them on rewrites it."
-        )),
-    }
+            prefs: Prefs {
+                enabled: false,
+                ..Prefs::default()
+            },
+            persist_error: Some(msg),
+        }
     };
     match std::fs::read_to_string(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Loaded {
@@ -542,6 +596,9 @@ struct Inner {
     /// The last transient failure's line, cleared by any completed check.
     transient_error: Option<String>,
     persist_error: Option<String>,
+    /// When this launch's disclosure strip was acknowledged. In memory only:
+    /// a relaunch shows no strip and owes it no wait.
+    disclosed_at: Option<Instant>,
 }
 
 impl Inner {
@@ -644,6 +701,7 @@ impl Store {
                 checking: false,
                 transient_error: None,
                 persist_error,
+                disclosed_at: None,
             }),
         }
     }
@@ -657,20 +715,27 @@ impl Store {
     }
 
     /// The disclosure strip has been rendered; the file remembers so a
-    /// relaunch shows no strip.
+    /// relaunch shows no strip. Unforced checks hold off for
+    /// `FIRST_CHECK_DELAY` from here (see `begin_check`).
     pub fn acknowledge(&self, now: u64) -> UpdateInfo {
         let mut g = self.lock();
         if !g.prefs.disclosed {
             g.prefs.disclosed = true;
+            g.disclosed_at = Some(Instant::now());
             g.persist();
         }
         g.info(now)
     }
 
     /// Turning checks on rewrites the file, which is also how a corrupt one
-    /// (fail-closed at load) is repaired.
+    /// (fail-closed at load) is repaired. Without a config directory there
+    /// is no file to keep the choice in, so checks stay off, as the line
+    /// `open` left in `persist_error` says.
     pub fn set_enabled(&self, enabled: bool, now: u64) -> UpdateInfo {
         let mut g = self.lock();
+        if g.path.is_none() {
+            return g.info(now);
+        }
         g.prefs.enabled = enabled;
         if !enabled {
             g.transient_error = None;
@@ -695,7 +760,8 @@ impl Store {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Skip {
     Disabled,
-    /// The strip has not been rendered yet: no network contact before it.
+    /// The strip has not been rendered yet, or only just: no network
+    /// contact before it has been up for `FIRST_CHECK_DELAY`.
     Undisclosed,
     NotDue,
     InFlight,
@@ -720,7 +786,10 @@ fn begin_check(i: &mut Inner, now: u64, force: bool) -> Result<(), Skip> {
         return Err(Skip::InFlight);
     }
     if !force {
-        if !i.prefs.disclosed {
+        let strip_just_shown = i
+            .disclosed_at
+            .is_some_and(|t| t.elapsed() < FIRST_CHECK_DELAY);
+        if !i.prefs.disclosed || strip_just_shown {
             return Err(Skip::Undisclosed);
         }
         if !due(i.prefs.last_check_unix, i.last_attempt_unix, now) {
@@ -737,7 +806,10 @@ fn begin_check(i: &mut Inner, now: u64, force: bool) -> Result<(), Skip> {
 fn apply_outcome(i: &mut Inner, outcome: FetchOutcome, now: u64) -> CheckResult {
     i.checking = false;
     if let FetchOutcome::Unreachable(e) = outcome {
-        i.transient_error = Some(format!("Could not reach grepfocus.com ({e}). Will retry."));
+        i.transient_error = Some(format!(
+            "Could not reach grepfocus.com ({}). Will retry.",
+            capped(e)
+        ));
         return CheckResult::Unreachable;
     }
     i.transient_error = None;
@@ -747,7 +819,7 @@ fn apply_outcome(i: &mut Inner, outcome: FetchOutcome, now: u64) -> CheckResult 
             i.prefs.latest = Some(r);
             i.prefs.check_error = None;
         }
-        other => i.prefs.check_error = other.error_text(),
+        other => i.prefs.check_error = other.error_text().map(capped),
     }
     i.persist();
     CheckResult::Completed
@@ -777,16 +849,34 @@ pub fn run_check(
 /// feature), redirects only over https when the URL is https, 10 s
 /// overall, body capped at 64 KiB. 200 is the only status with a body we
 /// read; 404 and 5xx are "nothing published", anything else is unusable.
+///
+/// The request goes through the proxy the environment names (`ALL_PROXY`,
+/// `HTTPS_PROXY`, `HTTP_PROXY`, with `NO_PROXY` honoured), as a browser's
+/// would.
 pub fn fetch_latest(url: &str, user_agent: &str) -> FetchOutcome {
+    let agent = agent_for(url, user_agent, ureq::Proxy::try_from_env(), FETCH_TIMEOUT);
+    fetch_with(&agent, url)
+}
+
+fn agent_for(
+    url: &str,
+    user_agent: &str,
+    proxy: Option<ureq::Proxy>,
+    timeout: Duration,
+) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .https_only(https_only_for(url))
         .http_status_as_error(false)
-        .timeout_global(Some(FETCH_TIMEOUT))
+        .timeout_global(Some(timeout))
         .max_redirects(3)
         .user_agent(user_agent)
         .accept("application/json")
+        .proxy(proxy)
         .build();
-    let agent = ureq::Agent::new_with_config(config);
+    ureq::Agent::new_with_config(config)
+}
+
+fn fetch_with(agent: &ureq::Agent, url: &str) -> FetchOutcome {
     let mut resp = match agent.get(url).call() {
         Ok(r) => r,
         Err(e) => return classify(&e),
@@ -805,7 +895,7 @@ pub fn fetch_latest(url: &str, user_agent: &str) -> FetchOutcome {
         .take(MAX_BODY_BYTES as u64 + 1)
         .read_to_end(&mut body);
     if let Err(e) = read {
-        return classify_io(&e);
+        return classify_body(e);
     }
     if body.len() > MAX_BODY_BYTES {
         return FetchOutcome::Unusable(format!("reply larger than {} KiB", MAX_BODY_BYTES / 1024));
@@ -854,12 +944,15 @@ pub async fn check_now(app: &AppHandle) -> Result<UpdateInfo, String> {
 /// The disclosure strip has been rendered: record it, then run the check
 /// the launch tick had to skip when the page acknowledged later than
 /// `FIRST_CHECK_DELAY` — otherwise the first check would wait for the next
-/// hourly tick. Not forced, so it is a no-op when the tick already ran or
-/// nothing is due.
+/// hourly tick. It waits out the `FIRST_CHECK_DELAY` that `begin_check`
+/// grants a fresh strip, so "Turn off" inside that window means no request
+/// is made. Not forced, so it is a no-op when checks were turned off
+/// meanwhile, the tick already ran, or nothing is due.
 pub fn acknowledge_then_check(app: &AppHandle) -> UpdateInfo {
     let info = app.state::<Store>().acknowledge(now_unix());
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(FIRST_CHECK_DELAY).await;
         check_in_background(&app, false).await;
     });
     info
@@ -875,17 +968,6 @@ pub fn spawn_checker(app: AppHandle) {
             tokio::time::sleep(tick_delay(jitter_seed())).await;
         }
     });
-}
-
-impl fmt::Display for Skip {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Skip::Disabled => "disabled",
-            Skip::Undisclosed => "undisclosed",
-            Skip::NotDue => "not due",
-            Skip::InFlight => "in flight",
-        })
-    }
 }
 
 #[cfg(test)]
@@ -958,6 +1040,28 @@ mod tests {
         assert!(parse_latest(b"<html><body>404</body></html>").is_err());
         assert!(parse_latest(b"[]").is_err());
         assert!(parse_latest(b"").is_err());
+    }
+
+    #[test]
+    fn parse_latest_caps_the_version_length() {
+        let body = |v: &str| format!(r#"{{"version": "{v}"}}"#).into_bytes();
+        // Valid semver, but build metadata makes it longer than any release.
+        let fits = format!("0.6.0+{}", "a".repeat(MAX_VERSION_BYTES - 6));
+        assert_eq!(fits.len(), MAX_VERSION_BYTES);
+        assert_eq!(
+            parse_latest(&body(&fits)).map(|r| r.version),
+            Ok(fits.clone())
+        );
+        assert_eq!(
+            parse_latest(&body(&format!("{fits}a"))),
+            Err("version field too long".to_string())
+        );
+        // The error never echoes an oversized value back.
+        let huge = "9".repeat(60 * 1024);
+        assert_eq!(
+            parse_latest(&body(&huge)),
+            Err("version field too long".to_string())
+        );
     }
 
     #[test]
@@ -1122,7 +1226,7 @@ mod tests {
             ("APPIMAGE", "/home/u/Downloads/GrepFocus_0.5.0_amd64.AppImage".to_string()),
             ("ARGV0", "./GrepFocus_0.5.0_amd64.AppImage".to_string()),
             ("OWD", "/home/u".to_string()),
-            ("PATH", format!("{m}/usr/bin/:{m}/usr/sbin/:{m}/usr/games/:{m}/bin/:{m}/sbin/:/home/u/.local/bin:/usr/local/bin:/usr/bin")),
+            ("PATH", format!("{m}/usr/bin/:{m}/usr/sbin/:{m}/usr/games/:{m}/bin/:{m}/sbin/:{m}2/usr/bin:/home/u/.local/bin:/usr/local/bin:/usr/bin")),
             ("LD_LIBRARY_PATH", format!("{m}/usr/lib/:{m}/usr/lib/i386-linux-gnu/:{m}/usr/lib/x86_64-linux-gnu/:{m}/usr/lib32/:{m}/usr/lib64/:{m}/lib/:{m}/lib/i386-linux-gnu/:{m}/lib/x86_64-linux-gnu/:{m}/lib32/:{m}/lib64/:")),
             ("PYTHONHOME", format!("{m}/usr/")),
             ("PYTHONPATH", format!("{m}/usr/share/pyshared/:")),
@@ -1166,9 +1270,10 @@ mod tests {
                 .find(|(key, _)| key == k)
                 .map(|(_, v)| v.to_str().unwrap().to_string())
         };
+        // The sibling mount's element is another AppImage's, not ours: kept.
         assert_eq!(
             get("PATH").as_deref(),
-            Some("/home/u/.local/bin:/usr/local/bin:/usr/bin")
+            Some("/tmp/.mount_GrepFoXYZ2/usr/bin:/home/u/.local/bin:/usr/local/bin:/usr/bin")
         );
         assert_eq!(
             get("XDG_DATA_DIRS").as_deref(),
@@ -1264,6 +1369,7 @@ mod tests {
         assert_eq!(cmd.get_program(), "xdg-open");
         assert_eq!(cmd.get_args().collect::<Vec<_>>(), [url]);
         assert_eq!(cmd.get_envs().count(), 0);
+        assert_eq!(cmd.get_current_dir(), None);
         // AppImage: cleared and re-set from the scrub, PATH among them.
         let cmd = launcher(
             url,
@@ -1287,7 +1393,7 @@ mod tests {
             .map(|(_, v)| v.clone());
         assert_eq!(
             path.as_deref(),
-            Some("/home/u/.local/bin:/usr/local/bin:/usr/bin")
+            Some("/tmp/.mount_GrepFoXYZ2/usr/bin:/home/u/.local/bin:/usr/local/bin:/usr/bin")
         );
         assert!(envs.iter().all(|(_, v)| !v.contains("mount_GrepFoXYZ/")));
         // With no PATH of the user's own, a sane default is supplied.
@@ -1305,6 +1411,32 @@ mod tests {
             .and_then(|(_, v)| v)
             .map(|v| v.to_string_lossy().into_owned());
         assert_eq!(path.as_deref(), Some(FALLBACK_PATH));
+        // Neither $OWD nor $HOME in that environment: the root directory.
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
+    }
+
+    #[test]
+    fn launcher_leaves_the_mount() {
+        let url = "https://grepfocus.com/changelog";
+        let appdir = Path::new("/tmp/.mount_GrepFoXYZ");
+        let owd = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let env = |owd: &Path, home: &Path| -> Vec<(OsString, OsString)> {
+            vec![
+                (OsString::from("OWD"), owd.as_os_str().to_os_string()),
+                (OsString::from("HOME"), home.as_os_str().to_os_string()),
+            ]
+        };
+        // Where the user started the AppImage from.
+        let cmd = launcher(url, env(owd.path(), home.path()), Some(appdir));
+        assert_eq!(cmd.get_current_dir(), Some(owd.path()));
+        // That directory is gone (or was never exported): the home directory.
+        let gone = owd.path().join("gone");
+        let cmd = launcher(url, env(&gone, home.path()), Some(appdir));
+        assert_eq!(cmd.get_current_dir(), Some(home.path()));
+        // Neither exists.
+        let cmd = launcher(url, env(&gone, &gone), Some(appdir));
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
     }
 
     // ── the preference file ──
@@ -1436,6 +1568,15 @@ mod tests {
     fn store_without_config_dir_is_off() {
         let store = Store::open(None, DEFAULT_URL.to_string(), "0.5.1", false);
         let info = store.info(0);
+        assert!(!info.enabled);
+        assert!(info.persist_error.unwrap().contains("No config directory"));
+        assert_eq!(
+            run_check(&store, 0, true, |_, _| panic!("no fetch")),
+            CheckResult::Skipped(Skip::Disabled)
+        );
+        // The toggle cannot turn on what cannot be remembered: the state and
+        // the line that explains it stay as they were.
+        let info = store.set_enabled(true, 0);
         assert!(!info.enabled);
         assert!(info.persist_error.unwrap().contains("No config directory"));
         assert_eq!(
@@ -1649,6 +1790,56 @@ mod tests {
     }
 
     #[test]
+    fn run_check_caps_error_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, path) = store_in(dir.path(), "0.5.1");
+        disclosed(&store);
+        let long = "é".repeat(5000);
+        run_check(&store, D, false, |_, _| {
+            FetchOutcome::Unusable(long.clone())
+        });
+        let kept = on_disk(&path).unwrap().check_error.unwrap();
+        assert_eq!(kept.chars().count(), MAX_ERROR_CHARS + 1);
+        assert!(kept.starts_with("unexpected reply from grepfocus.com (é"));
+        assert!(kept.ends_with("é…"));
+        run_check(&store, 2 * D, false, |_, _| {
+            FetchOutcome::Unreachable(long.clone())
+        });
+        let status = store.info(2 * D).status;
+        assert!(status.starts_with("Could not reach grepfocus.com (é"));
+        assert!(status.ends_with("é…). Will retry."));
+        assert!(status.chars().count() < MAX_ERROR_CHARS + 60);
+        // A short text is left alone.
+        assert_eq!(capped("connection failed".to_string()), "connection failed");
+    }
+
+    #[test]
+    fn disclosure_grace_holds_unforced_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = store_in(dir.path(), "0.5.1");
+        let ok = |_: &str, _: &str| FetchOutcome::Release(release("0.5.1"));
+        store.acknowledge(D);
+        // The strip went up a moment ago: the launch tick must wait...
+        assert_eq!(
+            run_check(&store, D, false, |_, _| panic!("inside the grace")),
+            CheckResult::Skipped(Skip::Undisclosed)
+        );
+        // ...and "Turn off" inside the window means no request at all.
+        store.set_enabled(false, D);
+        assert_eq!(
+            run_check(&store, D, false, |_, _| panic!("turned off")),
+            CheckResult::Skipped(Skip::Disabled)
+        );
+        store.set_enabled(true, D);
+        // Once the strip has been up for FIRST_CHECK_DELAY the check runs.
+        store.lock().disclosed_at = Instant::now().checked_sub(FIRST_CHECK_DELAY);
+        assert_eq!(run_check(&store, D, false, ok), CheckResult::Completed);
+        // "Check now" never waits for it.
+        store.lock().disclosed_at = Some(Instant::now());
+        assert_eq!(run_check(&store, D, true, ok), CheckResult::Completed);
+    }
+
+    #[test]
     fn run_check_in_flight_is_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let (store, _) = store_in(dir.path(), "0.5.1");
@@ -1692,6 +1883,12 @@ mod tests {
         (url, handle)
     }
 
+    /// `fetch_latest` minus the environment's proxy, which would swallow a
+    /// loopback URL on a machine that has one configured.
+    fn fetch_direct(url: &str, user_agent: &str) -> FetchOutcome {
+        fetch_with(&agent_for(url, user_agent, None, FETCH_TIMEOUT), url)
+    }
+
     fn http_reply(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
         let mut reply = format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1708,7 +1905,7 @@ mod tests {
             "notes_url": "https://grepfocus.com/changelog"}"#;
         let (url, server) = serve_once(http_reply("200 OK", "application/json", body));
         assert_eq!(
-            fetch_latest(&url, &user_agent("0.5.1")),
+            fetch_direct(&url, &user_agent("0.5.1")),
             FetchOutcome::Release(release("0.6.0"))
         );
         let head = server.join().unwrap().to_ascii_lowercase();
@@ -1726,25 +1923,25 @@ mod tests {
     fn fetch_latest_classifies_replies() {
         for (status, code) in [("404 Not Found", 404), ("503 Service Unavailable", 503)] {
             let (url, server) = serve_once(http_reply(status, "text/html", b"<html>nope</html>"));
-            assert_eq!(fetch_latest(&url, "t"), FetchOutcome::NoInfo(code));
+            assert_eq!(fetch_direct(&url, "t"), FetchOutcome::NoInfo(code));
             server.join().unwrap();
         }
         let (url, server) = serve_once(http_reply("403 Forbidden", "text/plain", b"no"));
         assert_eq!(
-            fetch_latest(&url, "t"),
+            fetch_direct(&url, "t"),
             FetchOutcome::Unusable("HTTP 403".to_string())
         );
         server.join().unwrap();
 
         let (url, server) = serve_once(http_reply("200 OK", "text/html", b"<html>hi</html>"));
         assert!(
-            matches!(fetch_latest(&url, "t"), FetchOutcome::Unusable(e) if e.starts_with("not JSON"))
+            matches!(fetch_direct(&url, "t"), FetchOutcome::Unusable(e) if e.starts_with("not JSON"))
         );
         server.join().unwrap();
 
         let (url, server) = serve_once(http_reply("200 OK", "application/json", b"{}"));
         assert_eq!(
-            fetch_latest(&url, "t"),
+            fetch_direct(&url, "t"),
             FetchOutcome::Unusable("no version field".to_string())
         );
         server.join().unwrap();
@@ -1752,10 +1949,78 @@ mod tests {
         let big = vec![b' '; 300 * 1024];
         let (url, server) = serve_once(http_reply("200 OK", "application/json", &big));
         assert_eq!(
-            fetch_latest(&url, "t"),
+            fetch_direct(&url, "t"),
             FetchOutcome::Unusable("reply larger than 64 KiB".to_string())
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_latest_broken_body_completes_the_check() {
+        // A 200 whose body stops short of its Content-Length.
+        let cut = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"version\":".to_vec();
+        let (url, server) = serve_once(cut);
+        assert!(
+            matches!(fetch_direct(&url, "t"), FetchOutcome::Unusable(e) if e.starts_with("reply cut short")),
+        );
+        server.join().unwrap();
+        // A 200 whose chunked framing is not chunked framing.
+        let bad = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nzz\r\n{}\r\n".to_vec();
+        let (url, server) = serve_once(bad);
+        assert!(matches!(fetch_direct(&url, "t"), FetchOutcome::Unusable(_)));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn fetch_latest_stalled_body_is_a_timeout() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/latest.json", listener.local_addr().unwrap());
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{",
+            );
+            // Hold the connection open, silent, until the client gives up.
+            let _ = wait.recv();
+        });
+        let agent = agent_for(&url, "t", None, Duration::from_millis(300));
+        assert_eq!(
+            fetch_with(&agent, &url),
+            FetchOutcome::Unreachable(format!("timed out after {} s", FETCH_TIMEOUT.as_secs()))
+        );
+        drop(done);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn classify_body_unwraps_ureq_errors() {
+        use std::io::{Error, ErrorKind};
+        // A plain socket error after the 200: the reply is unusable.
+        assert_eq!(
+            classify_body(Error::new(ErrorKind::UnexpectedEof, "Peer disconnected")),
+            FetchOutcome::Unusable("reply cut short: Peer disconnected".to_string())
+        );
+        assert!(matches!(
+            classify_body(Error::from(ErrorKind::ConnectionReset)),
+            FetchOutcome::Unusable(_)
+        ));
+        // A timeout, bare or wrapped by ureq's reader, stays transient.
+        let timeout =
+            FetchOutcome::Unreachable(format!("timed out after {} s", FETCH_TIMEOUT.as_secs()));
+        assert_eq!(classify_body(Error::from(ErrorKind::TimedOut)), timeout);
+        assert_eq!(
+            classify_body(ureq::Error::Timeout(ureq::Timeout::Global).into_io()),
+            timeout
+        );
+        // Any other ureq error that surfaces through the reader completes.
+        assert!(matches!(
+            classify_body(ureq::Error::BodyExceedsLimit(1).into_io()),
+            FetchOutcome::Unusable(_)
+        ));
     }
 
     #[test]
@@ -1765,7 +2030,7 @@ mod tests {
         let url = format!("http://{}/latest.json", listener.local_addr().unwrap());
         drop(listener);
         assert_eq!(
-            fetch_latest(&url, "t"),
+            fetch_direct(&url, "t"),
             FetchOutcome::Unreachable("connection failed".to_string())
         );
     }

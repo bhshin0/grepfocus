@@ -374,7 +374,10 @@ query string and no cookies, just the User-Agent `GrepFocus/<version>
 host. The daemon is not involved.
 
 - **Disclosure and opt-out.** The first launch shows a one-line notice on
-  the Status tab before the first request is made ("Got it" / "Turn off").
+  the Status tab ("Got it" / "Turn off") a few seconds before the first
+  request is made. It is a notice, not a prompt: the check does not wait
+  for a click, so "Turn off" prevents that first request only when clicked
+  within those seconds and otherwise stops the later ones.
   The switch is in Settings ("Check grepfocus.com once a day…"), per user
   and not behind the settings password; "Check now" beside it runs a check
   on demand and the line next to it reports the last outcome.
@@ -398,6 +401,9 @@ host. The daemon is not involved.
   grepfocus.com pages through `xdg-open` (the packages recommend
   `xdg-utils`); no other address is ever opened. Without `xdg-open` the
   button reports the link to open by hand.
+- **Proxies.** The request follows the standard proxy environment
+  variables (`ALL_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`, with `NO_PROXY`
+  honoured) when the GUI is started with them set.
 - **Mirrors and testing.** `GREPFOCUS_UPDATE_URL` replaces the address for
   that launch; an `http://` URL is accepted for a local stub.
 

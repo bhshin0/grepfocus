@@ -75,11 +75,6 @@ Recommends). Design record: `docs/plans/hardening-health-updates.md` — its
 live verification checklist is still to be run. Pending release-note lines
 (the next `Release x.y.z` commit owns the changelog files):
 
-- The Status tab now reports enforcement problems (failed `/etc/hosts`
-  write, failed or stale DoH table, tamper protection off, browser policy
-  failures, instant-break proxy) with a desktop notification on a new
-  failure; the Settings tab shows the app and service versions plus a
-  diagnostics line; `grepfocusd --version` and `grepfocus-gui --version`.
 - Browsers' DNS-over-HTTPS is now switched off through standard
   enterprise-policy files (Firefox, Mullvad Browser, Chromium, Chrome, Brave)
   so blocks apply in them; those browsers show a "managed by your
@@ -87,6 +82,11 @@ live verification checklist is still to be run. Pending release-note lines
   GrepFocus is installed (Mullvad Browser then uses the OS resolver instead
   of Mullvad DNS); `grepfocusd cleanup` or uninstalling restores the files.
   Downgrading: remove the files first (README → Recovery).
+- The Status tab now reports enforcement problems (failed `/etc/hosts`
+  write, failed or stale DoH table, tamper protection off, browser policy
+  failures, instant-break proxy) with a desktop notification on a new
+  failure; the Settings tab shows the app and service versions plus a
+  diagnostics line; `grepfocusd --version` and `grepfocus-gui --version`.
 - Block content is validated: domains must be hostnames (URLs are trimmed to
   the hostname; IP literals, wildcards and single labels are refused), app
   matchers must be well-formed and may not target GrepFocus itself, a block
@@ -265,6 +265,13 @@ to be redone when the item is picked up.
   saved"), and the next launch starts from the defaults: checks on, the
   disclosure strip shown again. A file that exists but cannot be read
   fails closed; a directory that never accepts the file cannot.
+- **Release-check disclosure is a notice, not a prompt** — the first
+  request goes out about 3 s after the strip is shown, clicked or not
+  (README → *Update notifications* says so); "Turn off" is a refusal only
+  inside that window. Holding the first request until "Got it" would make
+  it a real choice, at the price of never checking where the strip is
+  ignored. Owner decision, tied to open question 3 of
+  `docs/plans/hardening-health-updates.md` (default on vs opt-in).
 - **`min_supported` / `security` flag in `latest.json`** — the contract
   carries `version` only, so a dismissed release stays dismissed even when
   it fixes a bypass. A flag the client treats as undismissable (and a

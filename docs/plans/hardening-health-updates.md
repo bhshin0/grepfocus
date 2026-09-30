@@ -1,7 +1,7 @@
 # Hardening, health signals, browser DoH policies and update paths — implementation plan
 
-Status: **implemented** (2026-09-30; live verification pending — see the
-checklist below). Designed 2026-09-28 and written against commit
+Status: **implemented — live verification pending** (2026-09-30) — see the
+checklist below. Designed 2026-09-28 and written against commit
 `3dff97e` on branch `hardening-health` (same HEAD as `release-0.5.1`, clean tree).
 Line references are as of that commit — treat symbols as authoritative, lines as
 hints. Five item designs (browser DoH policies, input hardening, health signals,
@@ -22,7 +22,7 @@ leaves `./scripts/check.sh` green and is shippable on its own):
 | 4 | daemon `browser_policy` module, unit comment, cleanup parity | `5bb072a` |
 | 5 | GUI health banner, tray RED notification, about/diagnostics line, error-state fixes | `0eb67a2` |
 | 6 | GUI/daemon skew advice + AppImage "Update system service" | `a10589b` |
-| 7 | daily update check, Settings toggle, `open_url`, website hand-off | the commit that adds `crates/gui/src/update.rs` (it cannot name its own hash) |
+| 7 | daily update check, Settings toggle, `open_url`, website hand-off | `a53899a` |
 
 ## Context
 
@@ -1038,9 +1038,14 @@ Depends on: WP5 (`GUI_VERSION`, strips' CSS), WP6 (`version.rs`, `#update-banner
 after launch when due (short GNOME sessions still check), hourly tick with 0-5
 min jitter; "due" = ≥24 h since the last *completed* check and ≥1 h since the
 last attempt; a server reply or unusable body (404/5xx/HTML/oversize/TLS
-failure) completes a check, only DNS/connect/timeout/io retry hourly. The
+failure, a 200 whose body is cut short) completes a check, only
+DNS/connect/timeout and io errors before the reply retry hourly. `version` is
+refused beyond 64 bytes and stored error text is cut to 300 characters. The
 one-time disclosure strip renders before the first network contact (`disclosed`
-flag; "Got it" / "Turn off"). State file per §5; fail-closed on a corrupt or
+flag; "Got it" / "Turn off"); unforced checks wait 3 s from the
+acknowledgement, so "Turn off" inside that window means no request at all.
+With no config directory the toggle cannot be turned on. State file per §5;
+fail-closed on a corrupt or
 unreadable existing file (checks off for the session with a dedicated line;
 toggling on rewrites it); persist errors are a separate field and line, never
 mixed with fetch errors. `dismiss_update` takes no argument (dismisses the
@@ -1051,7 +1056,10 @@ such as `PYTHONHOME`, `GTK_EXE_PREFIX`, `GDK_PIXBUF_MODULE_FILE`,
 `WEBKIT_EXEC_PATH` and anything containing `$APPDIR` removed; `APPDIR`,
 `APPIMAGE`, `ARGV0`, `OWD`, `GTK_THEME`, `GDK_BACKEND`, `PYTHONDONTWRITEBYTECODE`
 removed unconditionally); `xdg-open` resolves against the scrubbed `PATH`
-because `PATH` is set on the `Command`. `fetch` is injected into `run_check`
+because `PATH` is set on the `Command`, and under an AppImage it starts in
+`$OWD` (else `$HOME`, else `/`) so a browser it launches does not pin the
+FUSE mount through its working directory. The request honours the proxy
+environment variables (ureq's default). `fetch` is injected into `run_check`
 so the cadence/state machine is unit-tested without the network. Exact status
 texts: `Not checked yet.` · `Checked {when}: up to date ({ver}).` · `Checked
 {when}: GrepFocus {latest} is available.` · `Checked {when}: grepfocus.com has
@@ -1387,10 +1395,11 @@ the assistant runs (the user is in group `grepfocus`, the socket is
    `"notes_url": "https://grepfocus.com/changelog"`; `python3 -m http.server
    8099 --directory $SCRATCH/latest &`.
 3. `rm -f ~/.config/grepfocus/update-check.json; GREPFOCUS_UPDATE_URL=http://127.0.0.1:8099/latest.json
-   cargo run -p grepfocus-gui` → the disclosure strip renders first; within
-   ~3 s one GET with UA `GrepFocus/0.5.1 (linux)`; next poll shows "GrepFocus
+   cargo run -p grepfocus-gui` → the disclosure strip renders first; ~3 s
+   later one GET with UA `GrepFocus/0.5.1 (linux)`; next poll shows "GrepFocus
    9.9.9 is available — you have 0.5.1."; file has `disclosed:true`, mode
-   0600, dir 0700. "Got it" hides the strip; relaunch → no strip.
+   0600, dir 0700. "Got it" hides the strip; relaunch → no strip. Repeat
+   with a fresh file and click "Turn off" inside the 3 s → no GET at all.
 4. Short session: relaunch and quit after ~5 s → exactly one GET; relaunch
    within 24 h → no GET.
 5. Settings: "Check now" → immediate GET, row "Checked just now: GrepFocus
@@ -1414,9 +1423,10 @@ the assistant runs (the user is in group `grepfocus`, the socket is
     `dist/grepfocus.AppImage` with the env override → notice carries the
     "Update system service" sentence; "What's new" (Firefox closed) →
     `tr '\0' '\n' < /proc/$(pgrep -n firefox)/environ | grep -cE 'mount_|PYTHONHOME'`
-    == 0, `XDG_DATA_DIRS` still starts with the flatpak export dirs, `PATH`
-    has no `mount_`; the skew banner's "Download" button opens
-    `https://grepfocus.com/download`.
+    == 0, `XDG_DATA_DIRS` still contains the flatpak export dirs in their
+    original order and no `mount_` entry, `PATH` has no `mount_`, and
+    `readlink /proc/$(pgrep -n firefox)/cwd` is not under `/tmp/.mount_`; the
+    skew banner's "Download" button opens `https://grepfocus.com/download`.
 11. Real endpoint, after the website ships `latest.json` = 0.5.1: run without
     the override → "Checked just now: up to date (0.5.1)".
 12. **[user]** `sudo ./packaging/upgrade.sh`; relaunch from the desktop entry;
