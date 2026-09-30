@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Privileged installer for the AppImage build: first run AND update. Run as
-# root BY the GUI's `install_service` command, via a pkexec'd bootstrap:
+# Privileged installer for the AppImage build: first run, update AND removal.
+# Run as root BY the GUI, via a pkexec'd bootstrap — `install_service` (the
+# first-run dialog, the Status tab's update banner) and `uninstall_service`
+# (Settings' "Remove system service"):
 #
 #     bash <root-tmp>/appimage-install.sh <action> <user>
 #
@@ -18,9 +20,23 @@
 # an older payload unless --force. A unit the admin customised is saved as
 # .bak before being replaced — use a drop-in instead.
 #
-# Exit codes: 0 ok · 2 usage · 98 a package install owns grepfocusd ·
-# 99 would downgrade (97 = payload integrity, raised by the bootstrap). The
-# GUI maps these in `installer_error` (crates/gui/src/main.rs).
+# The downgrade guard has to run the payload's `grepfocusd --version` from the
+# temp dir it was staged into. Where that dir does not allow execution (/tmp
+# mounted noexec, or an exec-restricting policy) the guard cannot compare
+# anything: it says so on stderr and the install goes ahead unchecked — the
+# binary runs fine once copied to /usr/local/bin. Whether it is the dir or
+# the payload is settled by running a copy of bash from the same dir: a
+# payload that cannot be executed where bash can (corrupt, wrong
+# architecture), or that runs but reports no version, is refused (exit 1).
+#
+# `uninstall` stops the service, runs `grepfocusd cleanup` and only then
+# deletes the binary and unit. A cleanup that fails ends the run (exit 1) with
+# nothing deleted: the binary is what a retry needs, and the GUI reports
+# "removed" on exit 0.
+#
+# Exit codes: 0 ok · 1 any other failure · 2 usage · 98 a package install
+# owns grepfocusd · 99 would downgrade (97 = payload integrity, raised by the
+# bootstrap). The GUI maps these in `installer_error` (crates/gui/src/main.rs).
 #
 # It does ONLY the system-side steps the RPM %post / packaging/install.sh do —
 # it never builds. It CANNOT run from the AppImage mount: that mount is
@@ -59,23 +75,59 @@ refuse_over_package() {
     fi
 }
 
-# Both binaries print "grepfocusd X.Y.Z"; a daemon too old to know --version
-# prints usage and exits non-zero, which reads as "no current version" and
-# lets the install proceed (it is older than any payload that gets here).
+# Prints the version a grepfocusd binary reports: both binaries print
+# "grepfocusd X.Y.Z". Prints nothing when it ran but said anything else — a
+# daemon too old to know --version prints usage and exits non-zero, which
+# reads as "no current version" and lets the install proceed (it is older than
+# any payload that gets here). A pre-release suffix is "anything else" too:
+# `sort -V` would rank 0.6.0-rc1 above 0.6.0. Returns 126, the shell's status
+# for a file it found but could not execute, and leaves it to the caller to
+# tell a directory that forbids execution from a binary that cannot run.
 version_of() {
-    local out
-    out=$("$1" --version 2>/dev/null) || return 0
-    printf '%s\n' "${out#grepfocusd }"
+    local out rc=0
+    local re='^grepfocusd ([0-9]+\.[0-9]+\.[0-9]+)$'
+    out=$("$1" --version 2>/dev/null) || rc=$?
+    if (( rc == 126 )); then
+        return 126
+    fi
+    if (( rc == 0 )) && [[ "$out" =~ $re ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    fi
+}
+
+# Whether files in $PAYLOAD can be executed at all, tried with a copy of the
+# running bash: a binary known to run on this machine. False too when the
+# probe cannot be made — the caller then skips its check instead of blaming
+# the payload.
+payload_dir_allows_exec() {
+    local probe="$PAYLOAD/exec-probe" rc=0
+    cp -- "$BASH" "$probe" 2>/dev/null && chmod 0755 "$probe" || rc=126
+    if (( rc == 0 )); then
+        "$probe" -c : 2>/dev/null || rc=$?
+    fi
+    rm -f "$probe"
+    (( rc != 126 ))
 }
 
 # Refuse to replace a newer service with an older payload. Releases are plain
 # MAJOR.MINOR.PATCH, so `sort -V` agrees with the GUI's semver compare.
 refuse_downgrade() {
-    local new cur newest
+    local new cur newest rc=0
     chmod 0755 "$PAYLOAD/grepfocusd"
-    new=$(version_of "$PAYLOAD/grepfocusd")
+    new=$(version_of "$PAYLOAD/grepfocusd") || rc=$?
+    if (( rc == 126 )); then
+        if payload_dir_allows_exec; then
+            echo "error: the bundled grepfocusd cannot be executed (corrupt, or built for another architecture?)" >&2
+            exit 1
+        fi
+        # Not the payload's fault and not a reason to refuse: only the
+        # comparison is lost, `install` below puts the binary where it runs.
+        echo "warning: cannot execute files in $PAYLOAD (a noexec mount, or a policy that restricts execution) — downgrade check skipped" >&2
+        echo "==> Installing grepfocusd (bundled version not checked)"
+        return 0
+    fi
     if [[ -z "$new" ]]; then
-        echo "error: the bundled grepfocusd does not report a version" >&2
+        echo "error: the bundled grepfocusd does not report a plain X.Y.Z version" >&2
         exit 1
     fi
     cur=$([[ -x "$BIN" ]] && version_of "$BIN" || true)
@@ -137,8 +189,17 @@ do_uninstall() {
     echo "==> Stopping and disabling grepfocusd"
     systemctl disable --now grepfocusd.service || true
     # Tear down enforcement (immutable /etc/hosts bit, nftables, browser DoH
-    # policies) while the binary still exists.
-    [[ -x "$BIN" ]] && timeout --kill-after=5 30 "$BIN" cleanup || true
+    # policies) while the binary still exists. It exits non-zero when the
+    # managed /etc/hosts region could not be removed or the daemon is still
+    # running; deleting the binary then would strand what is still enforced.
+    if [[ -x "$BIN" ]]; then
+        local rc=0
+        timeout --kill-after=5 30 "$BIN" cleanup || rc=$?
+        if (( rc != 0 )); then
+            echo "error: \`grepfocusd cleanup\` failed (status $rc), so nothing was deleted. The service may be stopped: \`sudo systemctl enable --now grepfocusd\` brings it back, \`sudo $BIN cleanup\` retries the teardown (README: Recovery)." >&2
+            exit 1
+        fi
+    fi
     echo "==> Removing files"
     rm -f "$BIN" "$UNIT" \
           /usr/lib/sysusers.d/grepfocus.conf \

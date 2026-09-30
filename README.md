@@ -2,8 +2,8 @@
 
 A Cold Turkey-style website and application blocker for Linux.
 
-> **Status:** v0.1 in active development. Daemon and Tauri GUI scaffolds
-> both compile and run. End-to-end testing on a real install is the next step.
+> **Status:** released — installers (rpm, deb, AppImage, AUR) are at [grepfocus.com/download](https://grepfocus.com/download).\
+> **Licence:** [PolyForm Shield 1.0.0](LICENSE) — source available (see [License](#license)).
 
 ## What it does
 
@@ -49,13 +49,19 @@ When a block is active, GrepFocus:
 crates/
   core/      shared types, IPC framing, HMAC helpers
   daemon/    grepfocusd binary
-  gui/       Tauri app (planned)
+  gui/       Tauri app (Rust shell in src/, TypeScript UI in ui/)
 packaging/
   systemd/   grepfocusd.service unit
-  install.sh dev installer
+  install.sh, upgrade.sh, uninstall.sh   dev scripts for a source checkout
+  grepfocus.spec, build-*.sh, aur/, appimage/   rpm, deb, AUR and AppImage packaging
+debian/      deb packaging
 ```
 
-## Build and install (Fedora)
+## Build and install from source (Fedora)
+
+Most people want a packaged installer from
+[grepfocus.com/download](https://grepfocus.com/download); this section is
+for building from a checkout.
 
 Prerequisites:
 
@@ -74,7 +80,7 @@ Build and install the full product — daemon + systemd unit, GUI binary,
 app-grid launcher, icon, and login autostart entry:
 
 ```bash
-git clone <repo> grepfocus && cd grepfocus
+git clone https://github.com/bhshin0/grepfocus.git && cd grepfocus
 sudo ./packaging/install.sh
 # log out and back in for `grepfocus` group membership to take effect
 ```
@@ -193,18 +199,74 @@ dev mode against a local stub instead of the site:
 GREPFOCUS_UPDATE_URL=http://127.0.0.1:8099/latest.json cargo run -p grepfocus-gui
 ```
 
+## Uninstalling
+
+- **rpm / deb / AUR:** remove the `grepfocus` package with your package
+  manager. Its removal script stops the service and runs `grepfocusd
+  cleanup` before the files go.
+- **AppImage:** Settings → *System service* → **Remove system service**,
+  then delete the AppImage file. Deleting the file alone leaves the root
+  service installed and enforcing. The button asks for confirmation and
+  your password, then runs the same pkexec installer with `uninstall`: the
+  service is stopped and disabled, `grepfocusd cleanup` tears down
+  enforcement and removes or restores the browser DoH policy files, and the
+  daemon binary and its unit are deleted. It is shown only when the
+  AppImage's own installer put the service there (never over a package
+  install), it honours the settings password, and — like every other path
+  in the app — it will not end a block early: while a block or a pomodoro
+  session is running it refuses. To reinstall, run the AppImage again; it
+  offers to install the service.
+
+  The button needs the service to answer. If it does not (the app says
+  "Service not running"), or the AppImage file is already gone, the same
+  steps from a terminal:
+
+  ```bash
+  sudo systemctl disable --now grepfocusd
+  # If cleanup reports a FAILED step, stop here and see Recovery below.
+  sudo /usr/local/bin/grepfocusd cleanup
+  sudo rm -f /usr/local/bin/grepfocusd /etc/systemd/system/grepfocusd.service \
+      /usr/lib/sysusers.d/grepfocus.conf /usr/lib/tmpfiles.d/grepfocus.conf
+  sudo systemctl daemon-reload
+  ```
+
+  Unlike the button, these end a running block (see
+  [Known limits](#known-limits): root is out of the threat model).
+- **Source checkout:** `sudo ./packaging/uninstall.sh` (see
+  [Recovery](#recovery)).
+
+Package removal and the AppImage button keep your saved blocks, schedules,
+usage stats, license and settings password in `/var/lib/grepfocus` and
+`/etc/grepfocus`, so a reinstall picks up where you left off. Deleting that
+data is a terminal step, never a button. `sudo grepfocusd cleanup --purge`
+deletes both directories; it needs the service stopped and the binary still
+present, so run it before removing a package (or, in the AppImage terminal
+steps above, in place of the plain `cleanup`). After the AppImage button the
+binary is already gone — delete the same two directories by hand
+(`sudo rm -rf /var/lib/grepfocus /etc/grepfocus`), but look first:
+`sudo ls /var/lib/grepfocus/policies`. A `.orig` file left there is the copy
+of a browser policy file from before GrepFocus that `cleanup` did not put
+back, and possibly the only one — restore it as [Recovery](#recovery) shows,
+or decide you do not need it, before deleting anything (after a failed
+restore `cleanup --purge` refuses to purge for the same reason).
+`uninstall.sh` asks, or takes `--purge`. The `grepfocus` group is left in
+place by everything but `uninstall.sh --purge` (`sudo groupdel grepfocus`
+removes it).
+
 ## Wire protocol
 
 The daemon listens on a Unix socket. Each frame is a 4-byte big-endian
-unsigned length followed by JSON. Methods:
+unsigned length followed by JSON. The core methods (breaks, schedules, the
+settings password, licensing, settings, usage stats and pomodoro have their
+own — `Request` in `crates/core/src/lib.rs` is the full list):
 
 | Method            | Params                                | Notes                                        |
 | ----------------- | ------------------------------------- | -------------------------------------------- |
 | `list_blocks`     | —                                     |                                              |
 | `add_block`       | `{ block: Block }`                    | Returns `{ result: "added", id }`            |
-| `update_block`    | `{ block: Block }`                    | Rejected during an active block              |
+| `update_block`    | `{ block: Block }`                    | Rejected while that block is active          |
 | `delete_block`    | `{ id: u64 }`                         | Rejected if block is currently active        |
-| `start_block`     | `{ id: u64, duration_secs: u64 }`     | Rejected if any block is already active      |
+| `start_block`     | `{ id: u64, duration_secs: u64 }`     | Rejected if that block is already active     |
 | `cancel_block`    | —                                     | Always rejected while a block is active      |
 | `get_status`      | —                                     | Active blocks, server time, license, settings, plus `health` (daemon version, install kind, nft/hosts/proxy state, browser DoH policies, drift counters, last error) |
 
@@ -246,7 +308,7 @@ used to log and forget, plus its identity. What a healthy daemon emits:
 
 ```json
 "health": {
-  "daemon_version": "0.5.1",
+  "daemon_version": "0.6.0",
   "daemon_exe": "/usr/local/bin/grepfocusd",
   "install_kind": "local",
   "nft":   {"kind": "ok"},
@@ -315,8 +377,9 @@ sudo grepfocusd cleanup [--purge] [--force]
 policy files stay in place until `grepfocusd cleanup` or an uninstall
 removes them, so a stopped daemon still leaves Firefox and Chromium saying
 "managed by your organization" with DoH off. Downgrading to a release that
-predates the policies (0.5.x) has the same effect: that daemon's `cleanup`
-does not know the files, so run the manual commands below first.
+predates the policies (anything before 0.6.0) has the same effect: that
+daemon's `cleanup` does not know the files, so run the manual commands below
+first.
 
 If the binaries are already gone, everything GrepFocus enforces can be
 undone by hand:
@@ -476,7 +539,9 @@ that Cold Turkey beats either.
   uninstall lockout was considered and deliberately rejected: root is out
   of the threat model (see above), and never bricking a machine beats
   fighting root. `uninstall.sh` and `grepfocusd cleanup` tear down
-  enforcement during an active block without complaint.
+  enforcement during an active block without complaint. The AppImage's
+  *Remove system service* button is the exception: it is a GUI path, so it
+  refuses while a block is running (see [Uninstalling](#uninstalling)).
 - **No tray icon on stock GNOME.** GNOME ships no StatusNotifier host, so
   the tray icon needs an extension such as "AppIndicator and
   KStatusNotifierItem Support". Without one, closing the window quits the

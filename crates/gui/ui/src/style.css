@@ -358,6 +358,26 @@ dialog .row { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
 #about { margin-top: 20px; border-top: 1px solid var(--border); padding-top: 10px; }
 #about .hint { margin: 4px 0; overflow-wrap: anywhere; }
 
+/* Settings: "System service" (AppImage installs only), set off like #about. */
+#service-section { margin-top: 20px; border-top: 1px solid var(--border); padding-top: 10px; }
+#service-section h3 { margin: 0 0 4px; font-size: 14px; }
+
+/* Its confirmation dialog: a list of consequences needs more than the 360px
+   default, and the confirm button is the destructive one. */
+#service-remove-dialog { max-width: 460px; }
+#service-remove-dialog p { margin: 0; }
+.dialog-list { margin: 0; padding-left: 18px; font-size: 13px; display: grid; gap: 6px; }
+button.danger {
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid var(--danger);
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+button.danger:disabled { opacity: 0.5; cursor: not-allowed; }
+
 /* Challenge dialog: wider than the 360px default so a 40-char string can
    breathe on one or two lines. */
 #challenge-dialog { max-width: 460px; }

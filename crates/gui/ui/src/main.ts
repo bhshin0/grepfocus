@@ -1052,8 +1052,10 @@ function renderAboutLine(s: Status | null) {
 async function refreshStatus() {
   try {
     const s = await invoke<Status>("get_status");
-    // Reaching the daemon means any first-run installer prompt is now moot.
+    // Reaching the daemon means any first-run installer prompt is now moot,
+    // and so is "the service was removed": something is answering again.
     hideFirstRun();
+    serviceRemoved = false;
     // Before the no-active-block early return below: a failed teardown must
     // show above "No active block", not vanish with it.
     renderAboutLine(s);
@@ -1095,11 +1097,11 @@ async function refreshStatus() {
     statusEl.innerHTML = "";
     const p = document.createElement("p");
     if (installBusy) {
-      // The installer is restarting the service: this connect failure is
-      // expected and momentary, not a fault to paint red. The skew banner
-      // keeps its progress line.
+      // The installer is restarting the service (or the removal is stopping
+      // it): this connect failure is expected, not a fault to paint red. The
+      // skew banner keeps its progress line.
       p.className = "msg";
-      p.textContent = "Restarting service…";
+      p.textContent = removingService ? "Removing service…" : "Restarting service…";
     } else {
       p.className = "msg error";
       p.textContent = String(e);
@@ -2020,6 +2022,9 @@ async function refreshSettings() {
   // Before the daemon round trip: the update-check row is GUI-local and must
   // be current even when the daemon is down.
   void refreshUpdateInfo();
+  renderServiceSection();
+  serviceMsgEl.classList.remove("error");
+  serviceMsgEl.textContent = "";
   try {
     const s = await invoke<Status>("get_status");
     // Reflect current preferences. Setting `.checked` in code does not fire a
@@ -2779,17 +2784,20 @@ function emptyLi(text: string): HTMLLIElement {
   return li;
 }
 
-// ─── System-service installer: first run, service down, update ───────────────
+// ─── System-service installer: first run, service down, update, removal ──────
 //
 // The daemon-unreachable dialog and the Status-tab skew banner share one
 // installer path (`installServiceAndWait`, the only `install_service` caller)
-// and one busy flag. The dialog is shown when the daemon is unreachable: "not
-// installed yet" offers the pkexec installer (AppImage only — a package GUI
-// has no payload), "installed but this login predates the group" asks for a
-// relogin, and an installed daemon that is not running asks for a systemctl
-// start, with "Reinstall service" as the fallback when the install is the
-// AppImage's own. A non-AppImage run with no daemon binary anywhere keeps the
-// per-tab error, which already names install.sh.
+// and one busy flag, which Settings' "Remove system service" takes too. The
+// dialog is shown when the daemon is unreachable: "not installed yet" offers
+// the pkexec installer (AppImage only — a package GUI has no payload),
+// "installed but this login predates the group" asks for a relogin, and an
+// installed daemon that is not running asks for a systemctl start, with
+// "Reinstall service" as the fallback when the install is the AppImage's own.
+// After a removal from Settings the same dialog says so ("removed") instead
+// of offering the first-run install as if nothing had happened. A
+// non-AppImage run with no daemon binary anywhere keeps the per-tab error,
+// which already names install.sh.
 
 interface AppEnv {
   appimage: boolean;
@@ -2811,15 +2819,24 @@ const firstRunMsg = document.querySelector<HTMLElement>("#firstrun-msg")!;
 const firstRunAction = document.querySelector<HTMLButtonElement>("#firstrun-action")!;
 const firstRunSecondary = document.querySelector<HTMLButtonElement>("#firstrun-secondary")!;
 
-type FirstRunMode = "install" | "relogin" | "packaged" | "stopped";
+type FirstRunMode = "install" | "relogin" | "packaged" | "stopped" | "removed";
 let firstRunMode: FirstRunMode | null = null;
 // True while an install click owns the UI (pkexec in flight or waiting for
-// the fresh daemon to answer), from either the dialog or the skew banner.
-// Blocks the background status poll's error handler from resetting the dialog
-// mid-flow — a poll landing between "install finished" and "daemon accepting
-// connections" would otherwise flip the dialog back to the install screen —
-// and keeps the poll from repainting the skew banner under a click.
+// the fresh daemon to answer), from either the dialog or the skew banner, and
+// while a removal from Settings is in flight. Blocks the background status
+// poll's error handler from resetting the dialog mid-flow — a poll landing
+// between "install finished" and "daemon accepting connections" would
+// otherwise flip the dialog back to the install screen, and one landing
+// mid-removal would pop "service not running" — and keeps the poll from
+// repainting the skew banner under a click.
 let installBusy = false;
+// The busy flag is held by a removal, not an install: picks the Status tab's
+// progress word.
+let removingService = false;
+// "Remove system service" succeeded in this session. While it stands, an
+// unreachable daemon with no binary left is the expected end state, not a
+// first run. Cleared by the first poll that gets an answer.
+let serviceRemoved = false;
 
 // Esc must not dismiss this into an unusable app.
 firstRunDialog.addEventListener("cancel", (ev) => ev.preventDefault());
@@ -2864,6 +2881,12 @@ function showFirstRun(mode: FirstRunMode) {
       firstRunSecondary.hidden = !reinstall;
       break;
     }
+    case "removed":
+      firstRunTitle.textContent = "Service removed";
+      firstRunBody.textContent =
+        "The GrepFocus system service has been removed and blocking is off. Your saved blocks, schedules, stats and license are still in /var/lib/grepfocus and /etc/grepfocus. To finish, quit GrepFocus (Quit in its tray icon's menu; with no tray icon, closing the window quits) and delete the AppImage file. To keep using GrepFocus, reinstall the service: you'll be asked to authorize with your password, and DNS-over-HTTPS is switched off in your browsers again.";
+      firstRunAction.textContent = "Reinstall system service";
+      break;
   }
   if (!firstRunDialog.open) firstRunDialog.showModal();
 }
@@ -2873,24 +2896,37 @@ function hideFirstRun() {
   if (firstRunDialog.open) firstRunDialog.close();
 }
 
-// Classify a daemon-unreachable error and show the right dialog state. The
-// error strings come from crates/gui/src/client.rs; only the two connect-class
-// failures pick a mode — a deserialize or protocol error is a daemon we DID
-// reach, and never opens the dialog.
+/// Which dialog mode a failed daemon call asks for; null leaves the dialog
+/// alone. The error strings come from crates/gui/src/client.rs; only the two
+/// connect-class failures pick a mode — a deserialize or protocol error is a
+/// daemon we DID reach, and never opens the dialog. `removed` is
+/// `serviceRemoved`: with no binary left it turns "not installed yet" into
+/// "you just removed it"; once a reinstall has put a binary back the ordinary
+/// modes apply again.
+function unreachableMode(msg: string, env: AppEnv | null, removed: boolean): FirstRunMode | null {
+  // Socket exists but we lack group membership — installed, needs relogin.
+  if (msg.includes("not allowed to talk")) return "relogin";
+  if (!msg.includes("daemon is not running")) return null;
+  // Nothing listening on the socket: which binary exists says whether that
+  // is "not installed" or "installed but stopped".
+  if (env?.packaged_daemon) return "packaged";
+  if (env?.local_daemon) return "stopped";
+  if (env?.appimage) return removed ? "removed" : "install";
+  // Non-AppImage, no daemon binary: leave the per-tab error.
+  return null;
+}
+
 function handleDaemonUnreachable(err: unknown) {
-  if (installBusy) return; // the install flow owns the dialog right now
-  const msg = String(err);
-  if (msg.includes("not allowed to talk")) {
-    // Socket exists but we lack group membership — installed, needs relogin.
-    showFirstRun("relogin");
-  } else if (msg.includes("daemon is not running")) {
-    // Nothing listening on the socket: which binary exists says whether that
-    // is "not installed" or "installed but stopped".
-    if (appEnv?.packaged_daemon) showFirstRun("packaged");
-    else if (appEnv?.local_daemon) showFirstRun("stopped");
-    else if (appEnv?.appimage) showFirstRun("install");
-    // Otherwise (non-AppImage, no daemon binary): leave the per-tab error.
-  }
+  if (installBusy) return; // the install or removal flow owns the UI right now
+  // A removal that failed after stopping the service leaves its error in the
+  // confirmation dialog; opening "service not running" over it would hide
+  // the one line that says why. The next poll after it closes gets here.
+  if (serviceRemoveDialog.open) return;
+  const mode = unreachableMode(String(err), appEnv, serviceRemoved);
+  // The dialog already says this: showing it again would wipe its message
+  // line, and an installer error must outlive the next 5 s poll.
+  if (mode === null || (firstRunDialog.open && firstRunMode === mode)) return;
+  showFirstRun(mode);
 }
 
 /// Poll the daemon until it answers, the socket denies us (needs relogin), or
@@ -2926,13 +2962,14 @@ async function installServiceAndWait(
     report(String(e), true);
     return "error";
   }
-  // The binaries on disk just changed; the dialog's mode picker and the skew
-  // advice read them from here.
+  // The binaries on disk just changed; the dialog's mode picker, the skew
+  // advice and Settings' "System service" section read them from here.
   try {
     appEnv = await invoke<AppEnv>("app_env");
   } catch {
     // Keep the boot-time answer.
   }
+  renderServiceSection();
   report("Service installed — waiting for it to start…");
   return waitForDaemon(waitMs);
 }
@@ -2952,6 +2989,9 @@ async function runFirstRunInstall() {
         // Already in the grepfocus group (e.g. reinstall) — done, no relogin.
         hideFirstRun();
         refreshStatus();
+        // A reinstall after "Remove system service" ends on the Settings tab,
+        // whose lock line was read from the daemon that is gone.
+        if (settingsTabVisible()) void refreshSettings();
         break;
       case "denied":
         // Fresh install: usermod ran but this login predates it.
@@ -2975,8 +3015,8 @@ async function runFirstRunInstall() {
   }
 }
 
-firstRunAction.addEventListener("click", () => {
-  if (firstRunMode === "install") {
+firstRunAction.addEventListener("click", async () => {
+  if (firstRunMode === "install" || firstRunMode === "removed") {
     void runFirstRunInstall();
     return;
   }
@@ -2984,11 +3024,140 @@ firstRunAction.addEventListener("click", () => {
   // now — re-poll; success hides the dialog.
   firstRunMsg.classList.remove("error");
   firstRunMsg.textContent = "Checking…";
-  refreshStatus();
+  await refreshStatus();
+  // Still open in the same mode: nothing re-showed the dialog, so the
+  // progress word is ours to take down.
+  if (firstRunDialog.open && firstRunMsg.textContent === "Checking…") {
+    firstRunMsg.textContent = "";
+  }
 });
 
 firstRunSecondary.addEventListener("click", () => {
   void runFirstRunInstall();
+});
+
+// ─── Settings: remove the system service (AppImage installs) ─────────────────
+//
+// The daemon an AppImage installs is a root service that outlives the
+// AppImage file; this is its one in-app way out. The pkexec'd script is the
+// installer's `uninstall` (stop and disable the unit, `grepfocusd cleanup`,
+// delete binary and unit; saved data stays). Removing the service ends every
+// block, so it is refused while one runs — by `serviceRemovalRefusal` before
+// the confirmation and again by the Rust command right before the script.
+
+const settingsSection = document.querySelector<HTMLElement>("#settings")!;
+const serviceSectionEl = document.querySelector<HTMLDivElement>("#service-section")!;
+const serviceRemoveEl = document.querySelector<HTMLButtonElement>("#service-remove")!;
+const serviceMsgEl = document.querySelector<HTMLParagraphElement>("#service-msg")!;
+const serviceRemoveDialog = document.querySelector<HTMLDialogElement>("#service-remove-dialog")!;
+const serviceRemoveConfirmEl = document.querySelector<HTMLButtonElement>("#service-remove-confirm")!;
+const serviceRemoveCancelEl = document.querySelector<HTMLButtonElement>("#service-remove-cancel")!;
+const serviceRemoveMsgEl = document.querySelector<HTMLParagraphElement>("#service-remove-msg")!;
+
+/// The section is for the service this AppImage installed: running as an
+/// AppImage, a daemon at /usr/local/bin, and none at /usr/bin — a package's
+/// daemon is the package manager's to remove (the script refuses it, exit 98).
+function serviceRemovalOffered(env: AppEnv | null): boolean {
+  return env !== null && env.appimage && env.local_daemon && !env.packaged_daemon;
+}
+
+/// Why the service may not be removed right now, null when it may. Mirrors
+/// the two running-block sentences of `removal_refusal` in src/main.rs, which
+/// has the last word — change together.
+function serviceRemovalRefusal(s: Status): string | null {
+  if (s.pomodoro != null) {
+    return "A pomodoro session is running — the service cannot be removed until it ends.";
+  }
+  if (s.active.length > 0) {
+    return "A block is running — the service cannot be removed until it ends.";
+  }
+  return null;
+}
+
+function renderServiceSection() {
+  serviceSectionEl.hidden = !serviceRemovalOffered(appEnv);
+}
+
+function settingsTabVisible(): boolean {
+  return settingsSection.classList.contains("active");
+}
+
+function serviceError(text: string) {
+  serviceMsgEl.classList.add("error");
+  serviceMsgEl.textContent = text;
+}
+
+serviceRemoveEl.addEventListener("click", async () => {
+  serviceMsgEl.classList.remove("error");
+  serviceMsgEl.textContent = "";
+  if (installBusy) return;
+  if (!(await ensureUnlocked())) return;
+  let s: Status;
+  try {
+    s = await invoke<Status>("get_status");
+  } catch (e) {
+    // Without an answer there is no telling whether a block is running.
+    serviceError(String(e));
+    return;
+  }
+  const refusal = serviceRemovalRefusal(s);
+  if (refusal !== null) {
+    serviceError(refusal);
+    return;
+  }
+  serviceRemoveMsgEl.classList.remove("error");
+  serviceRemoveMsgEl.textContent = "";
+  serviceRemoveConfirmEl.disabled = false;
+  serviceRemoveCancelEl.disabled = false;
+  if (!serviceRemoveDialog.open) serviceRemoveDialog.showModal();
+  // showModal() focuses the first button, which is the destructive one: a
+  // stray Enter must land on Cancel.
+  serviceRemoveCancelEl.focus();
+});
+
+serviceRemoveCancelEl.addEventListener("click", () => serviceRemoveDialog.close());
+// Esc closes it like Cancel, but not from under a running removal.
+serviceRemoveDialog.addEventListener("cancel", (ev) => {
+  if (removingService) ev.preventDefault();
+});
+
+serviceRemoveConfirmEl.addEventListener("click", async () => {
+  if (installBusy) return;
+  installBusy = true;
+  removingService = true;
+  serviceRemoveConfirmEl.disabled = true;
+  serviceRemoveCancelEl.disabled = true;
+  serviceRemoveMsgEl.classList.remove("error");
+  serviceRemoveMsgEl.textContent = "Removing… authorize when prompted.";
+  try {
+    try {
+      await invoke("uninstall_service");
+    } catch (e) {
+      // A running block, a dismissed prompt or the script's own error: the
+      // text is `removal_refusal`'s or `installer_error`'s.
+      serviceRemoveMsgEl.classList.add("error");
+      serviceRemoveMsgEl.textContent = String(e);
+      serviceRemoveConfirmEl.disabled = false;
+      serviceRemoveCancelEl.disabled = false;
+      return;
+    }
+    serviceRemoved = true;
+    // Still under the busy flag: a poll landing before the binary probe is
+    // refreshed would read the stale "installed" answer and say "stopped".
+    try {
+      appEnv = await invoke<AppEnv>("app_env");
+    } catch {
+      if (appEnv) appEnv = { ...appEnv, local_daemon: false };
+    }
+    serviceRemoveDialog.close();
+    renderServiceSection();
+    showFirstRun("removed");
+  } finally {
+    installBusy = false;
+    removingService = false;
+  }
+  // Repaint the tabs behind the dialog for a daemon that is gone.
+  refreshStatus();
 });
 
 // ─── Status tab: GUI/daemon version skew banner ──────────────────────────────

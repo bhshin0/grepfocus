@@ -175,6 +175,19 @@
           <p id="about-line" class="hint"></p>
           <p id="health-diag" class="hint"></p>
         </div>
+
+        <!--
+          AppImage installs only (serviceRemovalOffered in main.ts): the
+          service this app installed outlives the AppImage file, so this is
+          where it is taken off the machine again. Never shown over a package
+          install — the package manager owns that daemon.
+        -->
+        <div id="service-section" hidden>
+          <h3>System service</h3>
+          <p class="hint">This AppImage installed the background service that enforces blocks. Deleting the AppImage file does not remove it — remove the service here first.</p>
+          <button type="button" id="service-remove" class="ghost">Remove system service…</button>
+          <p id="service-msg" class="msg"></p>
+        </div>
       </section>
 
       <section id="license" class="tab">
@@ -287,12 +300,36 @@
     </dialog>
 
     <!--
+      Confirmation for Settings' "Remove system service" (main.ts). Says what
+      the pkexec'd uninstall does before it asks for the password; stays open
+      while it runs, and on failure to show the installer's message.
+    -->
+    <dialog id="service-remove-dialog">
+      <form id="service-remove-form" method="dialog">
+        <h3>Remove the system service?</h3>
+        <p>You'll be asked to authorize with your password. Then:</p>
+        <ul class="dialog-list">
+          <li>Blocking stops: the GrepFocus service (grepfocusd) and its systemd unit are removed from this computer.</li>
+          <li>The browser DNS-over-HTTPS policy files are removed, or put back as they were before GrepFocus — restart your browsers once afterwards.</li>
+          <li>Your saved blocks, schedules, stats, license and settings password are kept, in /var/lib/grepfocus and /etc/grepfocus.</li>
+        </ul>
+        <p class="hint">To reinstall, run the AppImage again — it offers to install the service.</p>
+        <div class="row">
+          <button type="button" id="service-remove-confirm" class="danger">Remove system service</button>
+          <button type="button" id="service-remove-cancel" class="ghost">Cancel</button>
+        </div>
+        <p id="service-remove-msg" class="msg"></p>
+      </form>
+    </dialog>
+
+    <!--
       Daemon-unreachable dialog (modes in main.ts's showFirstRun): "not
       installed yet" offers the pkexec installer (AppImage only), "installed
       but this login predates the group" asks for a relogin, and an installed
       daemon that is not running asks for a systemctl start — with a
       "Reinstall service" fallback when it is the AppImage's own install.
-      Driven from main.ts's refreshStatus.
+      "removed" is where "Remove system service" ends: it says so and offers
+      the installer again. Driven from main.ts's refreshStatus.
     -->
     <dialog id="firstrun-dialog">
       <form id="firstrun-form" method="dialog">

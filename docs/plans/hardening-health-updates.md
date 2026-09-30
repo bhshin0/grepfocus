@@ -418,6 +418,19 @@ ghost `#firstrun-secondary` "Reinstall service" button for `stopped`, and the
 one-sentence DoH-policy disclosure appended to the `install` body (WP4; the WP6
 refactor keeps it).
 
+**Added after WP7 (2026-09-30):** Settings ends with `#service-section`
+("System service", after `#about`), shown only when `appEnv.appimage &&
+appEnv.local_daemon && !appEnv.packaged_daemon`. Its "Remove system service"
+button runs the existing `uninstall_service` command behind the settings
+password, a refusal while a block or pomodoro session runs (frontend
+`serviceRemovalRefusal`, and again in the Rust command: `removal_refusal`)
+and the `#service-remove-dialog` confirmation, holding `installBusy` for the
+duration. Success sets the frontend's `serviceRemoved` flag (cleared by the
+first poll that gets an answer), which adds a fifth first-run mode,
+`removed` — "Service removed" with a "Reinstall system service" action that
+enters `runFirstRunInstall` — in place of `install`. This is not the dropped
+`#service-row`: there is still no same-version reinstall button in Settings.
+
 ### 12. Deploy-skew rule
 
 `Response::Status` gains a field the GUI pattern-matches exhaustively, so daemon
@@ -987,7 +1000,8 @@ relaunch; if this notice stays, ./packaging/upgrade.sh"; AppImage → download
 from `DOWNLOAD_URL`). Installer exit codes: 0 ok · 2 usage · 97 integrity
 (BOOTSTRAP) · 98 package install owns grepfocusd · 99 would downgrade
 (`--force` is CLI-only; BOOTSTRAP never forwards it) · 126/127 pkexec only when
-stderr is empty. A daemon restart (SIGTERM) loses in-memory-only state — unlock
+stderr is empty or opens with pkexec's own "Error executing command as another
+user:" line (it prints one on dismissal and on "Not authorized"). A daemon restart (SIGTERM) loses in-memory-only state — unlock
 window, pending break challenges, unflushed kill counts — exactly as
 `upgrade.sh` does today; the banner says "settings relock".
 
@@ -996,7 +1010,8 @@ window, pending break challenges, unflushed kill counts — exactly as
 (`0.10.0 > 0.9.9`), `compare_unparseable_is_none`, one `advise_*` per row,
 `advise_daemon_newer_never_offers_install`, `advise_empty_daemon_version_is_pre_reporting`,
 `advice_wire_shape`. main.rs — `installer_error_maps_pkexec_codes` (126/127
-empty stderr; 126 with stderr → generic), `_97_integrity`, `_98_package_present`,
+empty stderr; 126 with stderr → generic), `_reads_pkexec_refusal_lines` (the
+real pkexec strings; "No authentication agent found." → generic), `_97_integrity`, `_98_package_present`,
 `_99_downgrade`, `_other_includes_code_and_stderr`;
 `bootstrap_runs_installer_under_bash_and_is_posix` (last non-empty BOOTSTRAP
 line starts with `bash "$tmp/appimage-install.sh"`; BOOTSTRAP contains neither
@@ -1435,11 +1450,17 @@ the assistant runs (the user is in group `grepfocus`, the socket is
 
 ## Open questions (decisions only the owner can make)
 
+All three were decided by the owner on 2026-09-30; each question is kept as
+asked, with the decision under it.
+
 1. **Release number.** 0.5.2 or 0.6.0? Recommendation: 0.6.0 — a new wire
    field, three behaviour changes (root processes never killed, block needs
    content, entries canonicalized), a privacy-relevant DoH-off policy and a
    daily network check. It fixes the changelog lines, the live-checklist
    numbers and the AppImage filename the website advertises.
+
+   **DECIDED (owner, 2026-09-30): 0.6.0.** 0.5.0 and 0.5.1 are never
+   released separately; everything on this branch ships as one 0.6.0.
 2. **DoH-off privacy stance.** Policies switch DoH off in every covered browser
    for as long as GrepFocus is installed, not only during blocks — Mullvad
    Browser users lose Mullvad DNS. Ship v1 without an opt-out toggle (disclose
@@ -1447,9 +1468,15 @@ the assistant runs (the user is in group `grepfocus`, the socket is
    feedback), or add `Settings.browser_policies: bool` now (core + GUI +
    `set_settings` surface, and a "not attempted" state)? Recommendation: no
    toggle in v1.
+
+   **DECIDED (owner, 2026-09-30): no opt-out toggle in v1.** The DoH-off
+   policies ship unconditionally, disclosed as listed above.
 3. **Update check default.** Default ON with the one-time disclosure strip
    (designed), or default OFF/opt-in (no strip needed, but almost nobody
    would ever learn about a release)? Recommendation: ON with the strip.
+
+   **DECIDED (owner, 2026-09-30): default ON** with the one-time disclosure
+   strip, as designed.
 
 Everything else raised by the five designs is decided above: Chromium/Firefox
 snap and Chrome/Brave targets ship unverified and flagged; Flatpak Firefox is

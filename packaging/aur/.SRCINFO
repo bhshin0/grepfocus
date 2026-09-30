@@ -14,6 +14,7 @@ pkgbase = grepfocus
 	depends = libsoup3
 	depends = nftables
 	depends = libayatana-appindicator
+	optdepends = xdg-utils: open grepfocus.com links from the app
 	source = grepfocus-0.5.1.tar.gz::https://github.com/bhshin0/grepfocus/archive/refs/tags/v0.5.1.tar.gz
 	sha256sums = SKIP
 

@@ -404,12 +404,78 @@ async fn install_service(app: AppHandle) -> Result<(), String> {
     // Resolve the target user in-process (the desktop user running the GUI),
     // not from the frontend — the script usermod's them into the grepfocus group.
     let user = std::env::var("USER").unwrap_or_default();
-    run_service_script(&app, "install", Some(user)).await
+    run_service_script(&app, ServiceAction::Install, Some(user)).await
 }
 
+/// Remove the system service the AppImage's installer put there: the script
+/// stops and disables the unit, runs `grepfocusd cleanup` (hosts region,
+/// nftables, browser DoH policies) and deletes the binary and unit. Saved
+/// data in /var/lib/grepfocus and /etc/grepfocus stays. Called by the
+/// Settings tab's "Remove system service".
+///
+/// The daemon is asked first, here and not only in the frontend: a block or
+/// a pomodoro session refuses the removal (from the GUI this would be the
+/// cancel the daemon never grants) even when it started while the
+/// confirmation dialog was open, and so does a daemon that cannot be asked.
+/// A schedule that fires while the polkit prompt is up is not caught.
 #[tauri::command]
 async fn uninstall_service(app: AppHandle) -> Result<(), String> {
-    run_service_script(&app, "uninstall", None).await
+    let status = client::call(Request::GetStatus {}).await.map_err(|e| {
+        format!(
+            "The service is not answering, so GrepFocus cannot tell whether a block is running — nothing was removed.\n({e})"
+        )
+    })?;
+    match status {
+        Response::Status {
+            active,
+            pomodoro,
+            password_set,
+            unlocked,
+            ..
+        } => {
+            let locked = password_set && !unlocked;
+            if let Some(why) = removal_refusal(!active.is_empty(), pomodoro.is_some(), locked) {
+                return Err(why.to_string());
+            }
+        }
+        Response::Error { message } => return Err(message),
+        other => return Err(format!("unexpected response: {other:?}")),
+    }
+    run_service_script(&app, ServiceAction::Uninstall, None).await
+}
+
+/// Why the system service may not be removed right now, `None` when it may.
+/// The two running-block sentences are also `serviceRemovalRefusal` in
+/// ui/src/main.ts, which asks before it opens the confirmation dialog —
+/// change together. The settings lock is prompted for there
+/// (`ensureUnlocked`); here it only catches an unlock that lapsed since.
+fn removal_refusal(block_active: bool, pomodoro: bool, locked: bool) -> Option<&'static str> {
+    if pomodoro {
+        Some("A pomodoro session is running — the service cannot be removed until it ends.")
+    } else if block_active {
+        Some("A block is running — the service cannot be removed until it ends.")
+    } else if locked {
+        Some("Settings are locked — unlock them, then remove the service.")
+    } else {
+        None
+    }
+}
+
+/// What the privileged installer script is asked to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServiceAction {
+    Install,
+    Uninstall,
+}
+
+impl ServiceAction {
+    /// The script's first argument (its `case "$ACTION"` arms).
+    fn arg(self) -> &'static str {
+        match self {
+            ServiceAction::Install => "install",
+            ServiceAction::Uninstall => "uninstall",
+        }
+    }
 }
 
 // The daily release check (see update.rs). Every command but `open_url`
@@ -508,7 +574,7 @@ bash "$tmp/appimage-install.sh" "$action" "$tgt_user"
 /// execution is caught, closing the classic user-writable-path race.
 async fn run_service_script(
     app: &AppHandle,
-    action: &str,
+    action: ServiceAction,
     user: Option<String>,
 ) -> Result<(), String> {
     let payload_dir = app
@@ -523,7 +589,6 @@ async fn run_service_script(
         ));
     }
 
-    let action = action.to_string();
     let output =
         tauri::async_runtime::spawn_blocking(move || -> Result<std::process::Output, String> {
             use std::os::unix::fs::PermissionsExt;
@@ -564,7 +629,7 @@ async fn run_service_script(
                     .arg("-c")
                     .arg(BOOTSTRAP)
                     .arg("sh")
-                    .arg(&action)
+                    .arg(action.arg())
                     .arg(user.as_deref().unwrap_or(""));
                 for (path, hash) in &pairs {
                     cmd.arg(path).arg(hash);
@@ -583,18 +648,34 @@ async fn run_service_script(
         return Ok(());
     }
     Err(installer_error(
+        action,
         output.status.code(),
         &String::from_utf8_lossy(&output.stderr),
     ))
 }
 
+/// How pkexec opens the one stderr line it prints when it refuses before
+/// running anything; the rest of the line is the reason.
+const PKEXEC_REFUSAL: &str = "Error executing command as another user:";
+
+/// pkexec's reason for refusing, when `stderr` opens with its own line.
+fn pkexec_refusal(stderr: &str) -> Option<&str> {
+    let reason = stderr.lines().next()?.strip_prefix(PKEXEC_REFUSAL)?;
+    Some(reason.trim())
+}
+
 /// The user-facing text for a failed installer run. pkexec itself: 126 = auth
 /// dialog dismissed, 127 = not authorized — but once the program runs, the
 /// exit code is the program's, so those meanings are only trusted when the
-/// run produced no stderr of its own. 97/98/99 are the bootstrap's and the
-/// script's own codes (integrity, package install present, downgrade).
-fn installer_error(code: Option<i32>, stderr: &str) -> String {
+/// run left stderr empty or opening with pkexec's own refusal line (it
+/// prints one for both). Any other pkexec reason — no authentication agent
+/// — falls through with its text. 97/98/99 are the bootstrap's and the
+/// script's own codes (integrity, package install present, downgrade); the
+/// script raises 99 for `install` only. `action` picks the wording where
+/// "update it" or "installer" would be wrong for a removal.
+fn installer_error(action: ServiceAction, code: Option<i32>, stderr: &str) -> String {
     let stderr = stderr.trim();
+    let pkexec = pkexec_refusal(stderr);
     let detail = |msg: &str| {
         if stderr.is_empty() {
             msg.to_string()
@@ -602,20 +683,31 @@ fn installer_error(code: Option<i32>, stderr: &str) -> String {
             format!("{msg}\n({stderr})")
         }
     };
-    match code {
-        Some(126) if stderr.is_empty() => "Authorization was dismissed.".to_string(),
-        Some(127) if stderr.is_empty() => "Authentication failed or not authorized.".to_string(),
-        Some(97) => {
+    match (code, action) {
+        (Some(126), _) if stderr.is_empty() || pkexec == Some("Request dismissed") => {
+            "Authorization was dismissed.".to_string()
+        }
+        (Some(127), _) if stderr.is_empty() || pkexec == Some("Not authorized") => {
+            "Authentication failed or not authorized.".to_string()
+        }
+        (Some(97), _) => {
             "Installer bundle failed its integrity check — re-download the AppImage.".to_string()
         }
-        Some(98) => detail(
+        (Some(98), ServiceAction::Install) => detail(
             "A package install of GrepFocus owns /usr/bin/grepfocusd — update it with your package manager instead of from this app.",
         ),
-        Some(99) => detail(
+        (Some(98), ServiceAction::Uninstall) => detail(
+            "A package install of GrepFocus owns /usr/bin/grepfocusd — remove it with your package manager instead of from this app.",
+        ),
+        (Some(99), _) => detail(
             "The installed service is newer than the one bundled in this app, so the installer refused to downgrade it. Use a newer AppImage.",
         ),
-        code => format!(
-            "Installer failed (exit {}): {}",
+        (code, action) => format!(
+            "{} (exit {}): {}",
+            match action {
+                ServiceAction::Install => "Installer failed",
+                ServiceAction::Uninstall => "Removing the service failed",
+            },
             code.unwrap_or(-1),
             stderr
         ),
@@ -975,8 +1067,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        enforcement_red, installer_error, version, BOOTSTRAP, GUI_VERSION, LOCAL_DAEMON_BIN,
-        PACKAGED_DAEMON_BIN, PAYLOAD_FILES,
+        enforcement_red, installer_error, removal_refusal, version, ServiceAction, BOOTSTRAP,
+        GUI_VERSION, LOCAL_DAEMON_BIN, PACKAGED_DAEMON_BIN, PAYLOAD_FILES,
     };
     use grepfocus_core::{Health, NftStatus};
 
@@ -1052,39 +1144,103 @@ mod tests {
 
     #[test]
     fn installer_error_maps_pkexec_codes() {
-        assert_eq!(
-            installer_error(Some(126), ""),
-            "Authorization was dismissed."
-        );
-        assert_eq!(
-            installer_error(Some(127), "  \n"),
-            "Authentication failed or not authorized."
-        );
+        for action in [ServiceAction::Install, ServiceAction::Uninstall] {
+            assert_eq!(
+                installer_error(action, Some(126), ""),
+                "Authorization was dismissed."
+            );
+            assert_eq!(
+                installer_error(action, Some(127), "  \n"),
+                "Authentication failed or not authorized."
+            );
+        }
         // Once the program ran, 126 is its own exit code, not pkexec's.
-        let generic = installer_error(Some(126), "bash: permission denied");
+        let generic = installer_error(ServiceAction::Install, Some(126), "bash: permission denied");
         assert!(generic.starts_with("Installer failed (exit 126): bash: permission denied"));
         assert!(!generic.contains("dismissed"));
     }
 
+    /// pkexec does not refuse silently: the strings are the ones in polkit's
+    /// pkexec, newline and "incident" trailer included.
+    #[test]
+    fn installer_error_reads_pkexec_refusal_lines() {
+        const DISMISSED: &str = "Error executing command as another user: Request dismissed\n";
+        const NOT_AUTHORIZED: &str =
+            "Error executing command as another user: Not authorized\n\nThis incident has been reported.\n";
+        const NO_AGENT: &str =
+            "Error executing command as another user: No authentication agent found.\n";
+        for action in [ServiceAction::Install, ServiceAction::Uninstall] {
+            assert_eq!(
+                installer_error(action, Some(126), DISMISSED),
+                "Authorization was dismissed."
+            );
+            assert_eq!(
+                installer_error(action, Some(127), NOT_AUTHORIZED),
+                "Authentication failed or not authorized."
+            );
+            // A reason with no sentence of its own keeps pkexec's text.
+            let no_agent = installer_error(action, Some(127), NO_AGENT);
+            assert!(no_agent.contains("(exit 127)"), "{no_agent}");
+            assert!(
+                no_agent.ends_with("No authentication agent found."),
+                "{no_agent}"
+            );
+        }
+        // The script's own output that merely mentions the phrase is not
+        // pkexec's line.
+        let own = installer_error(
+            ServiceAction::Uninstall,
+            Some(126),
+            "rm: Error executing command as another user: Request dismissed",
+        );
+        assert!(
+            own.starts_with("Removing the service failed (exit 126)"),
+            "{own}"
+        );
+    }
+
     #[test]
     fn installer_error_97_integrity() {
-        let msg = installer_error(Some(97), "integrity check failed: grepfocusd");
-        assert!(msg.contains("integrity check"));
-        assert!(msg.contains("re-download"));
+        for action in [ServiceAction::Install, ServiceAction::Uninstall] {
+            let msg = installer_error(action, Some(97), "integrity check failed: grepfocusd");
+            assert!(msg.contains("integrity check"));
+            assert!(msg.contains("re-download"));
+        }
     }
 
     #[test]
     fn installer_error_98_package_present() {
-        let msg = installer_error(Some(98), "error: /usr/bin/grepfocusd exists");
-        assert!(msg.contains("package manager"));
+        let msg = installer_error(
+            ServiceAction::Install,
+            Some(98),
+            "error: /usr/bin/grepfocusd exists",
+        );
+        assert!(msg.contains("update it with your package manager"));
         assert!(msg.ends_with("(error: /usr/bin/grepfocusd exists)"));
         // Without stderr the message stands alone.
-        assert!(!installer_error(Some(98), "").contains('('));
+        assert!(!installer_error(ServiceAction::Install, Some(98), "").contains('('));
+    }
+
+    /// A removal never tells the user to "update" the package.
+    #[test]
+    fn installer_error_98_on_uninstall_says_remove() {
+        let msg = installer_error(
+            ServiceAction::Uninstall,
+            Some(98),
+            "error: /usr/bin/grepfocusd exists",
+        );
+        assert!(msg.contains("remove it with your package manager"));
+        assert!(!msg.contains("update"));
+        assert!(msg.ends_with("(error: /usr/bin/grepfocusd exists)"));
     }
 
     #[test]
     fn installer_error_99_downgrade() {
-        let msg = installer_error(Some(99), "refusing to downgrade grepfocusd 0.6.1 -> 0.6.0");
+        let msg = installer_error(
+            ServiceAction::Install,
+            Some(99),
+            "refusing to downgrade grepfocusd 0.6.1 -> 0.6.0",
+        );
         assert!(msg.contains("refused to downgrade"));
         assert!(msg.contains("0.6.1 -> 0.6.0"));
     }
@@ -1092,13 +1248,51 @@ mod tests {
     #[test]
     fn installer_error_other_includes_code_and_stderr() {
         assert_eq!(
-            installer_error(Some(2), "usage: install <user> [--force] | uninstall"),
+            installer_error(
+                ServiceAction::Install,
+                Some(2),
+                "usage: install <user> [--force] | uninstall"
+            ),
             "Installer failed (exit 2): usage: install <user> [--force] | uninstall"
         );
         assert_eq!(
-            installer_error(None, "killed"),
+            installer_error(ServiceAction::Install, None, "killed"),
             "Installer failed (exit -1): killed"
         );
+        assert_eq!(
+            installer_error(ServiceAction::Uninstall, Some(1), "rm: cannot remove"),
+            "Removing the service failed (exit 1): rm: cannot remove"
+        );
+    }
+
+    #[test]
+    fn removal_refused_while_a_block_or_pomodoro_runs() {
+        assert_eq!(removal_refusal(false, false, false), None);
+        assert_eq!(
+            removal_refusal(true, false, false),
+            Some("A block is running — the service cannot be removed until it ends.")
+        );
+        // A pomodoro session holds its block active through its breaks; it
+        // is named as what has to end.
+        for block_active in [false, true] {
+            assert_eq!(
+                removal_refusal(block_active, true, false),
+                Some(
+                    "A pomodoro session is running — the service cannot be removed until it ends."
+                )
+            );
+        }
+    }
+
+    /// The running block is the reason given even when settings are locked
+    /// too: unlocking would not help.
+    #[test]
+    fn removal_refused_while_settings_are_locked() {
+        let locked = removal_refusal(false, false, true).expect("refused");
+        assert!(locked.contains("locked"), "{locked}");
+        assert!(removal_refusal(true, false, true)
+            .expect("refused")
+            .contains("block is running"));
     }
 
     /// The bootstrap runs under `pkexec /bin/sh -c`, which is dash on
@@ -1142,7 +1336,21 @@ mod tests {
         assert!(INSTALL_SCRIPT.contains("exit 98"));
         assert!(INSTALL_SCRIPT.contains("exit 99"));
         assert!(INSTALL_SCRIPT.contains("sort -V"));
+        // A payload dir that forbids execution (noexec /tmp) skips the
+        // downgrade guard; it must not fail the install.
+        assert!(INSTALL_SCRIPT.contains("rc == 126"));
+        assert!(INSTALL_SCRIPT.contains("downgrade check skipped"));
+        // A failed teardown must fail the removal: exit 0 is what the GUI
+        // reports as "Service removed".
+        assert!(!INSTALL_SCRIPT.contains("cleanup || true"));
         assert!(INSTALL_SCRIPT.starts_with("#!/usr/bin/env bash\n"));
+        for action in [ServiceAction::Install, ServiceAction::Uninstall] {
+            assert!(
+                INSTALL_SCRIPT.contains(&format!("\n    {})\n", action.arg())),
+                "no `{}` arm in the script's case",
+                action.arg()
+            );
+        }
         assert!(DEBIAN_PRERM.contains(PACKAGED_DAEMON_BIN));
     }
 }

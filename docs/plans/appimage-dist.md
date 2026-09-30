@@ -126,7 +126,11 @@ Plan:
   the dev scripts, so the offer keys off `$APPIMAGE` plus the two binary
   probes, never off `install_kind` alone.
 - Uninstall parity: ship the teardown (`grepfocusd cleanup` + file removal)
-  as a flag of the same script; mention it on the first-run screen.
+  as a flag of the same script; mention it on the first-run screen. DONE
+  (2026-09-30), except the first-run mention: the script's `uninstall`
+  action is reached from Settings → *System service* → "Remove system
+  service" (AppImage installs only, refused while a block runs, saved data
+  kept) — see README → *Uninstalling*.
 
 ### 3. Website follow-up (grepfocus-web, separate session)
 

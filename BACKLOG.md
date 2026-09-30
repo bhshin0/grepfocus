@@ -98,6 +98,10 @@ live verification checklist is still to be run. Pending release-note lines
   newer than the installed service; the installer runs under bash (fixes the
   first-run install on Debian/Ubuntu), refuses to run over a package install
   and refuses downgrades.
+- AppImage: Settings gains "Remove system service" (refused while a block
+  is running; saved data is kept), so the root service no longer outlives a
+  deleted AppImage; the installer no longer fails where `/tmp` is mounted
+  noexec (the downgrade check is skipped there, with a warning).
 - The app checks grepfocus.com once a day for a newer release (version
   number only; one-time disclosure; opt-out in Settings).
 
@@ -271,13 +275,44 @@ to be redone when the item is picked up.
   inside that window. Holding the first request until "Got it" would make
   it a real choice, at the price of never checking where the strip is
   ignored. Owner decision, tied to open question 3 of
-  `docs/plans/hardening-health-updates.md` (default on vs opt-in).
+  `docs/plans/hardening-health-updates.md` (default on vs opt-in — decided
+  2026-09-30: default on with the strip; notice versus prompt is still
+  open).
 - **`min_supported` / `security` flag in `latest.json`** — the contract
   carries `version` only, so a dismissed release stays dismissed even when
   it fixes a bypass. A flag the client treats as undismissable (and a
   floor below which the notice cannot be dismissed) needs a website change
   and a `Release` field; unknown fields are already ignored, so old
   clients are unaffected.
+- **Release CI: build rpm/deb/AppImage on a version tag** — a release is
+  three local runs today (`packaging/build-rpm.sh`, `build-deb.sh`,
+  `build-appimage.sh`; outputs in `dist/`), then a manual upload and the
+  website's `latest.json`. A job triggered by a `v*` tag would build all
+  three and attach them with their sha256s. What it has to reproduce: the
+  rpm is built from `git archive HEAD` with the toolchain on the invoking
+  user's `PATH` (the spec declares no rust/pnpm BuildRequires) and is named
+  for the build host's Fedora release (`fc44`), so it needs a Fedora
+  container of the advertised release; the deb and the AppImage already
+  build inside podman images (`packaging/deb/Containerfile` on
+  ubuntu:24.04, `packaging/appimage/Containerfile` on ubuntu:22.04, with
+  `APPIMAGE_EXTRACT_AND_RUN=1` because the container has no FUSE), so those
+  two port as container jobs. The job should fail when the tag and the
+  workspace version in `Cargo.toml` disagree. Deferred: no `.github/`
+  exists yet, and the release steps are being scripted first.
+- **Export / import of blocks and schedules** — no way to move a
+  configuration to another machine or keep a copy. Copying
+  `/var/lib/grepfocus` does not work: the state file is sealed with the
+  per-machine HMAC secret in `/etc/grepfocus`, so it reads as tampered
+  elsewhere. Needs a daemon-side pair (`ExportConfig` → plain JSON of
+  blocks and schedules only — never the password hash, the license token,
+  usage stats or active blocks; `ImportConfig` behind the settings lock),
+  with every imported block passed through `validate_block`, ids
+  reassigned and each schedule's `block_id` remapped, and the same license
+  gates as `AddBlock`/`AddSchedule` (saved-block limit, app blocking, lock
+  modes, schedules) so an import cannot grant what a save would refuse.
+  Open: merge versus replace, and what to do with name collisions. GUI: two
+  buttons on the Block list tab and a file dialog (no dialog plugin is
+  bundled today).
 - **[FIXED — UX polish] GNOME tray invisibility** — stock GNOME ships no
   StatusNotifier host, so the tray icon never appeared and close-to-tray made
   the app invisible after its first close. The GUI now probes for a host at
