@@ -1,0 +1,76 @@
+# Runs the same pre-flight a maintainer runs before committing
+# (scripts/check.sh: fmt, clippy, tests, UI build) plus the version
+# consistency check, on every push to master and every pull request.
+name: check
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or PR supersedes the run in progress.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # Mirrors the build deps of packaging/deb/Containerfile (same Ubuntu
+      # release), plus the appindicator and rsvg dev packages the AppImage
+      # image carries.
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      # rustup is preinstalled on the runner. The repo has no rust-toolchain
+      # file, so this is stable, like the packaging containers; if one is
+      # added, rustup picks it up and this step should install that instead.
+      - name: Install Rust stable with rustfmt and clippy
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # pnpm 10 matches the lockfile (lockfileVersion 9.0) and the
+      # `pnpm.onlyBuiltDependencies` setting in crates/gui/ui/package.json.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: crates/gui/ui/pnpm-lock.yaml
+
+      - name: Version consistency
+        run: ./scripts/bump-version.sh --check
+
+      # The GUI crate embeds crates/gui/ui/dist at compile time and does not
+      # compile without it. check.sh builds the UI last (fine on a dev box,
+      # where dist/ already exists), so a fresh checkout needs it built first.
+      - name: Build the UI
+        run: |
+          pnpm --dir crates/gui/ui install --frozen-lockfile
+          pnpm --dir crates/gui/ui build
+
+      - name: scripts/check.sh
+        run: ./scripts/check.sh
