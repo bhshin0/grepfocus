@@ -26,6 +26,16 @@ install="$pkgname.install"
 source=("$pkgname-$pkgver.tar.gz::https://github.com/bhshin0/grepfocus/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('fcd104dbf10a89eae4d1141dd728c9722b8f158f01c240174e500d43b4956714')
 
+prepare() {
+    cd "$pkgname-$pkgver"
+    # pnpm >= 11 refuses dependency build scripts that are not allow-listed in
+    # pnpm-workspace.yaml. Tags before 0.6.1 carry the allow-list only in
+    # package.json (the pre-11 location), so supply the file for them.
+    if [[ ! -f crates/gui/ui/pnpm-workspace.yaml ]]; then
+        printf 'allowBuilds:\n  esbuild: true\n' > crates/gui/ui/pnpm-workspace.yaml
+    fi
+}
+
 build() {
     cd "$pkgname-$pkgver"
     export CARGO_TARGET_DIR=target

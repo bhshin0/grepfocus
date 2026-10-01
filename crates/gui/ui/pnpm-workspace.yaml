@@ -1,0 +1,8 @@
+# pnpm settings. esbuild must run its install script to place its platform
+# binary. pnpm 10 reads onlyBuiltDependencies; pnpm >= 10.26 and 11 read
+# allowBuilds (the old key was removed in 11); both are kept so every
+# packaging toolchain approves the same build.
+onlyBuiltDependencies:
+  - esbuild
+allowBuilds:
+  esbuild: true

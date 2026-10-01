@@ -2660,7 +2660,7 @@ mod tests {
     #[test]
     fn challenge_alphabet_has_no_ambiguous_chars() {
         // The human retypes this string: 0/O/o and 1/l/I must not appear.
-        for c in [b'0', b'O', b'o', b'1', b'l', b'I'] {
+        for c in *b"0Oo1lI" {
             assert!(
                 !CHALLENGE_ALPHABET.contains(&c),
                 "ambiguous char {:?} in alphabet",
