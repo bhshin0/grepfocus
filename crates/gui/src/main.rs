@@ -916,6 +916,7 @@ fn spawn_status_watcher(app: AppHandle) {
                 None
             };
             if rescue_watch.poll(hidden, probe.host, locked) == tray::RescueAction::Show {
+                eprintln!("grepfocus-gui: tray host gone while the window was hidden: showing it");
                 show_main_window(&app);
             }
 
@@ -1070,14 +1071,19 @@ fn main() {
                 if tray::status_notifier_host_present() {
                     api.prevent_close();
                     let _ = window.hide();
+                    eprintln!("grepfocus-gui: close requested: hiding to the tray");
+                } else {
+                    // Allow the close; the app exits with its last window.
+                    // No goodbye notification — it was tried and removed: the
+                    // plugin delivers on a spawned task that process exit races
+                    // and loses, a blocking send can stall the main thread for
+                    // the D-Bus method timeout (the window freezes mid-close),
+                    // and GNOME suppresses the banner anyway (focused-app
+                    // heuristic, source teardown on exit).
+                    eprintln!(
+                        "grepfocus-gui: close requested: quitting, no StatusNotifier host to hide to"
+                    );
                 }
-                // else: allow the close; the app exits with its last window.
-                // No goodbye notification — it was tried and removed: the
-                // plugin delivers on a spawned task that process exit races
-                // and loses, a blocking send can stall the main thread for
-                // the D-Bus method timeout (the window freezes mid-close),
-                // and GNOME suppresses the banner anyway (focused-app
-                // heuristic, source teardown on exit).
             }
         })
         .setup(move |app| {
