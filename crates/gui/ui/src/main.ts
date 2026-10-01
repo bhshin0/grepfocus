@@ -1,280 +1,24 @@
 import { invoke } from "@tauri-apps/api/core";
-
-type AppMatcher =
-  | { kind: "exe_path"; path: string }
-  | { kind: "basename"; name: string }
-  | { kind: "cmdline"; contains: string };
-
-/// Mirrors core's `LockMode` (snake_case on the wire). How taking a break on
-/// this block is locked down; every mode but unlocked is premium, enforced by
-/// the daemon when the block is SAVED. The unlocked variant is spelled
-/// `"normal"` on the wire for compatibility with released daemons — the Rust
-/// variant was renamed, the wire value deliberately was not.
-type LockMode = "normal" | "password_breaks" | "challenge_breaks";
-
-/// Mirrors core's `AllowancePolicy`, an internally-tagged enum on `kind`: how
-/// much break time a block grants. Either/or by construction — policies never
-/// stack. The whole axis is FREE; friction lives on `LockMode` instead.
-type AllowancePolicy =
-  | { kind: "none" }
-  | { kind: "per_day"; secs: number }
-  | { kind: "rolling_window"; secs: number; window_secs: number }
-  | { kind: "per_break"; secs: number };
-
-interface Block {
-  id: number;
-  name: string;
-  domains: string[];
-  apps: AppMatcher[];
-  /// LEGACY downgrade mirror of `allowance`, kept in step by the daemon on
-  /// save. Read `allowance` instead; this only survives so a block written by
-  /// this build still means something to an older daemon.
-  allowance_secs_per_day: number;
-  allowance: AllowancePolicy | null;
-  lock: LockMode;
-}
-
-interface AllowanceLedger {
-  block_id: number;
-  day: number;
-  used_secs: number;
-}
-
-/// One active block's allowance as reported by `get_status`: the policy plus
-/// the daemon's reduction of break history under it. The view's fields are
-/// `#[serde(flatten)]`ed in core, so they sit flat here rather than nested.
-///
-/// The daemon does this arithmetic precisely so raw break history never
-/// reaches the frontend and window math is never reimplemented in TypeScript.
-interface AllowanceStatus {
-  block_id: number;
-  policy: AllowancePolicy;
-  budget_secs: number;
-  remaining_secs: number;
-  /// Absolute unix seconds, or null for the policies where "when does more
-  /// appear" has no knowable instant (none, per_day, per_break).
-  next_free_unix: number | null;
-  /// How much returns at `next_free_unix`, ties summed. 0 when that is null.
-  next_free_secs: number;
-}
-
-type Originator = { kind: "manual" } | { kind: "schedule"; schedule_id: number };
-
-interface ActiveBlock {
-  block: Block;
-  started_at_unix: number;
-  ends_at_unix: number;
-  originator: Originator;
-  break_until_unix: number | null;
-  /// The allowance policy SNAPSHOTTED at activation, for the same reason as
-  /// `lock` below. Null on a record written before snapshotting existed, in
-  /// which case the embedded block's policy is the fallback.
-  allowance: AllowancePolicy | null;
-  /// The lock mode SNAPSHOTTED at activation — not `block.lock`, which is the
-  /// (editable) saved config. This is the one the daemon enforces, so it is
-  /// the one the break UI must branch on.
-  lock: LockMode;
-}
-
-/// Mirrors core's `PomodoroPhase` (snake_case on the wire): which half of the
-/// pomodoro rhythm the session is in.
-type PomodoroPhase = "focus" | "break";
-
-/// The running-session view carried on `Status` (a projection of the daemon's
-/// live `PomodoroSession`). `cycle_index` is 0-based; `phase_ends_unix` is the
-/// unix time the current interval ends.
-interface PomodoroStatus {
-  block_id: number;
-  phase: PomodoroPhase;
-  phase_ends_unix: number;
-  cycle_index: number;
-  cycles_total: number;
-}
-
-/// Mirrors core's `Settings`: cross-cutting preferences the daemon persists,
-/// echoed on every `Status`. `notifications` defaults ON server-side (a
-/// hand-written Default, so an upgrading user is never silently muted).
-interface Settings {
-  notifications: boolean;
-  /// Instant breaks: run the loopback proxy so a break takes effect at once
-  /// even in a tab that is already open. Defaults ON server-side.
-  instant_breaks: boolean;
-}
-
-// ─── Health (mirrors core's wire types, snake_case on the wire) ─────────────
-//
-// Every enum below can carry a tag this build does not know — a newer daemon
-// may add one — which core folds to `"unknown"`; the UI says nothing for it.
-
-/// Where the daemon binary lives, classified once at daemon start.
-type InstallKind = "package" | "local" | "unknown";
-
-/// State of the DoH-blocking nftables table.
-type NftStatus =
-  | { kind: "ok" }
-  /// `nft` could not install the table: the hosts block is live, DoH is open.
-  | { kind: "failed"; reason: string }
-  /// The block ended but `nft delete` failed; the daemon keeps retrying.
-  | { kind: "stale_table"; reason: string }
-  /// Nothing enforced, no table left behind.
-  | { kind: "not_applicable" }
-  | { kind: "unknown" };
-
-/// State of the immutable flag on `/etc/hosts`.
-type HostsLockStatus =
-  | { kind: "locked" }
-  /// Licensed for tamper protection but `chattr +i` failed.
-  | { kind: "unlocked"; reason: string }
-  /// Nothing enforced, or not licensed (no lock attempted).
-  | { kind: "not_applicable" }
-  | { kind: "unknown" };
-
-/// State of the instant-breaks loopback proxy. `degraded` is what the legacy
-/// `Status.instant_breaks_degraded` flag is derived from.
-type ProxyStatus = "holding" | "degraded" | "off" | "unknown";
-
-/// Why a browser's DoH policy file could not be written. `unsupported` and
-/// `read_only_fs` are not fixable from inside GrepFocus; the rest are.
-type BrowserPolicyFailKind =
-  | "unsupported"
-  | "read_only_fs"
-  | "not_json"
-  | "symlink"
-  | "io"
-  | "unknown";
-
-/// What the daemon did about one browser's DoH policy file. The failure
-/// payload is `fail_kind` on the wire because the tag already owns `kind`.
-type BrowserPolicyState =
-  | { kind: "not_installed" }
-  | { kind: "written" }
-  | { kind: "merged" }
-  | { kind: "failed"; fail_kind: BrowserPolicyFailKind; reason: string }
-  | { kind: "unknown" };
-
-/// One browser's DoH policy file, as the daemon last saw it. `browser` is a
-/// slug (`firefox | firefox-flatpak | mullvad-browser | chromium |
-/// chromium-snap | chrome | brave`); the UI maps slugs to display names.
-interface BrowserPolicyStatus {
-  browser: string;
-  path: string;
-  state: BrowserPolicyState;
-  /// `written`/`merged`: mtime of the file; otherwise when this daemon first
-  /// saw the state.
-  since_unix: number;
-}
-
-/// Enforcement health plus daemon identity, carried on `Status`. An OLD
-/// daemon never emits it and core's default arrives instead — an empty
-/// `daemon_version` is the tell, and every other field is then meaningless.
-interface Health {
-  daemon_version: string;
-  daemon_exe: string;
-  install_kind: InstallKind;
-  nft: NftStatus;
-  hosts: HostsLockStatus;
-  /// Times a re-probe found the hosts region missing and re-applied it — a
-  /// tamper signal.
-  hosts_reapplies: number;
-  /// Times a re-probe found the table gone while nft worked and re-installed
-  /// it — a firewall reload.
-  nft_reinstalls: number;
-  proxy: ProxyStatus;
-  /// Fixed slug order after the first browser-policy pass; empty before it
-  /// and on an old daemon.
-  browser_policies: BrowserPolicyStatus[];
-  /// What the daemon's startup sanitize changed or flagged (capped at 200
-  /// lines, the last one a count of the rest).
-  startup_notes: string[];
-  /// The last enforcement error (hosts read/write, install or teardown);
-  /// cleared by the next success.
-  last_error: string | null;
-  last_error_unix: number | null;
-}
-
-interface Status {
-  active: ActiveBlock[];
-  now_unix: number;
-  password_set: boolean;
-  unlocked: boolean;
-  allowance: AllowanceStatus[];
-  /// DEPRECATED, still emitted: a bare per-day counter. Only read as a
-  /// fallback when `allowance` is absent — see `renderActive`.
-  allowance_used: AllowanceLedger[];
-  license_present: boolean;
-  license_valid: boolean;
-  license_kind: string | null;
-  license_email: string | null;
-  license_expires_at: number | null;
-  licensed_features: string[];
-  pomodoro: PomodoroStatus | null;
-  settings: Settings;
-  /// DEPRECATED, still emitted: equal to `health.proxy === "degraded"` —
-  /// instant breaks are on and a block is active but the loopback proxy could
-  /// not bind a port (something else holds :80 or :443), so breaks lag on
-  /// this machine. Drives an explanatory notice.
-  instant_breaks_degraded: boolean;
-  /// Enforcement health and daemon identity — see `Health`.
-  health: Health;
-  /// GUI/daemon version skew advice, computed by the Rust side on every poll
-  /// — see `UpdateAdvice`.
-  update: UpdateAdvice;
-}
-
-/// Mirrors `version::UpdateAdvice` in src/main.rs: what the GUI/daemon
-/// version skew calls for. `from` is the daemon's version (null = it predates
-/// version reporting), `to` this app's. Only `update_service` comes with a
-/// button; `gui_outdated` is never an install offer.
-type UpdateAdvice =
-  | { kind: "up_to_date" }
-  | { kind: "update_service"; from: string | null; to: string }
-  | { kind: "package_manager"; from: string | null; to: string }
-  | { kind: "both_installs"; from: string | null; to: string }
-  | { kind: "manual"; from: string | null; to: string }
-  | { kind: "gui_outdated"; gui: string; daemon: string };
-
-/// Mirrors `update::Release` in src/update.rs: what the GUI keeps of the
-/// site's `latest.json`. `notes_url` arrives only when it is a grepfocus.com
-/// link — the Rust side drops anything else before it gets here.
-interface Release {
-  version: string;
-  published: string | null;
-  notes_url: string | null;
-}
-
-/// Mirrors `update::UpdateInfo`: the daily release check as the Rust side
-/// sees it. `status` and `notice` are finished copy; this side only decides
-/// where and when they show.
-interface UpdateInfo {
-  enabled: boolean;
-  /// The one-time disclosure strip has been rendered (this launch or an
-  /// earlier one).
-  disclosed: boolean;
-  current: string;
-  latest: Release | null;
-  available: boolean;
-  dismissed: boolean;
-  checking: boolean;
-  last_check_unix: number | null;
-  /// The Settings row.
-  status: string;
-  /// The Status-tab strip; null unless a newer, undismissed release is known
-  /// and checks are on.
-  notice: string | null;
-  /// A preference file that could not be read or saved — its own line,
-  /// never mixed into `status`.
-  persist_error: string | null;
-}
-
-interface Schedule {
-  id: number;
-  name: string;
-  block_id: number;
-  days: number; // bitmask
-  start_minute: number;
-  duration_minutes: number;
-  enabled: boolean;
-}
+import type {
+  ActiveBlock,
+  AllowancePolicy,
+  AllowanceStatus,
+  AppEnv,
+  Block,
+  InstallKind,
+  LockMode,
+  Schedule,
+  Status,
+  UpdateAdvice,
+  UpdateInfo,
+  UsageStats,
+} from "./types";
+import { type FirstRunMode, serviceRemovalOffered, serviceRemovalRefusal, unreachableMode } from "./logic/firstrun";
+import { fmtClock, fmtDuration, fmtMinute, fmtPhaseRemaining, fmtRemaining, fmtWindow } from "./logic/format";
+import { CMDLINE_PREFIX, type FormField, blockFormError, blockFromFields } from "./logic/forms";
+import { type HealthNotice, aboutLine, healthNotices, healthSummary } from "./logic/health";
+import { DOWNLOAD_URL, adviceOffersDownload, releaseNoticeVisible, updateAdviceText } from "./logic/update";
+import { DAY_LABEL, DISPLAY_DAYS, WEEK_PALETTE, layoutDay } from "./logic/week";
 
 // ─── Tab switching ─────────────────────────────────────────────────────────
 
@@ -299,29 +43,11 @@ tabs.forEach((btn) => {
 
 // ─── New block form ────────────────────────────────────────────────────────
 
-/// Spelling of a `cmdline` matcher in the app textarea. The block card renders
-/// a saved cmdline matcher with the same prefix, so an Edit → Save round trip
-/// keeps its kind instead of silently turning it into a basename.
-const CMDLINE_PREFIX = "cmdline:";
-
-function parseAppLines(raw: string): AppMatcher[] {
-  return raw
-    .split("\n")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((line): AppMatcher => {
-      if (line.startsWith(CMDLINE_PREFIX)) {
-        return { kind: "cmdline", contains: line.slice(CMDLINE_PREFIX.length) };
-      }
-      return line.startsWith("/") ? { kind: "exe_path", path: line } : { kind: "basename", name: line };
-    });
-}
-
 /// Show only the inputs the selected allowance kind actually uses: "none"
 /// needs neither, the two flat budgets need the minutes box, and only the
 /// rolling window needs a window length.
 ///
-/// Hidden inputs still submit their values, which is fine — `readPolicy`
+/// Hidden inputs still submit their values, which is fine — `policyFromFields`
 /// selects fields by kind and never reads one the kind does not own.
 function syncPolicyFields(form: HTMLFormElement) {
   const kind = form.querySelector<HTMLSelectElement>('select[name="allowance_kind"]')!.value;
@@ -331,26 +57,16 @@ function syncPolicyFields(form: HTMLFormElement) {
   if (windowLabel) windowLabel.hidden = kind !== "rolling_window";
 }
 
-/// Read a block form's allowance controls into a wire policy, minutes → secs.
-/// Shared by the New-block tab and every per-card edit form so the two cannot
-/// drift into disagreeing about the encoding.
-function readPolicy(form: HTMLFormElement): AllowancePolicy {
+/// A form's controls as the field getter the parsers in logic/forms.ts take.
+function formFields(form: HTMLFormElement): FormField {
   const fd = new FormData(form);
-  const mins = (name: string) => Math.max(0, Math.floor(Number(fd.get(name) ?? 0)));
-  const secs = mins("allowance_minutes") * 60;
-  switch (String(fd.get("allowance_kind") ?? "none")) {
-    case "per_day":
-      return { kind: "per_day", secs };
-    case "rolling_window":
-      return { kind: "rolling_window", secs, window_secs: mins("window_minutes") * 60 };
-    case "per_break":
-      return { kind: "per_break", secs };
-    default:
-      return { kind: "none" };
-  }
+  return (name) => {
+    const v = fd.get(name);
+    return v === null ? null : String(v);
+  };
 }
 
-/// The inverse of `readPolicy`: load a saved policy into a form's controls,
+/// The inverse of `policyFromFields`: load a saved policy into a form's controls,
 /// secs → minutes, and sync which of them are visible. Leaves the defaults in
 /// the inputs a policy does not use, so switching kinds finds sane values.
 function writePolicy(form: HTMLFormElement, p: AllowancePolicy) {
@@ -368,28 +84,8 @@ function writePolicy(form: HTMLFormElement, p: AllowancePolicy) {
 
 /// Read a whole block form into a wire `Block`. `id` is 0 for a new block and
 /// the existing id for an edit — the only difference between the two forms.
-///
-/// Both `allowance` and its legacy `allowance_secs_per_day` mirror go on the
-/// wire. The daemon re-derives the mirror from the policy on save, so this is
-/// not load-bearing, but sending a self-consistent frame beats sending one
-/// whose two halves contradict each other.
 function readBlockForm(form: HTMLFormElement, id: number): Block {
-  const fd = new FormData(form);
-  const allowance = readPolicy(form);
-  return {
-    id,
-    name: String(fd.get("name") ?? "").trim(),
-    // Any whitespace or comma separates entries, so a pasted `reddit.com
-    // twitter.com` becomes two domains rather than one refused entry.
-    domains: String(fd.get("domains") ?? "")
-      .split(/[\s,]+/)
-      .filter(Boolean),
-    apps: parseAppLines(String(fd.get("apps") ?? "")),
-    allowance_secs_per_day: allowance.kind === "none" ? 0 : allowance.secs,
-    allowance,
-    // `"normal"` is the wire spelling of the unlocked mode (see `LockMode`).
-    lock: String(fd.get("lock") ?? "normal") as LockMode,
-  };
+  return blockFromFields(formFields(form), id);
 }
 
 const newForm = document.querySelector<HTMLFormElement>("#new-block-form")!;
@@ -430,9 +126,10 @@ newForm.addEventListener("submit", async (ev) => {
   newMsg.classList.remove("error");
   newMsg.textContent = "";
   const block = readBlockForm(newForm, 0);
-  if (!block.name) {
+  const problem = blockFormError(block);
+  if (problem !== null) {
     newMsg.classList.add("error");
-    newMsg.textContent = "name is required";
+    newMsg.textContent = problem;
     return;
   }
   if (!(await ensureUnlocked())) return;
@@ -528,15 +225,6 @@ const LOCK_NOTE: Record<LockMode, string> = {
   password_breaks: " · password-locked breaks",
   challenge_breaks: " · challenge-locked breaks",
 };
-
-/// A rolling window's length, phrased for prose: "per rolling ${fmtWindow(w)}".
-/// The common hour reads as a word rather than "60 min"; other round hours
-/// follow suit, and anything else falls back to minutes.
-function fmtWindow(windowSecs: number): string {
-  if (windowSecs === 3600) return "hour";
-  if (windowSecs % 3600 === 0) return `${windowSecs / 3600} hours`;
-  return `${Math.max(1, Math.round(windowSecs / 60))} min`;
-}
 
 /// The block-list one-liner for an allowance policy. Empty for "no breaks":
 /// a block without breaks is the plain case and needs no annotation.
@@ -717,9 +405,10 @@ function renderBlockCard(
     editMsg.classList.remove("error");
     editMsg.textContent = "";
     const block = readBlockForm(editForm, b.id);
-    if (!block.name) {
+    const problem = blockFormError(block);
+    if (problem !== null) {
       editMsg.classList.add("error");
-      editMsg.textContent = "name is required";
+      editMsg.textContent = problem;
       return;
     }
     if (!(await ensureUnlocked())) return;
@@ -806,224 +495,13 @@ function statusInteractionBusy(): boolean {
 
 // ─── Health: Status banner, Settings about + diagnostics lines ─────────────
 //
-// `healthNotices`, `healthSummary` and `aboutLine` are pure (status in, text
-// out) so every severity rule reads in one place; the render functions after
-// them are the only DOM writers. All of it is silent on a daemon too old to
-// report (`health.daemon_version === ""`) and for any `unknown` value.
+// The severity rules are logic/health.ts (`healthNotices`, `healthSummary`,
+// `aboutLine`: status in, text out); the render functions here are the only
+// DOM writers.
 
 const healthBannerEl = document.querySelector<HTMLDivElement>("#health-banner")!;
 const aboutLineEl = document.querySelector<HTMLParagraphElement>("#about-line")!;
 const healthDiagEl = document.querySelector<HTMLParagraphElement>("#health-diag")!;
-
-/// RED = blocking may not hold; YELLOW = enforced but degraded; INFO = worth
-/// knowing, nothing to do.
-type NoticeLevel = "error" | "warn" | "info";
-
-interface HealthNotice {
-  level: NoticeLevel;
-  text: string;
-}
-
-/// Display names for the daemon's browser slugs. An unknown slug (a newer
-/// daemon's browser) renders raw rather than being dropped.
-const BROWSER_NAME: Record<string, string> = {
-  firefox: "Firefox",
-  "firefox-flatpak": "Firefox (Flatpak)",
-  "mullvad-browser": "Mullvad Browser",
-  chromium: "Chromium",
-  "chromium-snap": "Chromium (snap)",
-  chrome: "Google Chrome",
-  brave: "Brave",
-};
-
-function browserName(slug: string): string {
-  return BROWSER_NAME[slug] ?? slug;
-}
-
-/// "Firefox" · "Firefox and Chromium" · "Firefox, Mullvad Browser and Chromium".
-function joinNames(names: string[]): string {
-  if (names.length <= 1) return names.join("");
-  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
-}
-
-/// How long after a policy file was written the "restart your browser" hint
-/// stays up. Firefox-based browsers read policies only at start, so one that
-/// was open at write time keeps DoH until restarted; past this window assume
-/// it has been.
-const RESTART_HINT_SECS = 900;
-
-/// The Status-tab notices for a status, RED → YELLOW → INFO.
-///
-/// The two RED rules are mirrored by `enforcement_red` in src/main.rs, which
-/// drives the tray notification — change together.
-function healthNotices(s: Status): HealthNotice[] {
-  const h = s.health;
-  if (h.daemon_version === "") return [];
-  const domainBlockActive = s.active.some((a) => a.block.domains.length > 0);
-  const red: HealthNotice[] = [];
-  const yellow: HealthNotice[] = [];
-  const info: HealthNotice[] = [];
-
-  // RED: the hosts write itself failed. Always shown — with no domain block
-  // active it is a failed teardown, and the previous block's entries may
-  // still be in /etc/hosts.
-  if (h.last_error != null) {
-    red.push({
-      level: "error",
-      text: domainBlockActive
-        ? `Website blocking may not be enforced: the /etc/hosts change could not be applied (${h.last_error}). The daemon retries every second; see journalctl -u grepfocusd`
-        : `The last /etc/hosts change could not be applied (${h.last_error}) — previously blocked sites may still be blocked. The daemon retries every second; see journalctl -u grepfocusd`,
-    });
-  }
-  // RED: no DoH table under a live domain block. Without one there is nothing
-  // to bypass, and the state clears at the next apply.
-  if (h.nft.kind === "failed" && domainBlockActive) {
-    red.push({
-      level: "error",
-      text: `Active blocks can be bypassed: DoH protection (nftables) failed — ${h.nft.reason}. Browsers using DNS-over-HTTPS (Firefox, Mullvad Browser) may still reach blocked sites.`,
-    });
-  }
-
-  if (h.hosts.kind === "unlocked") {
-    yellow.push({
-      level: "warn",
-      text: `Tamper protection off: /etc/hosts is not locked (${h.hosts.reason}). Blocking still works, but the file can be edited while a block is active.`,
-    });
-  }
-  if (h.nft.kind === "stale_table") {
-    yellow.push({
-      level: "warn",
-      text: `The DoH block table could not be removed after the last block (${h.nft.reason}) — DNS-over-HTTPS resolvers stay blocked (Mullvad Browser loses DNS). The daemon retries every 30 s; to remove it now: sudo nft delete table inet grepfocus_doh`,
-    });
-  }
-
-  // Browser policies: a fixable failure is YELLOW with its remedy, one the
-  // daemon cannot fix on this layout is INFO, and a fresh write earns the
-  // one-time restart hint.
-  const recentlyWritten: string[] = [];
-  let lastWriteUnix = 0;
-  for (const bp of h.browser_policies) {
-    const name = browserName(bp.browser);
-    const st = bp.state;
-    if (st.kind === "failed") {
-      switch (st.fail_kind) {
-        case "not_json":
-        case "symlink":
-        case "io": {
-          const remedy =
-            st.fail_kind === "not_json"
-              ? `Fix or remove ${bp.path}; GrepFocus retries every minute.`
-              : st.fail_kind === "symlink"
-                ? `Replace ${bp.path} with a real file or add DNSOverHTTPS there yourself.`
-                : "GrepFocus retries every minute.";
-          yellow.push({
-            level: "warn",
-            text: `${name}: DoH policy not installed (${st.reason}). ${name} may bypass blocks via DNS-over-HTTPS. ${remedy}`,
-          });
-          break;
-        }
-        case "unsupported":
-          info.push({
-            level: "info",
-            text: `${name} is present but not covered (${st.reason}). DoH may bypass blocks in it — see README → Known limits.`,
-          });
-          break;
-        case "read_only_fs":
-          info.push({
-            level: "info",
-            text: `Cannot write ${bp.path}: read-only filesystem. DoH may bypass blocks in ${name}; not fixable on this system layout.`,
-          });
-          break;
-        default:
-          // `unknown`: a newer daemon's kind this build cannot judge.
-          break;
-      }
-    } else if (
-      (st.kind === "written" || st.kind === "merged") &&
-      s.now_unix - bp.since_unix < RESTART_HINT_SECS
-    ) {
-      recentlyWritten.push(name);
-      // The latest write is the conservative cut-off for "open before".
-      lastWriteUnix = Math.max(lastWriteUnix, bp.since_unix);
-    }
-  }
-
-  if (h.startup_notes.length > 0) {
-    yellow.push({
-      level: "warn",
-      text: `${h.startup_notes.length} stored block entries were changed or dropped when the daemon started (invalid domains or app matchers from an older version). Details: journalctl -u grepfocusd | grep sanitized`,
-    });
-  }
-  if (recentlyWritten.length > 0) {
-    info.push({
-      level: "info",
-      text: `GrepFocus switched DNS-over-HTTPS off in ${joinNames(recentlyWritten)} through a system policy so blocks apply there (they will say 'managed by your organization'). Restart Firefox-based browsers once if they were open before ${fmtClock(lastWriteUnix)}.`,
-    });
-  }
-  // The Settings tab carries the same note off the legacy bool; this one is
-  // on the Status tab because that is where a lagging break is noticed.
-  if (h.proxy === "degraded" && s.settings.instant_breaks) {
-    info.push({
-      level: "info",
-      text: "Instant breaks unavailable — port 80 or 443 is in use, so breaks may take up to a minute to show in an already-open tab. Blocking is unaffected.",
-    });
-  }
-  return [...red, ...yellow, ...info];
-}
-
-/// The Settings diagnostics line: every enforcement state on one row, for a
-/// bug report or a journal cross-check. The drift counters are diagnostics
-/// only — they never raise a notice. "off (premium feature)" is this side's
-/// reading of a hosts lock that was never attempted; the daemon stays the only
-/// source of "NOT locked" (attempted and failed).
-function healthSummary(s: Status): string {
-  const h = s.health;
-  const domainBlockActive = s.active.some((a) => a.block.domains.length > 0);
-  const tamperLicensed = s.license_valid && s.licensed_features.includes("tamper_protection");
-  let nft: string;
-  switch (h.nft.kind) {
-    case "ok":
-      nft = "ok";
-      break;
-    case "failed":
-      nft = "FAILED";
-      break;
-    case "stale_table":
-      nft = `stale table (${h.nft.reason})`;
-      break;
-    case "not_applicable":
-      nft = "not applicable";
-      break;
-    default:
-      nft = "unknown";
-  }
-  let hosts: string;
-  switch (h.hosts.kind) {
-    case "locked":
-      hosts = "locked";
-      break;
-    case "unlocked":
-      hosts = "NOT locked";
-      break;
-    case "not_applicable":
-      hosts = domainBlockActive && !tamperLicensed ? "off (premium feature)" : "not applicable";
-      break;
-    default:
-      hosts = "unknown";
-  }
-  return `Enforcement — DoH block (nft): ${nft} · /etc/hosts lock: ${hosts} · instant-break proxy: ${h.proxy} · re-applies since daemon start: hosts ${h.hosts_reapplies}, nft ${h.nft_reinstalls}`;
-}
-
-/// The Settings about line: our version beside the daemon's. `h` null means
-/// the daemon could not be reached; an empty `daemon_version` means it
-/// answered but predates health reporting. `gui` null means `app_env` itself
-/// failed, which leaves the version out rather than guessing one.
-function aboutLine(gui: string | null, h: Health | null): string {
-  const app = gui ? `GrepFocus ${gui}` : "GrepFocus";
-  if (h === null) return `${app} · daemon unreachable`;
-  if (h.daemon_version === "") return `${app} · daemon: older version (no health reporting)`;
-  return `${app} · daemon ${h.daemon_version} (${h.daemon_exe || h.install_kind})`;
-}
 
 /// What the banner currently shows, so a poll that changes nothing leaves the
 /// DOM alone (a rewrite every 5 s flickers and re-announces to screen readers
@@ -1128,14 +606,6 @@ function stopCountdownTimer() {
   }
 }
 
-function fmtRemaining(secs: number): string {
-  const s = Math.max(0, Math.floor(secs));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const r = s % 60;
-  return [h, m, r].map((n) => String(n).padStart(2, "0")).join(":");
-}
-
 /// The budget half of a break row: what the policy grants per its own period,
 /// independent of what is left right now.
 function budgetNote(p: AllowancePolicy): string {
@@ -1150,16 +620,6 @@ function budgetNote(p: AllowancePolicy): string {
     default:
       return "";
   }
-}
-
-/// Format an ABSOLUTE unix instant as a local wall-clock time.
-///
-/// Deliberately not adjusted by `activeServerSkew`: that skew exists to tick
-/// countdowns off a client clock that may disagree with the daemon's, whereas
-/// `next_free_unix` is already an absolute instant both machines agree on.
-/// Skewing it would double-count the correction.
-function fmtClock(unix: number): string {
-  return new Date(unix * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 /// What is left of an active block's allowance, preferring the daemon's
@@ -1525,8 +985,6 @@ challengeDialog.addEventListener("cancel", (ev) => {
 
 // ─── Schedules ─────────────────────────────────────────────────────────────
 
-const DAY_LABEL = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
 const schedDialog = document.querySelector<HTMLDialogElement>("#schedule-dialog")!;
 const schedForm = document.querySelector<HTMLFormElement>("#schedule-form")!;
 const schedMsg = document.querySelector<HTMLParagraphElement>("#schedule-msg")!;
@@ -1625,8 +1083,7 @@ function openScheduleDialog(intent: SchedIntent, blockName?: string) {
     schedForm.querySelectorAll<HTMLInputElement>('input[name="day"]').forEach((cb) => {
       cb.checked = (s.days & (1 << Number(cb.value))) !== 0;
     });
-    schedForm.querySelector<HTMLInputElement>('input[name="start_time"]')!.value =
-      `${String(Math.floor(s.start_minute / 60)).padStart(2, "0")}:${String(s.start_minute % 60).padStart(2, "0")}`;
+    schedForm.querySelector<HTMLInputElement>('input[name="start_time"]')!.value = fmtMinute(s.start_minute);
     schedForm.querySelector<HTMLInputElement>('input[name="duration_hours"]')!.value = String(
       Math.round((s.duration_minutes / 60) * 100) / 100,
     );
@@ -1722,37 +1179,6 @@ function refreshSchedulesViews() {
 
 const weekEl = document.querySelector<HTMLDivElement>("#week-content")!;
 
-/// Display columns run Mon→Sun for readability, but the wire bitmask is
-/// Sun-first (bit 0 = Sunday … bit 6 = Saturday, matching `DAY_LABEL`). This
-/// maps each display column to the bit it represents; `DAY_LABEL[bit]` then
-/// labels it, keeping the column order and the bit order from drifting apart.
-const DISPLAY_DAYS = [1, 2, 3, 4, 5, 6, 0];
-
-/// Per-block colours: eight distinct hues as {fill, text} pairs, indexed by
-/// `blockId % length`. Each fill is a light pastel with an explicit dark text
-/// colour, so the label reads on the window in BOTH light and dark themes —
-/// the window carries its own background, so no `prefers-color-scheme` branch
-/// is needed for it (unlike the CSS vars, which do have one). The legend below
-/// the grid disambiguates the rare case where two blocks share a palette slot.
-const WEEK_PALETTE: { fill: string; text: string }[] = [
-  { fill: "#cfe3ff", text: "#0b2a5b" },
-  { fill: "#cdefd6", text: "#0e3d20" },
-  { fill: "#ffe6b3", text: "#5a3d00" },
-  { fill: "#ffd6e7", text: "#5c1236" },
-  { fill: "#e2d5f8", text: "#331457" },
-  { fill: "#c9eef0", text: "#06393d" },
-  { fill: "#ffd9c2", text: "#5a2405" },
-  { fill: "#e4f0b8", text: "#35400a" },
-];
-
-/// Minutes-since-midnight → "HH:MM". A window's end can be exactly 1440 (a
-/// full-day span), rendered as "24:00" rather than wrapping to "00:00" so the
-/// end of the day is unambiguous.
-function fmtMinute(m: number): string {
-  const h = Math.floor(m / 60);
-  return `${String(h).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
-}
-
 /// Build the read-only week grid DOM shared by the Week tab and each block
 /// card's mini grid: a `.week-scroll` box wrapping a `.week-grid` with a time
 /// axis and 7 day columns (Mon→Sun), every schedule window colour-coded per
@@ -1812,34 +1238,10 @@ function buildWeekGrid(
     const col = document.createElement("div");
     col.className = "week-day";
 
-    // Every schedule firing on this weekday, earliest first.
-    const todays = schedules
-      .filter((s) => (s.days & (1 << bit)) !== 0)
-      .sort((a, b) => a.start_minute - b.start_minute);
+    // Overlapping windows share the column side by side, one lane each.
+    const { windows, laneCount } = layoutDay(schedules, bit);
 
-    // Lane assignment (greedy interval partition, per day column): drop each
-    // window into the first lane whose previous window has already ended
-    // (`prevEnd <= start`), else open a new lane. Windows in one lane never
-    // overlap, so laying the lanes side-by-side keeps every overlapping window
-    // visible instead of hidden behind another. `laneEnds[i]` is the end minute
-    // of the last window placed in lane i.
-    const laneEnds: number[] = [];
-    const laneOf = new Map<Schedule, number>();
-    for (const s of todays) {
-      const end = s.start_minute + s.duration_minutes;
-      let lane = laneEnds.findIndex((prevEnd) => prevEnd <= s.start_minute);
-      if (lane === -1) {
-        lane = laneEnds.length;
-        laneEnds.push(end);
-      } else {
-        laneEnds[lane] = end;
-      }
-      laneOf.set(s, lane);
-    }
-    const laneCount = Math.max(1, laneEnds.length);
-
-    for (const s of todays) {
-      const lane = laneOf.get(s) ?? 0;
+    for (const { schedule: s, lane } of windows) {
       const win = document.createElement("div");
       win.className = `week-window${s.enabled ? "" : " disabled"}`;
       // Top/height from the day fraction; left/width from the lane split.
@@ -2290,47 +1692,6 @@ licenseRemove.addEventListener("click", async () => {
 
 // ─── Stats (premium) ─────────────────────────────────────────────────────────
 
-interface LifetimeTotals {
-  focus_secs: number;
-  sessions: number;
-  app_kills: number;
-  breaks_refused: number;
-}
-
-/// Mirrors core's `Origin` (snake_case on the wire).
-type Origin = "manual" | "schedule";
-
-interface FocusSession {
-  block_id: number;
-  name: string;
-  started_at_unix: number;
-  ended_at_unix: number;
-  origin: Origin;
-  duration_secs: number;
-}
-
-interface DayStat {
-  /// `num_days_from_ce` (a local-day integer), NOT a unix timestamp — use only
-  /// for ordering and labels relative to today, never as a clock time.
-  day: number;
-  focus_secs: number;
-  sessions_completed: number;
-  breaks_taken: number;
-  break_secs: number;
-  breaks_refused: number;
-  app_kills: number;
-}
-
-interface UsageStats {
-  totals: LifetimeTotals;
-  /// Stored ring, oldest-last — reverse for newest-first display.
-  sessions: FocusSession[];
-  /// Recent window, sorted ascending (oldest-first), last ~30 rollups.
-  days: DayStat[];
-  current_streak: number;
-  longest_streak: number;
-}
-
 const statsTabBtn = document.querySelector<HTMLButtonElement>("#stats-tab-btn")!;
 const statsEl = document.querySelector<HTMLDivElement>("#stats-content")!;
 const statsSection = document.querySelector<HTMLElement>("#stats")!;
@@ -2346,18 +1707,6 @@ function statsTabVisible(): boolean {
 function applyStatsGating(licenseValid: boolean) {
   statsTabBtn.hidden = !licenseValid;
   if (!licenseValid && statsTabVisible()) statusTabBtn.click();
-}
-
-/// Compact focus duration: "3h 20m" / "45m" / "30s". Distinct from
-/// `fmtRemaining` (a HH:MM:SS countdown) — a headline total reads better as
-/// human units than as a colon-clock.
-function fmtDuration(secs: number): string {
-  const s = Math.max(0, Math.floor(secs));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
-  if (m > 0) return `${m}m`;
-  return `${s}s`;
 }
 
 /// Relative label for a unix timestamp: "just now" / "2h ago" / "3d ago", and
@@ -2537,19 +1886,6 @@ function pomodoroTabVisible(): boolean {
 function applyPomodoroGating(licenseValid: boolean) {
   pomodoroTabBtn.hidden = !licenseValid;
   if (!licenseValid && pomodoroTabVisible()) statusTabBtn.click();
-}
-
-/// Phase-countdown format: MM:SS, rolling up to H:MM:SS past an hour (a focus
-/// interval can be up to 180 min). Same math as `fmtRemaining`, but a bare
-/// clock without the always-present hours field reads better in the banner.
-function fmtPhaseRemaining(secs: number): string {
-  const s = Math.max(0, Math.floor(secs));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const r = s % 60;
-  const mm = String(m).padStart(2, "0");
-  const rr = String(r).padStart(2, "0");
-  return h > 0 ? `${h}:${mm}:${rr}` : `${mm}:${rr}`;
 }
 
 /// Route the live status into whichever view fits. Called off the status poll
@@ -2799,17 +2135,6 @@ function emptyLi(text: string): HTMLLIElement {
 // non-AppImage run with no daemon binary anywhere keeps the per-tab error,
 // which already names install.sh.
 
-interface AppEnv {
-  appimage: boolean;
-  /// The app's own version, for the Settings about line (`aboutLine`).
-  gui_version: string;
-  /// `/usr/bin/grepfocusd` exists — a package install owns the daemon.
-  packaged_daemon: boolean;
-  /// `/usr/local/bin/grepfocusd` exists — the AppImage installer's or the
-  /// dev scripts' daemon.
-  local_daemon: boolean;
-}
-
 let appEnv: AppEnv | null = null;
 
 const firstRunDialog = document.querySelector<HTMLDialogElement>("#firstrun-dialog")!;
@@ -2819,7 +2144,6 @@ const firstRunMsg = document.querySelector<HTMLElement>("#firstrun-msg")!;
 const firstRunAction = document.querySelector<HTMLButtonElement>("#firstrun-action")!;
 const firstRunSecondary = document.querySelector<HTMLButtonElement>("#firstrun-secondary")!;
 
-type FirstRunMode = "install" | "relogin" | "packaged" | "stopped" | "removed";
 let firstRunMode: FirstRunMode | null = null;
 // True while an install click owns the UI (pkexec in flight or waiting for
 // the fresh daemon to answer), from either the dialog or the skew banner, and
@@ -2894,26 +2218,6 @@ function showFirstRun(mode: FirstRunMode) {
 function hideFirstRun() {
   firstRunMode = null;
   if (firstRunDialog.open) firstRunDialog.close();
-}
-
-/// Which dialog mode a failed daemon call asks for; null leaves the dialog
-/// alone. The error strings come from crates/gui/src/client.rs; only the two
-/// connect-class failures pick a mode — a deserialize or protocol error is a
-/// daemon we DID reach, and never opens the dialog. `removed` is
-/// `serviceRemoved`: with no binary left it turns "not installed yet" into
-/// "you just removed it"; once a reinstall has put a binary back the ordinary
-/// modes apply again.
-function unreachableMode(msg: string, env: AppEnv | null, removed: boolean): FirstRunMode | null {
-  // Socket exists but we lack group membership — installed, needs relogin.
-  if (msg.includes("not allowed to talk")) return "relogin";
-  if (!msg.includes("daemon is not running")) return null;
-  // Nothing listening on the socket: which binary exists says whether that
-  // is "not installed" or "installed but stopped".
-  if (env?.packaged_daemon) return "packaged";
-  if (env?.local_daemon) return "stopped";
-  if (env?.appimage) return removed ? "removed" : "install";
-  // Non-AppImage, no daemon binary: leave the per-tab error.
-  return null;
 }
 
 function handleDaemonUnreachable(err: unknown) {
@@ -3054,26 +2358,6 @@ const serviceRemoveConfirmEl = document.querySelector<HTMLButtonElement>("#servi
 const serviceRemoveCancelEl = document.querySelector<HTMLButtonElement>("#service-remove-cancel")!;
 const serviceRemoveMsgEl = document.querySelector<HTMLParagraphElement>("#service-remove-msg")!;
 
-/// The section is for the service this AppImage installed: running as an
-/// AppImage, a daemon at /usr/local/bin, and none at /usr/bin — a package's
-/// daemon is the package manager's to remove (the script refuses it, exit 98).
-function serviceRemovalOffered(env: AppEnv | null): boolean {
-  return env !== null && env.appimage && env.local_daemon && !env.packaged_daemon;
-}
-
-/// Why the service may not be removed right now, null when it may. Mirrors
-/// the two running-block sentences of `removal_refusal` in src/main.rs, which
-/// has the last word — change together.
-function serviceRemovalRefusal(s: Status): string | null {
-  if (s.pomodoro != null) {
-    return "A pomodoro session is running — the service cannot be removed until it ends.";
-  }
-  if (s.active.length > 0) {
-    return "A block is running — the service cannot be removed until it ends.";
-  }
-  return null;
-}
-
 function renderServiceSection() {
   serviceSectionEl.hidden = !serviceRemovalOffered(appEnv);
 }
@@ -3173,10 +2457,10 @@ serviceRemoveConfirmEl.addEventListener("click", async () => {
 // ─── Status tab: GUI/daemon version skew banner ──────────────────────────────
 //
 // `get_status` computes the advice (Rust `version::advise`, one decision
-// table); this side turns it into copy and, for `update_service` only, a
-// button that re-runs the AppImage's pkexec installer. `updateAdviceText` is
-// pure; `renderUpdateBanner` is the only DOM writer and, like the health
-// banner, rewrites only when the advice changes.
+// table); logic/update.ts turns it into copy (`updateAdviceText`) and this
+// side adds, for `update_service` only, a button that re-runs the AppImage's
+// pkexec installer. `renderUpdateBanner` is the only DOM writer and, like the
+// health banner, rewrites only when the advice changes.
 
 const updateBannerEl = document.querySelector<HTMLDivElement>("#update-banner")!;
 const updateTextEl = document.querySelector<HTMLParagraphElement>("#update-text")!;
@@ -3184,66 +2468,9 @@ const updateActionEl = document.querySelector<HTMLButtonElement>("#update-action
 const updateMsgEl = document.querySelector<HTMLParagraphElement>("#update-msg")!;
 const updateDownloadEl = document.querySelector<HTMLButtonElement>("#update-download")!;
 
-/// Where an outdated AppImage is sent: selectable text in the advice, and
-/// the "Download" button beside it opens the same page (`open_url`). The
-/// website keeps this route stable for exactly that.
-const DOWNLOAD_URL = "https://grepfocus.com/download";
-
 /// How long a finished update's outcome stays readable before the poll's
 /// `up_to_date` (or a renewed unreachable error) takes the card away.
 const UPDATE_HOLD_MS = 10_000;
-
-/// The opening sentence: which service, how it compares. A pre-reporting
-/// daemon (`from` null) is older than any app that asks.
-function serviceOlder(from: string | null, to: string): string {
-  return from === null
-    ? `The installed GrepFocus service predates version reporting and is older than this app (${to})`
-    : `The GrepFocus service (${from}) is older than this app (${to})`;
-}
-
-/// The one advice answered with `DOWNLOAD_URL`: an AppImage older than a
-/// service no package owns. Decides both the copy and the "Download" button.
-function adviceOffersDownload(a: UpdateAdvice, appimage: boolean, kind: InstallKind): boolean {
-  return a.kind === "gui_outdated" && appimage && kind !== "package";
-}
-
-/// The skew card's copy. `gui_outdated` branches on how this app and the
-/// daemon were installed: a packaged app should be launched instead, an
-/// AppImage replaced, a checkout rebuilt. A pre-reporting daemon's
-/// `install_kind` is necessarily `unknown`, so `manual` with `from` null
-/// names every install path rather than a location.
-function updateAdviceText(a: UpdateAdvice, appimage: boolean, kind: InstallKind): string {
-  const restartNote =
-    "Active blocks stay enforced across the restart; settings relock, and a pending break challenge is lost.";
-  switch (a.kind) {
-    case "up_to_date":
-      return "";
-    case "update_service":
-      return `${serviceOlder(a.from, a.to)}. Update the service so both match — you'll be asked to authorize with your password. ${restartNote}`;
-    case "package_manager":
-      return `${serviceOlder(a.from, a.to)}. It was installed by your package manager — update the grepfocus package (rpm/deb/AUR) to ${a.to}; this app cannot replace a packaged service.`;
-    case "both_installs":
-      return `${serviceOlder(a.from, a.to)}. grepfocusd is installed twice — by a package (/usr/bin/grepfocusd) and locally (/usr/local/bin/grepfocusd) — and the installer will not run over a package install: remove one of the two (the package with your package manager), then update the other.`;
-    case "manual":
-      if (a.from === null || kind === "local") {
-        return `${serviceOlder(a.from, a.to)}. Update it the way it was installed: ./packaging/upgrade.sh from a source checkout, your package manager, or the newer AppImage, which offers the update on this tab.`;
-      }
-      return `${serviceOlder(a.from, a.to)} and is not at a location this app can update. Update it the way it was installed.`;
-    case "gui_outdated": {
-      const lead = `The GrepFocus service (${a.daemon}) is newer than this app (${a.gui})`;
-      if (kind === "package") {
-        return `${lead}. Launch the GrepFocus that came with the package instead of this ${appimage ? "AppImage" : "build"}.`;
-      }
-      if (adviceOffersDownload(a, appimage, kind)) {
-        return `${lead}. Download the latest AppImage from ${DOWNLOAD_URL}.`;
-      }
-      if (kind === "local") {
-        return `${lead} — quit and relaunch GrepFocus; if this notice stays, ./packaging/upgrade.sh from the checkout rebuilds both.`;
-      }
-      return `${lead} — quit and relaunch GrepFocus; if this notice stays, update the app the way it was installed.`;
-    }
-  }
-}
 
 /// What the card currently shows, so an unchanged advice leaves the DOM (and
 /// a message from the last click) alone.
@@ -3348,11 +2575,10 @@ updateActionEl.addEventListener("click", async () => {
 //
 // The Rust side (src/update.rs) owns the fetch, the cadence, the preference
 // file and every sentence; this side polls `get_update_info` alongside the
-// status poll and decides where the answer shows. Two rules live only here:
-// the disclosure strip is on screen before `acknowledge_update_check` lets
-// the checker contact the site, and the notice yields to an active block and
-// to the skew banner (fix what is installed first — the Settings row still
-// reports the release).
+// status poll and decides where the answer shows. Two rules live only in the
+// GUI: the disclosure strip is on screen before `acknowledge_update_check`
+// lets the checker contact the site, and the notice yields to an active block
+// and to the skew banner (`releaseNoticeVisible` in logic/update.ts).
 
 const updateDisclosureEl = document.querySelector<HTMLDivElement>("#update-disclosure")!;
 const updateDisclosureOkEl = document.querySelector<HTMLButtonElement>("#update-disclosure-ok")!;
@@ -3388,9 +2614,7 @@ let updateNoticeKey = "";
 let updateToggleBusy = false;
 
 function renderUpdateNotice(info: UpdateInfo) {
-  // `!updateBannerEl.hidden` on top of `skewActive`: a finished service
-  // update holds the card for its outcome line after the skew is gone.
-  if (blockActive || skewActive || !updateBannerEl.hidden || info.notice === null) {
+  if (!releaseNoticeVisible(info.notice, blockActive, skewActive, !updateBannerEl.hidden)) {
     updateNoticeEl.hidden = true;
     return;
   }

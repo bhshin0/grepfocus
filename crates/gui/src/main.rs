@@ -448,9 +448,9 @@ async fn uninstall_service(app: AppHandle) -> Result<(), String> {
 
 /// Why the system service may not be removed right now, `None` when it may.
 /// The two running-block sentences are also `serviceRemovalRefusal` in
-/// ui/src/main.ts, which asks before it opens the confirmation dialog —
-/// change together. The settings lock is prompted for there
-/// (`ensureUnlocked`); here it only catches an unlock that lapsed since.
+/// ui/src/logic/firstrun.ts, which main.ts asks before it opens the
+/// confirmation dialog — change together. The settings lock is prompted for
+/// there (`ensureUnlocked`); here it only catches an unlock that lapsed since.
 fn removal_refusal(block_active: bool, pomodoro: bool, locked: bool) -> Option<&'static str> {
     if pomodoro {
         Some("A pomodoro session is running — the service cannot be removed until it ends.")
@@ -731,9 +731,9 @@ fn notify(app: &AppHandle, title: &str, body: &str) {
 
 /// The notification body while enforcement is in a RED state, `None`
 /// otherwise. Mirrors exactly the two RED rules of `healthNotices` in
-/// ui/src/main.ts — change together: a state the banner paints red that this
-/// does not (or the reverse) is a notification the window cannot explain.
-/// Silent on a daemon too old to report (empty `daemon_version`).
+/// ui/src/logic/health.ts — change together: a state the banner paints red
+/// that this does not (or the reverse) is a notification the window cannot
+/// explain. Silent on a daemon too old to report (empty `daemon_version`).
 fn enforcement_red(health: &Health, domain_block_active: bool) -> Option<&'static str> {
     if health.daemon_version.is_empty() {
         return None;

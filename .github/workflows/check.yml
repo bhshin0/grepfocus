@@ -1,6 +1,6 @@
 # Runs the same pre-flight a maintainer runs before committing
-# (scripts/check.sh: fmt, clippy, tests, UI build) plus the version
-# consistency check, on every push to master and every pull request.
+# (scripts/check.sh: fmt, clippy, tests, UI build, UI unit tests) plus the
+# version consistency check, on every push to master and every pull request.
 name: check
 
 on:

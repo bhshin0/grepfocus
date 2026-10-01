@@ -142,6 +142,8 @@ It runs, stopping on the first failure:
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
 - `pnpm --dir crates/gui/ui build` (`tsc -noEmit` + `vite build`)
+- `pnpm --dir crates/gui/ui test` (vitest, unit tests over the pure UI logic in
+  `crates/gui/ui/src/logic/`)
 
 Requirements: the `rustfmt` and `clippy` components
 (`rustup component add rustfmt clippy`), `pnpm`, and — for the workspace-wide

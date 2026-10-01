@@ -10,6 +10,9 @@ const SOCK_PATH: &str = "/run/grepfocus/sock";
 
 /// Actionable copy for the classic first-run connect failures; the raw error
 /// is appended by the caller so debuggability survives the friendlier text.
+/// The GUI picks its first-run dialog mode off two substrings of these,
+/// "daemon is not running" and "not allowed to talk" — change together with
+/// crates/gui/ui/src/logic/firstrun.ts, whose tests carry the texts verbatim.
 fn connect_error_message(kind: std::io::ErrorKind) -> &'static str {
     use std::io::ErrorKind::{ConnectionRefused, NotFound, PermissionDenied};
     match kind {
@@ -73,5 +76,29 @@ mod tests {
         let msg = connect_error_message(ErrorKind::TimedOut);
         assert_eq!(msg, "Could not reach the GrepFocus daemon.");
         assert!(!msg.contains("sudo"));
+    }
+
+    // The substrings `unreachableMode` in ui/src/logic/firstrun.ts keys on to
+    // pick the first-run dialog's mode; its fixtures carry these texts
+    // verbatim, so a reword here must land there too.
+
+    #[test]
+    fn not_running_tell_matches_the_first_run_dialog() {
+        assert!(connect_error_message(ErrorKind::NotFound).contains("daemon is not running"));
+        assert!(
+            connect_error_message(ErrorKind::ConnectionRefused).contains("daemon is not running")
+        );
+    }
+
+    #[test]
+    fn permission_denied_tell_matches_the_first_run_dialog() {
+        assert!(connect_error_message(ErrorKind::PermissionDenied).contains("not allowed to talk"));
+    }
+
+    #[test]
+    fn generic_fallback_carries_no_first_run_tell() {
+        let msg = connect_error_message(ErrorKind::TimedOut);
+        assert!(!msg.contains("daemon is not running"));
+        assert!(!msg.contains("not allowed to talk"));
     }
 }

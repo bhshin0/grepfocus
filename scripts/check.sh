@@ -2,11 +2,12 @@
 # GrepFocus pre-flight checks — run before committing.
 #
 # Runs, in order: formatting check, clippy (warnings are errors), the full test
-# suite, and the UI type-check/build. Any failure stops the run (set -e).
+# suite, the UI type-check/build, and the UI unit tests (vitest). Any failure
+# stops the run (set -e).
 #
 # Requirements:
 #   - rustfmt + clippy components:  rustup component add rustfmt clippy
-#   - pnpm (for the UI build)
+#   - pnpm (for the UI build and tests)
 #   - the GUI crate compiles only where webkit2gtk-4.1 + gtk-3 dev libs are
 #     present; on a headless box, scope the Rust steps to
 #     `-p grepfocus-core -p grepfocusd` by hand.
@@ -37,6 +38,9 @@ pnpm --dir crates/gui/ui install
 
 echo "==> pnpm --dir crates/gui/ui build (tsc -noEmit + vite build)"
 pnpm --dir crates/gui/ui build
+
+echo "==> pnpm --dir crates/gui/ui test (vitest)"
+pnpm --dir crates/gui/ui test
 
 echo
 echo "==> All checks passed."
