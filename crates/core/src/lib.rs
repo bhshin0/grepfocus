@@ -4,10 +4,11 @@
 //! the byte length of the payload, followed by the JSON payload itself.
 //! Both directions use the same framing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
+pub mod config_doc;
 pub mod hmac_sig;
 pub mod license;
 pub mod validate;
@@ -231,6 +232,13 @@ pub struct ActiveBlock {
     /// which falls back to the embedded block.
     #[serde(default)]
     pub allowance: Option<AllowancePolicy>,
+    /// Refused connections attributed to this block since it was activated
+    /// — the live per-run counter behind the status card's "blocked N
+    /// times". Reset by construction: every activation site writes `0`.
+    /// Persists with the record across a daemon restart; `0` on records
+    /// written before this field existed.
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 impl ActiveBlock {
@@ -697,6 +705,20 @@ pub struct DayStat {
     pub break_secs: u64,
     pub breaks_refused: u32,
     pub app_kills: u32,
+    /// Refused-connection attempts per blocklist entry. Capped at
+    /// [`UsageStats::ATTEMPT_DOMAINS_PER_DAY`] distinct entries, first come
+    /// per day — NOT the day's top 50: once the cap is hit a new entry moves
+    /// only `attempts_total`, while an entry already listed keeps counting.
+    /// So "other" = `attempts_total - sum(attempts)`, but only inside the
+    /// [`UsageStats::ATTEMPT_DETAIL_DAYS`] window: older rows have this map
+    /// cleared and keep `attempts_total` alone, so a reader deriving "other"
+    /// must restrict itself to that window or every old attempt shows up as
+    /// "other". A `BTreeMap` so serialization is deterministic under the
+    /// HMAC seal.
+    #[serde(default)]
+    pub attempts: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub attempts_total: u32,
 }
 
 /// Lifetime running counters — cheap, never pruned (unlike `days`/`sessions`,
@@ -709,6 +731,9 @@ pub struct LifetimeTotals {
     pub sessions: u64,
     pub app_kills: u64,
     pub breaks_refused: u64,
+    /// Refused-connection attempts, lifetime.
+    #[serde(default)]
+    pub attempts: u64,
 }
 
 /// Bounded, self-pruning record of the user's focus habit. Lives inside
@@ -733,6 +758,11 @@ impl UsageStats {
     pub const SESSIONS_CAP: usize = 200;
     /// Most recent day rollups kept; older ones drop off the front.
     pub const DAYS_RETAINED: usize = 365;
+    /// Distinct blocklist entries a day row keeps attempt counts for; beyond
+    /// it only the day's `attempts_total` moves.
+    pub const ATTEMPT_DOMAINS_PER_DAY: usize = 50;
+    /// Day rows more than this many days old keep only `attempts_total`.
+    pub const ATTEMPT_DETAIL_DAYS: i64 = 30;
 
     /// Find (or insert, keeping `days` sorted ascending) the rollup row for
     /// `day`. Callers must run [`UsageStats::enforce_day_retention`] after any
@@ -817,6 +847,48 @@ impl UsageStats {
         }
         self.totals.app_kills = self.totals.app_kills.saturating_add(n);
         self.enforce_day_retention();
+    }
+
+    /// Credit one refused connection to blocklist entry `host` on `day`: the
+    /// row's per-entry count (until [`UsageStats::ATTEMPT_DOMAINS_PER_DAY`]
+    /// distinct entries, after which only the day total moves), the day
+    /// total and the lifetime total. Then drops the per-entry detail from
+    /// rows older than [`UsageStats::ATTEMPT_DETAIL_DAYS`] so the detail
+    /// stays bounded while every row keeps its total.
+    ///
+    /// `host` must be a canonical blocklist entry (the `Block.domains` text
+    /// the proxy matched), never peer-supplied text: it becomes a key in the
+    /// sealed state file and a row in the stats table.
+    pub fn credit_attempt(&mut self, day: i64, host: &str) {
+        debug_assert!(
+            !host.chars().any(char::is_control) && host.len() <= validate::MAX_HOSTNAME_LEN,
+            "credit_attempt takes a canonical blocklist entry, got {host:?}"
+        );
+        {
+            let d = self.day_entry(day);
+            d.attempts_total = d.attempts_total.saturating_add(1);
+            if let Some(n) = d.attempts.get_mut(host) {
+                *n = n.saturating_add(1);
+            } else if d.attempts.len() < Self::ATTEMPT_DOMAINS_PER_DAY {
+                d.attempts.insert(host.to_string(), 1);
+            }
+        }
+        self.totals.attempts = self.totals.attempts.saturating_add(1);
+        self.compact_attempt_detail(day);
+        self.enforce_day_retention();
+    }
+
+    /// Clear the per-entry attempt detail on every row more than
+    /// [`UsageStats::ATTEMPT_DETAIL_DAYS`] days before `today`. `days` is
+    /// sorted ascending, so the walk stops at the first row inside the window.
+    fn compact_attempt_detail(&mut self, today: i64) {
+        let cutoff = today - Self::ATTEMPT_DETAIL_DAYS;
+        for d in self.days.iter_mut() {
+            if d.day >= cutoff {
+                break;
+            }
+            d.attempts.clear();
+        }
     }
 
     /// Compute `(current, longest)` focus streaks from `days`, treating a day
@@ -952,6 +1024,13 @@ pub struct Settings {
     /// fills it from the default (ON) rather than from serde's bool zero
     /// (OFF) — see the container-level `#[serde(default)]`.
     pub instant_breaks: bool,
+    /// Desktop nudge when a blocked site is attempted — a sub-switch of
+    /// `notifications`, read with it off the same status poll. Default OFF:
+    /// attempts are the only chatty event kind and the only one that names a
+    /// site, so nobody gets them without opting in. An older GUI's
+    /// `set_settings` omits the field, which resets it to off — the safe
+    /// direction for an off-by-default switch (compare `instant_breaks`).
+    pub attempt_nudges: bool,
 }
 
 impl Default for Settings {
@@ -965,6 +1044,7 @@ impl Default for Settings {
         Self {
             notifications: true,
             instant_breaks: true,
+            attempt_nudges: false,
         }
     }
 }
@@ -1139,6 +1219,61 @@ pub struct Health {
     pub last_error_unix: Option<u64>,
 }
 
+// ── Event wire types ────────────────────────────────────────────────────────
+//
+// What the daemon has recently DONE about enforcement, carried on `Status` as
+// a bounded, sequence-numbered list so a client polling every few seconds can
+// turn each entry into exactly one desktop notification. Same forward-
+// compatibility doctrine as the health types above: an unknown `kind` folds
+// to `Unknown` and clients say nothing for it.
+
+/// What a [`RecentEvent`] records.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    /// The loopback proxy refused a connection to a blocked host.
+    Attempt,
+    /// A process matching a blocked app entry was killed.
+    AppKill,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Longest `detail` the daemon puts on the wire; longer text is cut at the
+/// source so one entry cannot bloat every status frame.
+pub const MAX_EVENT_DETAIL_CHARS: usize = 64;
+
+/// One enforcement event, as carried in `Status.recent_events`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecentEvent {
+    /// Monotonic per daemon run, starting at 1; the client's dedup key. A
+    /// value below the last one seen means the daemon restarted.
+    pub seq: u64,
+    pub unix: u64,
+    pub kind: EventKind,
+    pub block_id: u64,
+    /// `attempt`: the blocklist entry (canonical hostname). `app_kill`: the
+    /// matched app entry's label. Never more than [`MAX_EVENT_DETAIL_CHARS`].
+    pub detail: String,
+}
+
+/// Where the daemon's trusted block clock stood at its last tick, persisted
+/// so a restart within the same boot resumes that time base instead of
+/// re-reading a wall clock that may have been stepped meanwhile.
+///
+/// `boot_id` is `/proc/sys/kernel/random/boot_id`: after a reboot the anchor
+/// is stale by construction and the daemon seeds from the wall clock again.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClockAnchor {
+    pub trusted_unix: u64,
+    /// `CLOCK_BOOTTIME` seconds at the moment `trusted_unix` was taken.
+    pub boot_secs: u64,
+    pub boot_id: String,
+}
+
 /// Daemon-side persisted state.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
@@ -1197,6 +1332,11 @@ pub struct State {
     /// default (notifications on), never with a zeroed one.
     #[serde(default)]
     pub settings: Settings,
+    /// The trusted block clock's last anchor (see [`ClockAnchor`]), `None`
+    /// until a daemon that keeps one has ticked. `serde(default)` so state
+    /// written before this field existed loads.
+    #[serde(default)]
+    pub clock_anchor: Option<ClockAnchor>,
 }
 
 impl State {
@@ -1536,6 +1676,12 @@ pub enum Response {
         /// same.
         #[serde(default)]
         health: Box<Health>,
+        /// The daemon's most recent enforcement events (see [`RecentEvent`]),
+        /// oldest first, bounded and sequence-numbered so a client can dedup
+        /// across polls. `#[serde(default)]`: an old daemon never emits it
+        /// and the client reads an empty vec.
+        #[serde(default)]
+        recent_events: Vec<RecentEvent>,
     },
     Added {
         id: u64,
@@ -1676,6 +1822,7 @@ mod tests {
             break_until_unix: None,
             apps_enforced: false,
             lock: LockMode::Unlocked,
+            attempts: 0,
         };
         // Simulate a mid-block edit landing on the embedded block.
         a.block.set_policy(AllowancePolicy::PerDay { secs: 36_000 });
@@ -1857,6 +2004,7 @@ mod tests {
                     notifications: false,
                     // Omitted on the wire, so it fills from the default (ON).
                     instant_breaks: true,
+                    attempt_nudges: false,
                 }
             }
         ));
@@ -1864,6 +2012,7 @@ mod tests {
             settings: Settings {
                 notifications: true,
                 instant_breaks: true,
+                attempt_nudges: false,
             },
         })
         .unwrap();
@@ -2771,6 +2920,7 @@ mod tests {
                 sessions: 2,
                 app_kills: 5,
                 breaks_refused: 1,
+                attempts: 9,
             },
             sessions: vec![session(2000, 120, Origin::Schedule)],
             days: vec![DayStat {
@@ -2781,6 +2931,8 @@ mod tests {
                 break_secs: 60,
                 breaks_refused: 1,
                 app_kills: 5,
+                attempts: BTreeMap::from([("reddit.com".to_string(), 3)]),
+                attempts_total: 4,
             }],
             current_streak: 3,
             longest_streak: 7,
@@ -2800,6 +2952,9 @@ mod tests {
                 assert_eq!(sessions.len(), 1);
                 assert_eq!(sessions[0].origin, Origin::Schedule);
                 assert_eq!(days[0].day, 42);
+                assert_eq!(days[0].attempts["reddit.com"], 3);
+                assert_eq!(days[0].attempts_total, 4);
+                assert_eq!(totals.attempts, 9);
                 assert_eq!(current_streak, 3);
                 assert_eq!(longest_streak, 7);
             }
@@ -2931,6 +3086,7 @@ mod tests {
             settings: Settings::default(),
             instant_breaks_degraded: false,
             health: Box::default(),
+            recent_events: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -3010,6 +3166,7 @@ mod tests {
                 last_error: Some("reading /etc/hosts: Permission denied".into()),
                 last_error_unix: Some(999),
             }),
+            recent_events: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(
@@ -3109,6 +3266,7 @@ mod tests {
                 apps_enforced: true,
                 lock: LockMode::Unlocked,
                 allowance: None,
+                attempts: 0,
             }],
             ..Default::default()
         };
@@ -3437,5 +3595,222 @@ mod tests {
         let s: BrowserPolicyStatus = serde_json::from_str("{}").unwrap();
         assert_eq!(s, BrowserPolicyStatus::default());
         assert_eq!(s.state, BrowserPolicyState::Unknown);
+    }
+
+    // ── 0.7.0 wire additions ────────────────────────────────────────────────
+
+    // Old daemon → new GUI: a Status frame WITHOUT `recent_events` (what
+    // every daemon before 0.7.0 emits) reads as an empty list.
+    #[test]
+    fn status_without_recent_events_still_deserializes() {
+        let old = r#"{
+            "result": "status",
+            "active": [],
+            "now_unix": 1752192000,
+            "password_set": false,
+            "unlocked": true,
+            "allowance_used": []
+        }"#;
+        let resp: Response = serde_json::from_str(old).unwrap();
+        match resp {
+            Response::Status { recent_events, .. } => assert!(recent_events.is_empty()),
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    // Pin the event wire shape and the forward-compat fold: a `kind` this
+    // build does not know reads as `Unknown`, never as a parse error, and a
+    // partial object fills from the default.
+    #[test]
+    fn unknown_kind_on_the_wire_folds() {
+        let e = RecentEvent {
+            seq: 3,
+            unix: 1752192000,
+            kind: EventKind::AppKill,
+            block_id: 7,
+            detail: "steam".into(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(
+            json,
+            r#"{"seq":3,"unix":1752192000,"kind":"app_kill","block_id":7,"detail":"steam"}"#
+        );
+        let back: RecentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
+
+        let attempt: RecentEvent =
+            serde_json::from_str(r#"{"seq":1,"kind":"attempt","detail":"reddit.com"}"#).unwrap();
+        assert_eq!(attempt.kind, EventKind::Attempt);
+        assert_eq!(attempt.unix, 0);
+
+        let future: RecentEvent =
+            serde_json::from_str(r#"{"seq":9,"kind":"teleport","detail":"x"}"#).unwrap();
+        assert_eq!(future.kind, EventKind::Unknown);
+        assert_eq!(RecentEvent::default().kind, EventKind::Unknown);
+    }
+
+    // A pre-0.7.0 day row has no attempt fields: they read as empty/zero.
+    #[test]
+    fn day_stat_without_attempts_deserializes() {
+        let old = r#"{
+            "day": 20000,
+            "focus_secs": 600,
+            "sessions_completed": 1,
+            "breaks_taken": 0,
+            "break_secs": 0,
+            "breaks_refused": 0,
+            "app_kills": 2
+        }"#;
+        let d: DayStat = serde_json::from_str(old).unwrap();
+        assert!(d.attempts.is_empty());
+        assert_eq!(d.attempts_total, 0);
+        assert_eq!(d.app_kills, 2);
+    }
+
+    // A pre-0.7.0 active record has no `attempts`: it starts at zero.
+    #[test]
+    fn active_block_without_attempts_defaults_to_zero() {
+        let old = r#"{
+            "block": {"id": 1, "name": "reddit", "domains": ["reddit.com"], "apps": []},
+            "started_at_unix": 1000,
+            "ends_at_unix": 2000
+        }"#;
+        let a: ActiveBlock = serde_json::from_str(old).unwrap();
+        assert_eq!(a.attempts, 0);
+    }
+
+    #[test]
+    fn lifetime_totals_without_attempts_deserialize() {
+        let old = r#"{"focus_secs": 10, "sessions": 1, "app_kills": 0, "breaks_refused": 0}"#;
+        let t: LifetimeTotals = serde_json::from_str(old).unwrap();
+        assert_eq!(t.attempts, 0);
+        assert_eq!(t.focus_secs, 10);
+    }
+
+    // The 51st distinct host on one day moves only the day total; the map
+    // stays at the cap, and the derived "other" remainder is what the GUI
+    // shows.
+    #[test]
+    fn credit_attempt_caps_domains_and_keeps_total() {
+        let mut s = UsageStats::default();
+        for i in 0..=UsageStats::ATTEMPT_DOMAINS_PER_DAY {
+            s.credit_attempt(42, &format!("site{i}.com"));
+        }
+        assert_eq!(s.days.len(), 1);
+        let d = &s.days[0];
+        assert_eq!(d.attempts.len(), UsageStats::ATTEMPT_DOMAINS_PER_DAY);
+        assert_eq!(
+            d.attempts_total as usize,
+            UsageStats::ATTEMPT_DOMAINS_PER_DAY + 1
+        );
+        assert!(!d.attempts.contains_key("site50.com"));
+        // A host already in the map keeps counting past the cap.
+        s.credit_attempt(42, "site0.com");
+        let d = &s.days[0];
+        assert_eq!(d.attempts["site0.com"], 2);
+        assert_eq!(
+            d.attempts_total as usize,
+            UsageStats::ATTEMPT_DOMAINS_PER_DAY + 2
+        );
+        let listed: u32 = d.attempts.values().sum();
+        assert_eq!(d.attempts_total - listed, 1, "one attempt lands in 'other'");
+    }
+
+    // Detail older than the window is dropped on the next credit; the row
+    // and its total survive. The boundary is inclusive: exactly 30 days old
+    // keeps its detail.
+    #[test]
+    fn credit_attempt_compacts_detail_older_than_30_days() {
+        let mut s = UsageStats::default();
+        s.credit_attempt(100, "reddit.com");
+        s.credit_attempt(100, "reddit.com");
+        s.credit_attempt(100 + UsageStats::ATTEMPT_DETAIL_DAYS, "x.com");
+        assert_eq!(s.days[0].attempts["reddit.com"], 2, "30 days old: kept");
+        s.credit_attempt(101 + UsageStats::ATTEMPT_DETAIL_DAYS, "x.com");
+        let old = &s.days[0];
+        assert_eq!(old.day, 100);
+        assert!(old.attempts.is_empty(), "31 days old: detail cleared");
+        assert_eq!(old.attempts_total, 2, "the total survives");
+        // Rows inside the window are untouched.
+        assert_eq!(s.days[1].attempts["x.com"], 1);
+    }
+
+    #[test]
+    fn credit_attempt_bumps_lifetime_total() {
+        let mut s = UsageStats::default();
+        s.credit_attempt(42, "reddit.com");
+        s.credit_attempt(43, "reddit.com");
+        s.credit_attempt(43, "news.ycombinator.com");
+        assert_eq!(s.totals.attempts, 3);
+        assert_eq!(s.days.len(), 2);
+        assert_eq!(s.days[1].attempts_total, 2);
+        // The per-entry map is a BTreeMap, so the wire order is stable.
+        let json = serde_json::to_string(&s.days[1].attempts).unwrap();
+        assert_eq!(json, r#"{"news.ycombinator.com":1,"reddit.com":1}"#);
+    }
+
+    // Upgrade compat, mirroring `old_settings_without_instant_breaks_defaults_on`:
+    // a 0.6.0 settings object has no `attempt_nudges` and must read as OFF —
+    // which here is also what the hand-written default says.
+    #[test]
+    fn old_settings_without_attempt_nudges_defaults_off() {
+        assert!(!Settings::default().attempt_nudges);
+        let old = r#"{
+            "next_id": 1,
+            "blocks": [],
+            "active": [],
+            "settings": { "notifications": true, "instant_breaks": true }
+        }"#;
+        let st: State = serde_json::from_str(old).unwrap();
+        assert!(!st.settings.attempt_nudges);
+        assert!(st.settings.notifications);
+        let s: Settings =
+            serde_json::from_str(r#"{"notifications":true,"attempt_nudges":true}"#).unwrap();
+        assert!(s.attempt_nudges, "an explicit value is honoured");
+        assert!(s.instant_breaks);
+    }
+
+    // A pre-0.7.0 state file has no `clock_anchor`: it loads as `None`.
+    #[test]
+    fn state_without_clock_anchor_still_deserializes() {
+        let old = r#"{ "next_id": 1, "blocks": [], "high_water_unix": 42 }"#;
+        let st: State = serde_json::from_str(old).unwrap();
+        assert_eq!(st.clock_anchor, None);
+        assert_eq!(st.high_water_unix, 42);
+    }
+
+    #[test]
+    fn clock_anchor_round_trips() {
+        let st = State {
+            clock_anchor: Some(ClockAnchor {
+                trusted_unix: 1752192000,
+                boot_secs: 3600,
+                boot_id: "0f7e5e9a-2b1c-4d3e-8f90-1a2b3c4d5e6f".into(),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&st).unwrap();
+        assert!(
+            json.contains(
+                r#""clock_anchor":{"trusted_unix":1752192000,"boot_secs":3600,"boot_id":"#
+            ),
+            "got {json}"
+        );
+        let back: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.clock_anchor, st.clock_anchor);
+        // A partial object fills from the default (a later build may add a
+        // field; an older one may omit it) — never a parse error.
+        let partial: ClockAnchor = serde_json::from_str(r#"{"trusted_unix": 5}"#).unwrap();
+        assert_eq!(
+            partial,
+            ClockAnchor {
+                trusted_unix: 5,
+                boot_secs: 0,
+                boot_id: String::new()
+            }
+        );
+        let st: State =
+            serde_json::from_str(r#"{"next_id": 1, "blocks": [], "clock_anchor": {}}"#).unwrap();
+        assert_eq!(st.clock_anchor, Some(ClockAnchor::default()));
     }
 }

@@ -1,10 +1,10 @@
-//! Block-content validation and canonicalization.
+//! Block and schedule validation, and block canonicalization.
 //!
-//! The daemon is the authority (it refuses a bad `AddBlock`/`UpdateBlock` and
-//! sanitizes stored blocks at startup); the GUI runs the same functions before
-//! the round trip so the user sees the same text without one. Everything here
-//! is pure — no I/O, no logging, no clock — so both sides agree by
-//! construction.
+//! The daemon is the authority (it refuses a bad `AddBlock`/`UpdateBlock`/
+//! `AddSchedule` and sanitizes stored blocks at startup); the GUI and the
+//! config importer run the same functions before the round trip so the user
+//! sees the same text without one. Everything here is pure — no I/O, no
+//! logging, no clock — so every caller agrees by construction.
 //!
 //! Two layers, kept apart on purpose:
 //!
@@ -18,7 +18,7 @@
 
 use std::fmt;
 
-use crate::{AppMatcher, Block};
+use crate::{AppMatcher, Block, Schedule, DAYS_ALL};
 
 /// DNS name limit; the hosts writer emits the name verbatim, so nothing longer
 /// can ever resolve.
@@ -34,6 +34,7 @@ pub const WWW_ALIAS_RESERVE: usize = 4;
 pub const MAX_DOMAINS_PER_BLOCK: usize = 5000;
 /// Every matcher is compared against every process on every procwatch sweep.
 pub const MAX_APPS_PER_BLOCK: usize = 500;
+/// Block and schedule names, in characters.
 pub const MAX_BLOCK_NAME_CHARS: usize = 200;
 /// A one- or two-character `cmdline` substring matches nearly every process
 /// on the machine.
@@ -389,6 +390,53 @@ pub fn validate_block(block: &mut Block) -> Result<(), String> {
     block.domains = domains;
     block.apps = apps;
     Ok(())
+}
+
+/// Validate a schedule a client wants saved. `Err` is the exact user-facing
+/// text. Does not check that `block_id` exists — that is the daemon's state
+/// to consult.
+///
+/// A window must end by 24:00. The scheduler's window functions end every
+/// window at midnight, so letting one run past it (a 24-hour length cap
+/// instead) lands together with those functions in the schedule-integrity
+/// package — never here first.
+pub fn validate_schedule(s: &Schedule) -> Result<(), String> {
+    if s.name.trim().is_empty() {
+        return Err("schedule name cannot be empty".into());
+    }
+    if s.name.chars().any(char::is_control) {
+        return Err("schedule name cannot contain control characters".into());
+    }
+    if s.name.chars().count() > MAX_BLOCK_NAME_CHARS {
+        return Err(format!(
+            "schedule name is too long (max {MAX_BLOCK_NAME_CHARS} characters)"
+        ));
+    }
+    if s.days == 0 {
+        return Err("at least one weekday must be selected".into());
+    }
+    if s.days & !DAYS_ALL != 0 {
+        return Err("days bitmask has unknown bits set".into());
+    }
+    if s.start_minute >= 1440 {
+        return Err("start_minute must be 0..1440".into());
+    }
+    if s.duration_minutes == 0 {
+        return Err("duration_minutes must be >= 1".into());
+    }
+    if s.start_minute as u32 + s.duration_minutes as u32 > 1440 {
+        return Err("schedule cannot span midnight; split into two schedules instead".into());
+    }
+    Ok(())
+}
+
+/// Two schedules are "the same" if they drive the same block over the same
+/// days and time window. Names may differ — only the effect matters.
+pub fn schedules_equivalent(a: &Schedule, b: &Schedule) -> bool {
+    a.block_id == b.block_id
+        && a.days == b.days
+        && a.start_minute == b.start_minute
+        && a.duration_minutes == b.duration_minutes
 }
 
 #[cfg(test)]
@@ -878,5 +926,95 @@ mod tests {
         assert_eq!(b.lock, LockMode::ChallengeBreaks);
         assert_eq!(b.id, 1);
         assert_eq!(b.name, "x");
+    }
+
+    fn sched(start: u16, dur: u16, days: u8) -> Schedule {
+        Schedule {
+            id: 1,
+            name: "work".into(),
+            block_id: 1,
+            days,
+            start_minute: start,
+            duration_minutes: dur,
+            enabled: true,
+        }
+    }
+
+    // A window must end by 24:00 — the rule the daemon has always applied,
+    // byte for byte. Ending exactly at midnight is fine; one minute past is
+    // not. Relaxing this to a 24-hour length cap belongs to the
+    // schedule-integrity package, with the scheduler changes that make a
+    // spanning window actually run.
+    #[test]
+    fn validate_schedule_refuses_midnight_span() {
+        assert_eq!(validate_schedule(&sched(23 * 60, 60, DAYS_ALL)), Ok(()));
+        assert_eq!(validate_schedule(&sched(0, 1440, DAYS_ALL)), Ok(()));
+        assert_eq!(validate_schedule(&sched(1439, 1, DAYS_ALL)), Ok(()));
+        let midnight: Result<(), String> =
+            Err("schedule cannot span midnight; split into two schedules instead".into());
+        assert_eq!(validate_schedule(&sched(23 * 60, 61, DAYS_ALL)), midnight);
+        assert_eq!(validate_schedule(&sched(1439, 2, DAYS_ALL)), midnight);
+        assert_eq!(validate_schedule(&sched(0, 1441, DAYS_ALL)), midnight);
+    }
+
+    #[test]
+    fn validate_schedule_rejects_each_kind() {
+        let mut s = sched(540, 60, DAYS_ALL);
+        s.name = "  ".into();
+        assert_eq!(
+            validate_schedule(&s),
+            Err("schedule name cannot be empty".into())
+        );
+        s.name = "tab\there".into();
+        assert_eq!(
+            validate_schedule(&s),
+            Err("schedule name cannot contain control characters".into())
+        );
+        s.name = "n".repeat(MAX_BLOCK_NAME_CHARS + 1);
+        assert_eq!(
+            validate_schedule(&s),
+            Err("schedule name is too long (max 200 characters)".into())
+        );
+        s.name = "n".repeat(MAX_BLOCK_NAME_CHARS);
+        assert_eq!(validate_schedule(&s), Ok(()), "exactly the cap is fine");
+        assert_eq!(
+            validate_schedule(&sched(540, 60, 0)),
+            Err("at least one weekday must be selected".into())
+        );
+        assert_eq!(
+            validate_schedule(&sched(540, 60, 0b1000_0000)),
+            Err("days bitmask has unknown bits set".into())
+        );
+        assert_eq!(
+            validate_schedule(&sched(1440, 60, DAYS_ALL)),
+            Err("start_minute must be 0..1440".into())
+        );
+        assert_eq!(
+            validate_schedule(&sched(540, 0, DAYS_ALL)),
+            Err("duration_minutes must be >= 1".into())
+        );
+    }
+
+    #[test]
+    fn schedules_equivalent_ignores_name() {
+        let a = sched(540, 60, DAYS_ALL);
+        let mut b = a.clone();
+        b.id = 2;
+        b.name = "another name".into();
+        b.enabled = false;
+        assert!(schedules_equivalent(&a, &b));
+        // Each of the four effect-bearing fields breaks the equivalence.
+        let mut c = a.clone();
+        c.block_id += 1;
+        assert!(!schedules_equivalent(&a, &c));
+        let mut c = a.clone();
+        c.days = 0b10;
+        assert!(!schedules_equivalent(&a, &c));
+        let mut c = a.clone();
+        c.start_minute += 1;
+        assert!(!schedules_equivalent(&a, &c));
+        let mut c = a.clone();
+        c.duration_minutes += 1;
+        assert!(!schedules_equivalent(&a, &c));
     }
 }

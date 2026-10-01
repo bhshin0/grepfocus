@@ -365,6 +365,7 @@ fn reconcile(
             // Snapshotted at activation: a mid-block license change (either
             // direction) never alters a running block's app enforcement.
             apps_enforced: gates.app_blocking,
+            attempts: 0,
         });
         info!(
             schedule_id = s.id,
@@ -567,6 +568,7 @@ mod tests {
             allowance: None,
             apps_enforced: false,
             lock: LockMode::Unlocked,
+            attempts: 0,
         }
     }
 
@@ -580,6 +582,7 @@ mod tests {
             allowance: None,
             apps_enforced: false,
             lock: LockMode::Unlocked,
+            attempts: 0,
         }
     }
 
@@ -1122,6 +1125,7 @@ mod tests {
             allowance: None,
             apps_enforced: false,
             lock: LockMode::Unlocked,
+            attempts: 0,
         }
     }
 

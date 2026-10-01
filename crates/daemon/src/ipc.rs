@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use grepfocus_core::license::{self, LicenseClaims};
-use grepfocus_core::validate::validate_block;
+use grepfocus_core::validate::{schedules_equivalent, validate_block, validate_schedule};
 use grepfocus_core::{
     compute_grant, evaluate_allowance, now_unix, validate_policy, ActiveBlock, AllowanceLedger,
     AllowancePolicy, AllowanceStatus, AppMatcher, BreakRecord, LockMode, Originator, PomodoroPhase,
-    PomodoroSession, PomodoroStatus, ProxyStatus, Request, Response, Schedule, State,
+    PomodoroSession, PomodoroStatus, ProxyStatus, Request, Response, State,
 };
 use nix::unistd::Group;
 use tokio::net::{UnixListener, UnixStream};
@@ -233,6 +233,8 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 settings: st.settings.clone(),
                 instant_breaks_degraded,
                 health: Box::new(health),
+                // Empty until the daemon keeps an event log.
+                recent_events: Vec::new(),
             }
         }
 
@@ -407,6 +409,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                     originator: Originator::Manual,
                     break_until_unix: None,
                     apps_enforced,
+                    attempts: 0,
                 });
                 if let Err(e) = state::save(&st, &daemon.key) {
                     st.active.pop();
@@ -597,7 +600,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             if !st.blocks.iter().any(|b| b.id == schedule.block_id) {
                 return err(format!("no block with id {}", schedule.block_id));
             }
-            if let Some(msg) = validate_schedule(&schedule) {
+            if let Err(msg) = validate_schedule(&schedule) {
                 return err(msg);
             }
             if st
@@ -635,7 +638,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             if !st.blocks.iter().any(|b| b.id == schedule.block_id) {
                 return err(format!("no block with id {}", schedule.block_id));
             }
-            if let Some(msg) = validate_schedule(&schedule) {
+            if let Err(msg) = validate_schedule(&schedule) {
                 return err(msg);
             }
             if st
@@ -885,6 +888,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                     originator: Originator::Pomodoro,
                     break_until_unix: None,
                     apps_enforced,
+                    attempts: 0,
                 });
                 if let Err(e) = state::save(&st, &daemon.key) {
                     st.active.pop();
@@ -1153,37 +1157,6 @@ fn generate_challenge(rng: &mut impl rand::Rng) -> String {
     (0..CHALLENGE_LEN)
         .map(|_| CHALLENGE_ALPHABET[rng.gen_range(0..CHALLENGE_ALPHABET.len())] as char)
         .collect()
-}
-
-/// Two schedules are "the same" if they drive the same block over the same
-/// days and time window. Names may differ — only the effect matters.
-fn schedules_equivalent(a: &Schedule, b: &Schedule) -> bool {
-    a.block_id == b.block_id
-        && a.days == b.days
-        && a.start_minute == b.start_minute
-        && a.duration_minutes == b.duration_minutes
-}
-
-fn validate_schedule(s: &Schedule) -> Option<String> {
-    if s.name.trim().is_empty() {
-        return Some("schedule name cannot be empty".into());
-    }
-    if s.days == 0 {
-        return Some("at least one weekday must be selected".into());
-    }
-    if s.days & !grepfocus_core::DAYS_ALL != 0 {
-        return Some("days bitmask has unknown bits set".into());
-    }
-    if s.start_minute >= 1440 {
-        return Some("start_minute must be 0..1440".into());
-    }
-    if s.duration_minutes == 0 {
-        return Some("duration_minutes must be >= 1".into());
-    }
-    if s.start_minute as u32 + s.duration_minutes as u32 > 1440 {
-        return Some("schedule cannot span midnight; split into two schedules instead".into());
-    }
-    None
 }
 
 /// Bounds for `StartPomodoro`, validated before any mutation. Pure so the
@@ -1500,6 +1473,7 @@ mod tests {
             apps_enforced: false,
             lock: LockMode::Unlocked,
             allowance: Some(policy),
+            attempts: 0,
         }
     }
 
@@ -1947,6 +1921,7 @@ mod tests {
                 settings: Settings {
                     notifications: false,
                     instant_breaks: true,
+                    attempt_nudges: false,
                 },
             },
             &daemon,
@@ -1965,7 +1940,7 @@ mod tests {
     // `update_needs_app_license`) instead — except where a later,
     // environment-independent error proves the gate was passed.
 
-    use grepfocus_core::{AllowancePolicy, Block, Settings, DAY_MON};
+    use grepfocus_core::{AllowancePolicy, Block, Schedule, Settings, DAY_MON};
 
     fn blk(id: u64, apps: Vec<AppMatcher>) -> Block {
         Block {
@@ -1995,6 +1970,7 @@ mod tests {
             allowance: None,
             apps_enforced: false,
             lock,
+            attempts: 0,
         }
     }
 
@@ -3041,6 +3017,7 @@ mod tests {
             allowance: None,
             apps_enforced: false,
             lock: LockMode::Unlocked,
+            attempts: 0,
         }
     }
 

@@ -183,6 +183,7 @@ async fn get_status() -> Result<StatusOut, String> {
             settings,
             instant_breaks_degraded,
             health,
+            recent_events: _,
         } => {
             let env = probe_app_env();
             let update = version::advise(version::Probe {

@@ -337,6 +337,7 @@ mod tests {
             allowance: None,
             apps_enforced,
             lock: LockMode::Unlocked,
+            attempts: 0,
         }
     }
 

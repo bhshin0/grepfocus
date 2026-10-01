@@ -550,6 +550,7 @@ mod tests {
                 allowance: None,
                 apps_enforced: false,
                 lock: LockMode::Unlocked,
+                attempts: 0,
             }],
             ..Default::default()
         };

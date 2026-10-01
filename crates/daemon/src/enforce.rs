@@ -591,6 +591,7 @@ mod tests {
             apps_enforced: false,
             lock: grepfocus_core::LockMode::default(),
             allowance: None,
+            attempts: 0,
         }
     }
 
