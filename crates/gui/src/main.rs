@@ -2,17 +2,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod client;
+mod notify;
 mod tray;
 mod update;
 mod version;
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use grepfocus_core::{
     ActiveBlock, AllowanceLedger, AllowanceStatus, Block, DayStat, FocusSession, Health,
-    LifetimeTotals, NftStatus, PomodoroStatus, Request, Response, Schedule, Settings,
+    LifetimeTotals, PomodoroStatus, RecentEvent, Request, Response, Schedule, Settings,
 };
 use tauri::menu::{Menu, MenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -157,6 +157,11 @@ struct StatusOut {
     /// old daemon never emits it, in which case core's default arrives here
     /// with an empty `daemon_version`.
     health: Health,
+    /// The daemon's recent enforcement events (see `RecentEvent`), oldest
+    /// first, passed through untouched; empty from an old daemon. The status
+    /// watcher (`notify`) turns them into desktop notifications off its own
+    /// poll — the frontend never decides notifications from them.
+    recent_events: Vec<RecentEvent>,
     /// GUI/daemon version skew advice (see `version::advise`). Computed
     /// here, on every poll, so the banner tracks an install the moment it
     /// lands; never license-gated.
@@ -183,7 +188,7 @@ async fn get_status() -> Result<StatusOut, String> {
             settings,
             instant_breaks_degraded,
             health,
-            recent_events: _,
+            recent_events,
         } => {
             let env = probe_app_env();
             let update = version::advise(version::Probe {
@@ -212,6 +217,7 @@ async fn get_status() -> Result<StatusOut, String> {
                 settings,
                 instant_breaks_degraded,
                 health: *health,
+                recent_events,
                 update,
             })
         }
@@ -730,28 +736,6 @@ fn notify(app: &AppHandle, title: &str, body: &str) {
     let _ = app.notification().builder().title(title).body(body).show();
 }
 
-/// The notification body while enforcement is in a RED state, `None`
-/// otherwise. Mirrors exactly the two RED rules of `healthNotices` in
-/// ui/src/logic/health.ts — change together: a state the banner paints red
-/// that this does not (or the reverse) is a notification the window cannot
-/// explain. Silent on a daemon too old to report (empty `daemon_version`).
-fn enforcement_red(health: &Health, domain_block_active: bool) -> Option<&'static str> {
-    if health.daemon_version.is_empty() {
-        return None;
-    }
-    if health.last_error.is_some() {
-        return Some(
-            "The /etc/hosts change could not be applied — website blocking may not be enforced. Open GrepFocus for details.",
-        );
-    }
-    if domain_block_active && matches!(health.nft, NftStatus::Failed { .. }) {
-        return Some(
-            "DoH protection (nftables) failed — browsers using DNS-over-HTTPS can bypass the active block. Open GrepFocus for details.",
-        );
-    }
-    None
-}
-
 /// Show + focus the main window. Every un-hide path must go through here:
 /// tao 0.35's Wayland client-side decorations go stale across hide()/show() —
 /// the titlebar buttons render but ignore clicks until something forces a
@@ -876,23 +860,20 @@ fn reregister_tray(app: &AppHandle) {
 }
 
 /// Background task: poll the daemon every 5s, keep the tray tooltip in sync,
-/// and fire a notification whenever a block starts or ends, or enforcement
-/// newly goes RED (see `enforcement_red`). Runs for the life of the process
-/// (when a tray host is present, the window hides to tray rather than
-/// closing), so notifications keep flowing even with no window open. Also
-/// re-shows a hidden window if its tray host vanishes for another reason than
-/// the screen being locked (see `tray::RescueWatch`), and puts the tray item
-/// back in front of a host that (re)appears (see `tray::TrayWatch`).
+/// and show whatever `notify::Watch::poll` decides is news in that poll:
+/// blocks starting and ending, pomodoro phases, breaks about to end or over,
+/// apps closed, attempt nudges, and enforcement newly going RED. Runs for the
+/// life of the process (when a tray host is present, the window hides to tray
+/// rather than closing), so notifications keep flowing even with no window
+/// open. Also re-shows a hidden window if its tray host vanishes for another
+/// reason than the screen being locked (see `tray::RescueWatch`), and puts
+/// the tray item back in front of a host that (re)appears (see
+/// `tray::TrayWatch`).
 fn spawn_status_watcher(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        // id -> block name. `None` until the first successful poll so we
-        // establish a baseline without notifying for already-active blocks.
-        let mut prev: Option<HashMap<u64, String>> = None;
-        // Whether the last successful poll was RED; `None` until the first
-        // one, for the same baseline reason. Only the false→true edge
-        // notifies: the fault stays up until it clears, so repeating it every
-        // poll would be noise.
-        let mut prev_red: Option<bool> = None;
+        // Every notification decision and its baselines live in `watch`;
+        // this loop only feeds it successful polls and shows what comes back.
+        let mut watch = notify::Watch::default();
         let mut tray_watch = tray::TrayWatch::default();
         let mut rescue_watch = tray::RescueWatch::default();
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
@@ -938,63 +919,52 @@ fn spawn_status_watcher(app: AppHandle) {
                 tray::TrayAction::None => {}
             }
 
-            let (active, settings, health) = match client::call(Request::GetStatus {}).await {
+            let (snapshot, settings) = match client::call(Request::GetStatus {}).await {
                 Ok(Response::Status {
                     active,
+                    now_unix,
+                    pomodoro,
                     settings,
                     health,
+                    recent_events,
                     ..
-                }) => (active, settings, health),
+                }) => (
+                    // The daemon's clock, not ours: it is the clock that
+                    // stamped every break end, phase end and event.
+                    notify::Snapshot {
+                        now: now_unix,
+                        active,
+                        pomodoro,
+                        health: *health,
+                        events: recent_events,
+                    },
+                    settings,
+                ),
                 _ => {
                     // Daemon down / transient error. Surface it in the tooltip
                     // instead of leaving the stale "N active" text, but do NOT
-                    // touch `prev` or `prev_red`: keeping the notification
-                    // baselines avoids a spurious burst of "block started/
-                    // ended" (or a repeated RED) when it recovers.
+                    // feed `watch`: keeping its baselines avoids a spurious
+                    // burst of "block started/ended" (or a repeated RED) when
+                    // it recovers.
                     if let Some(tray) = app.tray_by_id(tray::TRAY_ID) {
                         let _ = tray.set_tooltip(Some("GrepFocus — daemon unreachable"));
                     }
                     continue;
                 }
             };
-            let cur: HashMap<u64, String> = active
-                .iter()
-                .map(|a| (a.block.id, a.block.name.clone()))
-                .collect();
-            let domain_block_active = active.iter().any(|a| !a.block.domains.is_empty());
-            let red = enforcement_red(&health, domain_block_active);
 
             if let Some(tray) = app.tray_by_id(tray::TRAY_ID) {
-                let tip = if cur.is_empty() {
+                let tip = if snapshot.active.is_empty() {
                     "GrepFocus — no active blocks".to_string()
                 } else {
-                    format!("GrepFocus — {} active", cur.len())
+                    format!("GrepFocus — {} active", snapshot.active.len())
                 };
                 let _ = tray.set_tooltip(Some(&tip));
             }
 
-            // Gate on the preference, but always update the baseline below —
-            // toggling notifications back on must not then replay every block
-            // that started or ended while they were off.
-            if settings.notifications {
-                if let Some(prev_map) = &prev {
-                    for (id, name) in &cur {
-                        if !prev_map.contains_key(id) {
-                            notify(&app, "Block started", name);
-                        }
-                    }
-                    for (id, name) in prev_map {
-                        if !cur.contains_key(id) {
-                            notify(&app, "Block ended", name);
-                        }
-                    }
-                }
-                if let (Some(false), Some(body)) = (prev_red, red) {
-                    notify(&app, "GrepFocus: blocking problem", body);
-                }
+            for n in watch.poll(snapshot, &settings) {
+                notify(&app, &n.title, &n.body);
             }
-            prev = Some(cur);
-            prev_red = Some(red.is_some());
         }
     });
 }
@@ -1155,62 +1125,15 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        enforcement_red, installer_error, removal_refusal, version, ServiceAction, BOOTSTRAP,
-        GUI_VERSION, LOCAL_DAEMON_BIN, PACKAGED_DAEMON_BIN, PAYLOAD_FILES,
+        installer_error, removal_refusal, version, ServiceAction, BOOTSTRAP, GUI_VERSION,
+        LOCAL_DAEMON_BIN, PACKAGED_DAEMON_BIN, PAYLOAD_FILES,
     };
-    use grepfocus_core::{Health, NftStatus};
 
     // The packaging files this binary's constants must agree with. Test-only:
     // the release binary must not embed them.
     const STAGE_SCRIPT: &str = include_str!("../../../packaging/appimage/stage-payload.sh");
     const INSTALL_SCRIPT: &str = include_str!("../../../packaging/appimage/appimage-install.sh");
     const DEBIAN_PRERM: &str = include_str!("../../../debian/grepfocus.prerm");
-
-    /// A daemon new enough to report health, everything else at rest.
-    fn reporting() -> Health {
-        Health {
-            daemon_version: "0.5.1".to_string(),
-            ..Health::default()
-        }
-    }
-
-    #[test]
-    fn enforcement_red_mirrors_frontend_rules() {
-        // A daemon too old to report says nothing, whatever the fields hold.
-        let old = Health {
-            last_error: Some("hosts: read-only file system".to_string()),
-            ..Health::default()
-        };
-        assert_eq!(enforcement_red(&old, true), None);
-
-        // last_error is RED with or without a domain block.
-        let hosts = Health {
-            last_error: Some("hosts: read-only file system".to_string()),
-            ..reporting()
-        };
-        assert!(enforcement_red(&hosts, true).is_some());
-        assert!(enforcement_red(&hosts, false).is_some());
-
-        // nft Failed is RED only while a domain block is active.
-        let nft = Health {
-            nft: NftStatus::Failed {
-                reason: "nft: command not found".to_string(),
-            },
-            ..reporting()
-        };
-        assert!(enforcement_red(&nft, true).is_some());
-        assert_eq!(enforcement_red(&nft, false), None);
-
-        // StaleTable is the banner's YELLOW, never a notification.
-        let stale = Health {
-            nft: NftStatus::StaleTable {
-                reason: "table busy".to_string(),
-            },
-            ..reporting()
-        };
-        assert_eq!(enforcement_red(&stale, true), None);
-        assert_eq!(enforcement_red(&reporting(), true), None);
-    }
 
     #[test]
     fn tauri_conf_version_matches_cargo() {

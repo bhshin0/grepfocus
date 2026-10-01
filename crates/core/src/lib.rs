@@ -1014,8 +1014,9 @@ pub struct PomodoroStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Desktop notifications (block start/end). Default ON, preserving
-    /// today's behaviour.
+    /// Desktop notifications (blocks, breaks, pomodoro, closed apps;
+    /// `attempt_nudges` adds attempt nudges). Default ON, preserving today's
+    /// behaviour.
     pub notifications: bool,
     /// Point blocked domains at `127.0.0.1` and hold a loopback proxy there
     /// while any block is active, so a blocked connection is refused instantly

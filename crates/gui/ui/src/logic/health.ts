@@ -45,7 +45,7 @@ export const RESTART_HINT_SECS = 900;
 
 /// The Status-tab notices for a status, RED → YELLOW → INFO.
 ///
-/// The two RED rules are mirrored by `enforcement_red` in src/main.rs, which
+/// The two RED rules are mirrored by `enforcement_red` in src/notify.rs, which
 /// drives the tray notification — change together.
 export function healthNotices(s: Status): HealthNotice[] {
   const h = s.health;
