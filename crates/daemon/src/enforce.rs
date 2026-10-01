@@ -25,15 +25,24 @@
 //! an nft failure is degraded-but-enforced, and a failed bind costs nothing
 //! but the instant-refusal, since the sink simply stays `0.0.0.0` and blocking
 //! is untouched.
+//!
+//! Every outcome — each half of an apply, a failed apply, an nft re-install
+//! from the probe, a hosts drift re-apply, the live proxy state — is recorded
+//! in `daemon.health` (see `health`) so `GetStatus` can report what used to
+//! be journal-only. A teardown whose `nft delete` failed leaves the memo
+//! marked not-ok on an empty union, and `sync` retries the delete at the
+//! `REVERIFY_SECS` cadence until the table is gone.
 
 use std::collections::{BTreeSet, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use grepfocus_core::license::features;
-use grepfocus_core::{now_unix, ActiveBlock};
+use grepfocus_core::validate::normalize_domain;
+use grepfocus_core::{now_unix, ActiveBlock, HostsLockStatus, NftStatus, ProxyStatus};
 use tracing::{debug, info, warn};
 
+use crate::health;
 use crate::listener::{Decide, ProxyListener};
 use crate::{dns, has_feature, hosts, nftables, Daemon};
 
@@ -154,13 +163,27 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
     // Record for `GetStatus`: instant breaks were wanted but a port would not
     // bind, so breaks lag here and the GUI should say why. Set every tick,
     // outside the memo, so it tracks the live state rather than the last apply.
-    daemon.instant_breaks_degraded.store(
-        matches!(detection, Detection::Degraded),
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    daemon.health().set_proxy(proxy_status(detection));
     let sink = sink_ip(detection);
     if let Some(prev) = applied.as_mut() {
         if prev.matches(&domains, sink) {
+            // A teardown that could not delete the DoH table (`nft_ok` false
+            // on an EMPTY union) keeps dropping DoH while nothing is blocked.
+            // Retry at the probe cadence — `needs_probe` never fires on an
+            // empty union, so this comes first. `debug!` on the miss: on a
+            // host with a broken nft this repeats forever.
+            if domains.is_empty() && !prev.nft_ok && now.abs_diff(prev.verified_at) >= REVERIFY_SECS
+            {
+                let res = nftables::clear();
+                daemon.health().teardown_retried(res.as_ref().map(|_| ()));
+                match &res {
+                    Ok(()) => info!("nftables DoH table removed after earlier teardown failure"),
+                    Err(e) => debug!(?e, "nftables DoH table still present — will retry"),
+                }
+                prev.nft_ok = res.is_ok();
+                prev.verified_at = now;
+                return Ok(());
+            }
             if !needs_probe(&domains, prev.verified_at, now) {
                 return Ok(());
             }
@@ -174,7 +197,12 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
                 if prev.nft_ok {
                     warn!("nftables DoH table drifted (firewall reload?) — re-installing");
                 }
-                match nftables::apply() {
+                let prev_ok = prev.nft_ok;
+                let res = nftables::apply();
+                daemon
+                    .health()
+                    .nft_reprobed(prev_ok, res.as_ref().map(|_| ()));
+                match res {
                     Ok(()) => {
                         if !prev.nft_ok {
                             info!("nftables DoH table installed after earlier failure");
@@ -193,6 +221,7 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
                 return Ok(());
             }
             warn!("enforcement drift detected — re-applying");
+            daemon.health().hosts_drift_detected();
         }
     }
     // `applied` still holds the PREVIOUS union here — it is only replaced on
@@ -206,7 +235,7 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
         sink,
     );
     match apply(&domains, sink, tamper_protect) {
-        Ok(nft_ok) => {
+        Ok(outcome) => {
             // Only after the change actually landed, and only when the set of
             // blocked domains really moved: a drift re-apply rewrites
             // /etc/hosts with an identical union, so no cached lookup can
@@ -216,6 +245,8 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
             if changed {
                 dns::flush_caches();
             }
+            let nft_ok = outcome.nft_ok();
+            daemon.health().apply_succeeded(outcome.nft, outcome.hosts);
             *applied = Some(Applied {
                 domains,
                 sink,
@@ -226,6 +257,7 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
         }
         Err(e) => {
             *applied = None;
+            daemon.health().apply_failed(&e, now);
             Err(e)
         }
     }
@@ -313,6 +345,15 @@ fn sink_ip(detection: Detection) -> Ipv4Addr {
     }
 }
 
+/// The wire form of a detection, for `health`.
+fn proxy_status(detection: Detection) -> ProxyStatus {
+    match detection {
+        Detection::Off => ProxyStatus::Off,
+        Detection::Listening => ProxyStatus::Holding,
+        Detection::Degraded => ProxyStatus::Degraded,
+    }
+}
+
 /// Bring the loopback proxy into the state `want` describes, and report what
 /// it is really doing so `sink_ip` can decide the address.
 ///
@@ -374,8 +415,14 @@ async fn ensure_detection(daemon: &Daemon, want: bool) -> Detection {
 }
 
 /// Deduplicated, sorted union of all domains across the active blocks that are
-/// currently being enforced. Blocks on a break (`break_until_unix > now`) are
-/// skipped so their domains resolve again until the break ends.
+/// currently being enforced, in canonical form. Blocks on a break
+/// (`break_until_unix > now`) are skipped so their domains resolve again
+/// until the break ends.
+///
+/// Every entry passes through `normalize_domain` on its way in, so nothing
+/// that cannot be one `/etc/hosts` name reaches the writer: stored content is
+/// canonical after the startup sanitize, but the active copies are what gets
+/// written as root, and this is the tick that writes them.
 fn union_domains(active: &[ActiveBlock], now: u64) -> Vec<String> {
     let mut set: BTreeSet<String> = BTreeSet::new();
     for a in active {
@@ -383,9 +430,15 @@ fn union_domains(active: &[ActiveBlock], now: u64) -> Vec<String> {
             continue;
         }
         for d in &a.block.domains {
-            let d = d.trim();
-            if !d.is_empty() {
-                set.insert(d.to_string());
+            match normalize_domain(d) {
+                Ok(n) => {
+                    set.insert(n);
+                }
+                // `debug!`: this runs on every 1 s tick, and the startup
+                // sanitize already warned once about anything it dropped.
+                Err(e) => {
+                    debug!(domain = ?d, block = a.block.id, %e, "skipping invalid stored domain")
+                }
             }
         }
     }
@@ -399,42 +452,77 @@ fn union_domains(active: &[ActiveBlock], now: u64) -> Vec<String> {
 /// (i.e. still enforced by some other, non-break block). The subtraction is
 /// essential — a domain still in the union is written to `/etc/hosts` as the
 /// loopback sink, so resolving it returns `127.0.0.1` and forwarding it would
-/// splice the proxy into itself. Each surviving domain is lowercased (matching
-/// the parsers' output) and its `www.` alias added (matching
-/// `hosts::render_block`), so whichever form the browser cached is recognised.
+/// splice the proxy into itself. Each surviving domain is canonicalized
+/// (lowercase, matching the wire parsers' output) and its `www.` alias added
+/// (matching `hosts::render_block`), so whichever form the browser cached is
+/// recognised.
 ///
 /// Pure over `(active, now, union)` — the caller passes the clock in.
 fn forwardable_set(active: &[ActiveBlock], now: u64, union: &[String]) -> HashSet<String> {
-    // Lowercased on both sides so the subtraction is case-insensitive: a domain
-    // still enforced as `Reddit.com` must exclude an on-break `reddit.com`, or
-    // it would be marked forwardable while `/etc/hosts` still points it at the
-    // loopback sink. (The dial-time loopback guard is the hard backstop, but
-    // this keeps the set itself honest.)
-    let enforced: HashSet<String> = union
-        .iter()
-        .map(|d| d.trim().to_ascii_lowercase())
-        .collect();
+    // Canonical on both sides so the subtraction is exact: `union` comes out
+    // of `union_domains` already normalized, and an on-break entry goes
+    // through the same `normalize_domain` here. Otherwise a domain still
+    // enforced as `reddit.com` would not exclude an on-break `Reddit.com.`,
+    // which would be marked forwardable while `/etc/hosts` still points it at
+    // the loopback sink. (The dial-time loopback guard is the hard backstop,
+    // but this keeps the set itself honest.)
+    let enforced: HashSet<&str> = union.iter().map(String::as_str).collect();
     let mut out = HashSet::new();
     for a in active {
         if a.break_until_unix.is_none_or(|t| t <= now) {
             continue; // not on a break — the union already covers it
         }
         for d in &a.block.domains {
-            let d = d.trim();
-            if d.is_empty() {
+            let Ok(canonical) = normalize_domain(d) else {
+                continue; // never written, so never resolves to us
+            };
+            if enforced.contains(canonical.as_str()) {
                 continue;
             }
-            let lower = d.to_ascii_lowercase();
-            if enforced.contains(&lower) {
-                continue;
+            if !canonical.starts_with("www.") {
+                out.insert(format!("www.{canonical}"));
             }
-            if !lower.starts_with("www.") {
-                out.insert(format!("www.{lower}"));
-            }
-            out.insert(lower);
+            out.insert(canonical);
         }
     }
     out
+}
+
+/// What one successful `apply` left behind: the nft half and the hosts lock,
+/// for the memo and for `health`. The hosts CONTENT is implied — a content
+/// failure is `apply`'s only `Err`.
+struct ApplyOutcome {
+    nft: NftStatus,
+    hosts: HostsLockStatus,
+}
+
+impl ApplyOutcome {
+    /// Whether the memo may trust the nft half. `Failed` (install) and
+    /// `StaleTable` (teardown) both read as not-ok, so each of the two
+    /// re-probe paths in `sync` keys off the one flag.
+    fn nft_ok(&self) -> bool {
+        matches!(self.nft, NftStatus::Ok | NftStatus::NotApplicable)
+    }
+}
+
+/// The nft half of a non-empty apply.
+fn install_nft_status(result: Result<(), &anyhow::Error>) -> NftStatus {
+    match result {
+        Ok(()) => NftStatus::Ok,
+        Err(e) => NftStatus::Failed {
+            reason: health::reason(e),
+        },
+    }
+}
+
+/// The nft half of an empty apply (teardown).
+fn teardown_nft_status(result: Result<(), &anyhow::Error>) -> NftStatus {
+    match result {
+        Ok(()) => NftStatus::NotApplicable,
+        Err(e) => NftStatus::StaleTable {
+            reason: health::reason(e),
+        },
+    }
 }
 
 /// Apply a freshly computed union to `/etc/hosts` AND the nftables DoH
@@ -446,30 +534,38 @@ fn forwardable_set(active: &[ActiveBlock], now: u64, union: &[String]) -> HashSe
 /// `hosts::apply_block` — the hosts content and the nft DoH table are
 /// free-tier enforcement, the immutable bit is the premium hardening layer.
 ///
-/// Returns whether the nft half succeeded, for the memo: a hosts failure is
-/// fatal (`Err`), an nft failure is degraded-but-enforced (`Ok(false)`) so
-/// the periodic probe keeps retrying the nft half.
+/// A hosts failure is fatal (`Err`); an nft failure — install or teardown —
+/// is degraded-but-enforced and rides in the outcome, so the periodic probe
+/// keeps retrying the nft half.
 ///
 /// DoH blocking only matters when websites are being blocked — an
 /// app-only block (`domains: []`) doesn't need it.
-fn apply(domains: &[String], sink: Ipv4Addr, tamper_protect: bool) -> anyhow::Result<bool> {
+fn apply(domains: &[String], sink: Ipv4Addr, tamper_protect: bool) -> anyhow::Result<ApplyOutcome> {
     if domains.is_empty() {
         hosts::clear_block()?;
-        if let Err(e) = nftables::clear() {
-            warn!(?e, "nftables clear failed (continuing)");
+        let nft = nftables::clear();
+        if let Err(e) = &nft {
+            warn!(
+                ?e,
+                "nftables clear failed — DoH table left behind, will retry"
+            );
         }
-        // Nothing is enforced, so there is no nft half to be unhealthy —
-        // and `needs_probe` never fires on an empty union anyway.
-        Ok(true)
+        Ok(ApplyOutcome {
+            nft: teardown_nft_status(nft.as_ref().map(|_| ())),
+            hosts: HostsLockStatus::NotApplicable,
+        })
     } else {
-        hosts::apply_block(domains, sink, tamper_protect)?;
-        if let Err(e) = nftables::apply() {
+        let hosts = hosts::apply_block(domains, sink, tamper_protect)?;
+        let nft = nftables::apply();
+        if let Err(e) = &nft {
             // Hosts block is in place; DoH bypass is open. Log loudly but
             // don't unwind — partial enforcement is better than none.
             warn!(?e, "nftables apply failed — Firefox DoH bypass not closed");
-            return Ok(false);
         }
-        Ok(true)
+        Ok(ApplyOutcome {
+            nft: install_nft_status(nft.as_ref().map(|_| ())),
+            hosts,
+        })
     }
 }
 
@@ -498,33 +594,86 @@ mod tests {
         }
     }
 
-    /// Forwardable = on-break domains, lowercased with the `www.` alias, MINUS
-    /// anything still enforced by a non-break block (which would self-loop).
+    /// Forwardable = on-break domains, canonicalized with the `www.` alias,
+    /// MINUS anything still enforced by a non-break block (which would
+    /// self-loop).
     #[test]
     fn forwardable_is_on_break_minus_union() {
         let now = 1_000;
 
         // Solo break: domain removed from the union, so forwardable — both the
-        // lowercased name and its www. alias, matching how it was written.
-        let set = forwardable_set(&[active(&["Reddit.com"], Some(now + 60))], now, &[]);
-        assert!(set.contains("reddit.com"));
-        assert!(set.contains("www.reddit.com"));
-        assert_eq!(set.len(), 2);
+        // canonical name and its www. alias, matching how it was written. A
+        // trailing dot and capitals (a legacy or hand-written active copy)
+        // canonicalize the same way `union_domains` would have written them.
+        for raw in ["Reddit.com", "reddit.com.", "REDDIT.COM."] {
+            let set = forwardable_set(&[active(&[raw], Some(now + 60))], now, &[]);
+            assert!(set.contains("reddit.com"), "raw {raw:?}");
+            assert!(set.contains("www.reddit.com"), "raw {raw:?}");
+            assert_eq!(set.len(), 2, "raw {raw:?}");
+        }
 
         // Not on a break → the union covers it, never forwardable.
         assert!(forwardable_set(&[active(&["reddit.com"], None)], now, &[]).is_empty());
 
         // On a break but STILL enforced by another block (in the union): it
         // resolves to 127.0.0.1, so it must be excluded to avoid a self-loop.
-        // Case-insensitively — an enforced `reddit.com` must exclude an on-break
-        // `Reddit.com`, not leak it into the forwardable set.
+        // Whatever form the on-break copy carries — an enforced `reddit.com`
+        // must exclude an on-break `Reddit.com` or `reddit.com.`, not leak it
+        // into the forwardable set.
         let union = vec!["reddit.com".to_string()];
-        assert!(
-            forwardable_set(&[active(&["Reddit.com"], Some(now + 60))], now, &union).is_empty()
-        );
+        for raw in ["Reddit.com", "reddit.com.", "REDDIT.COM."] {
+            assert!(
+                forwardable_set(&[active(&[raw], Some(now + 60))], now, &union).is_empty(),
+                "raw {raw:?}"
+            );
+        }
+
+        // An entry that cannot be a hostname is never written, so it is never
+        // forwardable either.
+        assert!(forwardable_set(
+            &[active(
+                &["reddit.com\n0.0.0.0 evil.example"],
+                Some(now + 60)
+            )],
+            now,
+            &[]
+        )
+        .is_empty());
 
         // An already-expired break is not forwardable.
         assert!(forwardable_set(&[active(&["reddit.com"], Some(now - 1))], now, &[]).is_empty());
+    }
+
+    /// The union is what `/etc/hosts` is written from, so every entry is
+    /// canonical and anything that cannot be one hostname is left out.
+    #[test]
+    fn union_domains_canonicalizes_and_drops_invalid() {
+        let now = 1_000;
+        let union = union_domains(
+            &[
+                active(
+                    &["Reddit.com", "reddit.com.", "https://twitter.com/home"],
+                    None,
+                ),
+                active(
+                    &[
+                        "reddit.com\n0.0.0.0 evil.example",
+                        "localhost",
+                        "1.2.3.4",
+                        "*.example.com",
+                        "",
+                    ],
+                    None,
+                ),
+                // On a break: contributes nothing, valid or not.
+                active(&["news.ycombinator.com"], Some(now + 60)),
+            ],
+            now,
+        );
+        assert_eq!(
+            union,
+            vec!["reddit.com".to_string(), "twitter.com".to_string()]
+        );
     }
 
     #[test]
@@ -584,6 +733,47 @@ mod tests {
         assert_eq!(sink_ip(Detection::Off), DARK);
         assert_eq!(sink_ip(Detection::Listening), SEEN);
         assert_eq!(sink_ip(Detection::Degraded), DARK);
+    }
+
+    /// The wire form tracks the detection one-to-one, so the legacy degraded
+    /// flag `ipc` derives from it means exactly what the old atomic did.
+    #[test]
+    fn proxy_status_maps_detection() {
+        assert_eq!(proxy_status(Detection::Off), ProxyStatus::Off);
+        assert_eq!(proxy_status(Detection::Listening), ProxyStatus::Holding);
+        assert_eq!(proxy_status(Detection::Degraded), ProxyStatus::Degraded);
+    }
+
+    /// Both nft failure shapes carry the error text and read as not-ok for
+    /// the memo, so the install re-probe and the teardown retry each fire;
+    /// both success shapes read as ok.
+    #[test]
+    fn nft_status_mappings_and_memo_flag() {
+        let e = anyhow::anyhow!("nft -f failed (status 1): oops");
+        assert_eq!(install_nft_status(Ok(())), NftStatus::Ok);
+        assert_eq!(
+            install_nft_status(Err(&e)),
+            NftStatus::Failed {
+                reason: "nft -f failed (status 1): oops".into()
+            }
+        );
+        assert_eq!(teardown_nft_status(Ok(())), NftStatus::NotApplicable);
+        assert_eq!(
+            teardown_nft_status(Err(&e)),
+            NftStatus::StaleTable {
+                reason: "nft -f failed (status 1): oops".into()
+            }
+        );
+
+        let outcome = |nft: NftStatus| ApplyOutcome {
+            nft,
+            hosts: HostsLockStatus::NotApplicable,
+        };
+        assert!(outcome(NftStatus::Ok).nft_ok());
+        assert!(outcome(NftStatus::NotApplicable).nft_ok());
+        assert!(!outcome(install_nft_status(Err(&e))).nft_ok());
+        assert!(!outcome(teardown_nft_status(Err(&e))).nft_ok());
+        assert!(!outcome(NftStatus::Unknown).nft_ok());
     }
 
     /// Toggling `instant_breaks` mid-block changes the file's content, so it

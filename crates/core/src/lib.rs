@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod hmac_sig;
 pub mod license;
+pub mod validate;
 pub mod wire;
 
 /// A named bundle of things to block.
@@ -968,6 +969,176 @@ impl Default for Settings {
     }
 }
 
+// ── Health wire types ───────────────────────────────────────────────────────
+//
+// What the daemon reports about its own enforcement, carried on `Status`.
+// Every enum below accepts any tag it does not know as `Unknown`, and clients
+// say nothing for `unknown`: a newer daemon must be able to add a variant
+// without an older GUI failing the whole `Status` parse. Every `reason` is
+// `#[serde(default)]` for the same reason — the daemon always emits it, but a
+// missing one must never be fatal.
+
+/// Where the daemon binary lives, classified once at startup from
+/// `current_exe()`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallKind {
+    /// `/usr/bin/grepfocusd` — rpm, deb or AUR.
+    Package,
+    /// `/usr/local/bin/grepfocusd` — the AppImage's pkexec installer OR the
+    /// dev scripts; not by itself evidence of an AppImage install.
+    Local,
+    /// Anything else (`cargo run`, `/opt`). The conservative branch: never an
+    /// install offer.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// State of the DoH-blocking nftables table.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NftStatus {
+    Ok,
+    /// `nft` could not install the table: the hosts block is live, DoH is
+    /// open.
+    Failed {
+        #[serde(default)]
+        reason: String,
+    },
+    /// The block ended but `nft delete` failed; retried every re-verify tick.
+    StaleTable {
+        #[serde(default)]
+        reason: String,
+    },
+    /// Nothing enforced, no table left behind.
+    #[default]
+    NotApplicable,
+    /// The last apply failed before the nft half ran, or a tag this build
+    /// does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// State of the immutable flag on `/etc/hosts`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostsLockStatus {
+    Locked,
+    /// Licensed for tamper protection but `chattr +i` failed.
+    Unlocked {
+        #[serde(default)]
+        reason: String,
+    },
+    /// Nothing enforced, or not licensed (no lock attempted).
+    #[default]
+    NotApplicable,
+    #[serde(other)]
+    Unknown,
+}
+
+/// State of the instant-breaks loopback proxy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyStatus {
+    Holding,
+    /// Enabled and a block is active, but the proxy could not bind both
+    /// ports, so breaks lag on this machine.
+    Degraded,
+    #[default]
+    Off,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Why a browser's DoH policy file could not be written. `Unsupported` and
+/// `ReadOnlyFs` are not fixable from inside GrepFocus; the rest are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserPolicyFailKind {
+    Unsupported,
+    ReadOnlyFs,
+    NotJson,
+    Symlink,
+    Io,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// What the daemon did about one browser's DoH policy file.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BrowserPolicyState {
+    /// Browser not detected; any leftover of ours removed.
+    NotInstalled,
+    /// We created the file (possibly seeded from `distribution/policies.json`).
+    Written,
+    /// Pre-existing admin file; only `DNSOverHTTPS` added, recovery copy kept.
+    Merged,
+    /// The payload field is `fail_kind` on the wire because the internal tag
+    /// already owns `kind`.
+    Failed {
+        #[serde(rename = "fail_kind", default)]
+        kind: BrowserPolicyFailKind,
+        #[serde(default)]
+        reason: String,
+    },
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// One browser's DoH policy file, as the daemon last saw it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BrowserPolicyStatus {
+    /// Slug: `firefox | firefox-flatpak | mullvad-browser | chromium |
+    /// chromium-snap | chrome | brave`. The GUI maps slugs to display names.
+    pub browser: String,
+    /// The policy file we manage (or would manage).
+    pub path: String,
+    pub state: BrowserPolicyState,
+    /// `Written`/`Merged`: mtime of the file, so it survives daemon restarts;
+    /// otherwise when this daemon first saw the state.
+    pub since_unix: u64,
+}
+
+/// Enforcement health plus daemon identity, carried on `Status`.
+///
+/// A `#[serde(default)]` container so a future field never breaks an older
+/// client, and so an OLD daemon that never emits it reads as
+/// `Health::default()` — whose empty `daemon_version` is the tell.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Health {
+    /// `CARGO_PKG_VERSION` of the daemon; `""` means a daemon older than this
+    /// field.
+    pub daemon_version: String,
+    /// `current_exe()` at startup, `""` if unavailable.
+    pub daemon_exe: String,
+    pub install_kind: InstallKind,
+    pub nft: NftStatus,
+    pub hosts: HostsLockStatus,
+    /// Times a re-probe found the hosts region missing and re-applied it — a
+    /// tamper signal. Saturating.
+    pub hosts_reapplies: u32,
+    /// Times a re-probe found the table gone while nft worked and re-installed
+    /// it — a firewall reload. Saturating.
+    pub nft_reinstalls: u32,
+    pub proxy: ProxyStatus,
+    /// Fixed slug order, one entry per known browser after the first pass;
+    /// empty before it and on an old daemon.
+    pub browser_policies: Vec<BrowserPolicyStatus>,
+    /// What [`State::sanitize`] changed or flagged at startup, capped at 200
+    /// lines with a final `… and N more`.
+    pub startup_notes: Vec<String>,
+    /// The last enforcement error (hosts read/write, install or teardown);
+    /// cleared by the next success.
+    pub last_error: Option<String>,
+    pub last_error_unix: Option<u64>,
+}
+
 /// Daemon-side persisted state.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
@@ -1047,6 +1218,124 @@ impl State {
                 day: row.day,
             });
         }
+    }
+
+    /// Bring stored block content up to what [`validate::validate_block`]
+    /// would accept today, and say what changed. Runs once at daemon startup,
+    /// before any state was written by this build.
+    ///
+    /// Covers the saved blocks AND the copies embedded in `active` —
+    /// enforcement reads the active copies, so leaving them alone would let a
+    /// legacy entry keep reaching `/etc/hosts` and procwatch. Each domain and
+    /// matcher is normalized or dropped, duplicates removed, one note per
+    /// change. Never drops a block, never edits a name, never truncates a
+    /// list: an over-cap list, an invalid name and a block left with nothing
+    /// to enforce are noted only, and those notes repeat every start until
+    /// the user fixes the block (edits to it are refused meanwhile).
+    ///
+    /// The mutating part is idempotent — a second pass produces no
+    /// `normalized`/`dropped`/`duplicate` notes.
+    pub fn sanitize(&mut self) -> Vec<String> {
+        let mut notes = Vec::new();
+        for b in &mut self.blocks {
+            sanitize_block("saved", b, &mut notes);
+        }
+        for a in &mut self.active {
+            sanitize_block("active", &mut a.block, &mut notes);
+        }
+        notes
+    }
+}
+
+/// One block's share of [`State::sanitize`]; `ctx` names which copy.
+fn sanitize_block(ctx: &str, block: &mut Block, notes: &mut Vec<String>) {
+    use validate::{
+        excerpt, matcher_kind_label, matcher_text, normalize_domain, normalize_matcher,
+        MAX_APPS_PER_BLOCK, MAX_BLOCK_NAME_CHARS, MAX_DOMAINS_PER_BLOCK,
+    };
+    let who = format!("block {} ({ctx}) {:?}", block.id, excerpt(&block.name));
+
+    let name_problem = if block.name.trim().is_empty() {
+        Some("name is empty")
+    } else if block.name.chars().any(char::is_control) {
+        Some("name contains control characters")
+    } else if block.name.chars().count() > MAX_BLOCK_NAME_CHARS {
+        Some("name is too long")
+    } else {
+        None
+    };
+    if let Some(p) = name_problem {
+        notes.push(format!(
+            "{who}: {p} — edits will be refused until it is renamed"
+        ));
+    }
+
+    let mut domains: Vec<String> = Vec::with_capacity(block.domains.len());
+    for raw in block.domains.drain(..) {
+        match normalize_domain(&raw) {
+            Ok(n) => {
+                if n != raw {
+                    notes.push(format!(
+                        "{who}: domain {:?} normalized to {n:?}",
+                        excerpt(&raw)
+                    ));
+                }
+                if domains.contains(&n) {
+                    notes.push(format!("{who}: removed duplicate domain {n:?}"));
+                } else {
+                    domains.push(n);
+                }
+            }
+            Err(e) => notes.push(format!("{who}: dropped domain {:?}: {e}", excerpt(&raw))),
+        }
+    }
+    if domains.len() > MAX_DOMAINS_PER_BLOCK {
+        notes.push(format!(
+            "{who}: {} domains exceeds the {MAX_DOMAINS_PER_BLOCK} limit — edits will be refused until it is trimmed",
+            domains.len()
+        ));
+    }
+    block.domains = domains;
+
+    let mut apps: Vec<AppMatcher> = Vec::with_capacity(block.apps.len());
+    for raw in block.apps.drain(..) {
+        let kind = matcher_kind_label(&raw);
+        match normalize_matcher(&raw) {
+            Ok(n) => {
+                if n != raw {
+                    notes.push(format!(
+                        "{who}: {kind} {:?} normalized to {:?}",
+                        excerpt(matcher_text(&raw)),
+                        matcher_text(&n)
+                    ));
+                }
+                if apps.contains(&n) {
+                    notes.push(format!(
+                        "{who}: removed duplicate {kind} {:?}",
+                        matcher_text(&n)
+                    ));
+                } else {
+                    apps.push(n);
+                }
+            }
+            Err(e) => notes.push(format!(
+                "{who}: dropped {kind} {:?}: {e}",
+                excerpt(matcher_text(&raw))
+            )),
+        }
+    }
+    if apps.len() > MAX_APPS_PER_BLOCK {
+        notes.push(format!(
+            "{who}: {} app matchers exceeds the {MAX_APPS_PER_BLOCK} limit — edits will be refused until it is trimmed",
+            apps.len()
+        ));
+    }
+    block.apps = apps;
+
+    if block.domains.is_empty() && block.apps.is_empty() {
+        notes.push(format!(
+            "{who}: nothing left to block — edits will be refused until a domain or app is added"
+        ));
     }
 }
 
@@ -1232,12 +1521,21 @@ pub enum Response {
         /// object fills the same way.
         #[serde(default)]
         settings: Settings,
-        /// True when `settings.instant_breaks` is on and a block is active but
-        /// the loopback proxy could not bind both ports, so breaks lag on this
-        /// machine. Drives a GUI notice explaining why. `#[serde(default)]`:
-        /// an old daemon never emits it and the client reads `false`.
+        /// DEPRECATED, still emitted: always equal to
+        /// `health.proxy == ProxyStatus::Degraded`. Kept so a GUI built
+        /// against a pre-health daemon keeps its "port in use" notice; new
+        /// clients read `health.proxy`. `#[serde(default)]`: an old daemon
+        /// never emits it and the client reads `false`.
         #[serde(default)]
         instant_breaks_degraded: bool,
+        /// Enforcement health + daemon identity (see [`Health`]).
+        /// `#[serde(default)]`: an old daemon never emits it and the client
+        /// reads `Health::default()`, whose empty `daemon_version` is the
+        /// tell. Boxed only to keep `Response` small for its many one-word
+        /// variants (`clippy::large_enum_variant`); the wire shape is the
+        /// same.
+        #[serde(default)]
+        health: Box<Health>,
     },
     Added {
         id: u64,
@@ -2632,6 +2930,7 @@ mod tests {
             }),
             settings: Settings::default(),
             instant_breaks_degraded: false,
+            health: Box::default(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -2646,6 +2945,84 @@ mod tests {
             }
             other => panic!("expected Status, got {other:?}"),
         }
+    }
+
+    // Old daemon → new GUI: a Status frame without `health` (and without the
+    // legacy degraded flag) reads as `Health::default()`, whose empty
+    // `daemon_version` is how a client tells a pre-reporting daemon apart
+    // from a healthy one. A frame that does carry it round-trips the
+    // enforcement fields intact.
+    #[test]
+    fn status_without_health_still_deserializes() {
+        let old = r#"{
+            "result": "status",
+            "active": [],
+            "now_unix": 1752192000,
+            "password_set": false,
+            "unlocked": true,
+            "allowance_used": []
+        }"#;
+        let resp: Response = serde_json::from_str(old).unwrap();
+        match resp {
+            Response::Status {
+                instant_breaks_degraded,
+                health,
+                ..
+            } => {
+                assert!(!instant_breaks_degraded);
+                assert_eq!(*health, Health::default());
+                assert_eq!(health.daemon_version, "");
+                assert_eq!(health.install_kind, InstallKind::Unknown);
+                assert_eq!(health.proxy, ProxyStatus::Off);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+
+        let resp = Response::Status {
+            active: vec![],
+            now_unix: 1000,
+            password_set: false,
+            unlocked: true,
+            allowance_used: vec![],
+            allowance: vec![],
+            license_present: false,
+            license_valid: false,
+            license_kind: None,
+            license_email: None,
+            license_expires_at: None,
+            licensed_features: vec![],
+            pomodoro: None,
+            settings: Settings::default(),
+            instant_breaks_degraded: true,
+            health: Box::new(Health {
+                daemon_version: "0.5.1".into(),
+                daemon_exe: "/usr/local/bin/grepfocusd".into(),
+                install_kind: InstallKind::Local,
+                nft: NftStatus::Failed {
+                    reason: "nft -f failed".into(),
+                },
+                hosts: HostsLockStatus::Locked,
+                hosts_reapplies: 2,
+                nft_reinstalls: 1,
+                proxy: ProxyStatus::Degraded,
+                browser_policies: vec![],
+                startup_notes: vec!["block 1 (saved) \"x\": dropped domain".into()],
+                last_error: Some("reading /etc/hosts: Permission denied".into()),
+                last_error_unix: Some(999),
+            }),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            json.contains(r#""health":{"daemon_version":"0.5.1""#),
+            "got {json}"
+        );
+        let back: Response = serde_json::from_str(&json).unwrap();
+        let (Response::Status { health: a, .. }, Response::Status { health: b, .. }) =
+            (&resp, &back)
+        else {
+            panic!("expected Status");
+        };
+        assert_eq!(a, b);
     }
 
     // A PomodoroSession survives a state round-trip, and old state without
@@ -2676,5 +3053,389 @@ mod tests {
         assert_eq!(p.cycles_total, 4);
         assert_eq!(p.phase, PomodoroPhase::Focus);
         assert_eq!(p.phase_ends_unix, 9999);
+    }
+
+    // ── State::sanitize ─────────────────────────────────────────────────────
+
+    fn legacy_block(id: u64, name: &str, domains: &[&str], apps: Vec<AppMatcher>) -> Block {
+        Block {
+            id,
+            name: name.into(),
+            domains: domains.iter().map(|s| s.to_string()).collect(),
+            apps,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sanitize_normalizes_saved_and_active_copies() {
+        let saved = legacy_block(
+            1,
+            "Social",
+            &[
+                "Reddit.com",
+                "reddit.com",
+                "1.2.3.4",
+                "https://twitter.com/x",
+            ],
+            vec![
+                AppMatcher::ExePath {
+                    path: " /usr/bin/steam ".into(),
+                },
+                AppMatcher::ExePath {
+                    path: "/usr/bin/steam".into(),
+                },
+                AppMatcher::Basename {
+                    name: "grepfocusd".into(),
+                },
+            ],
+        );
+        let active = legacy_block(
+            2,
+            "Games",
+            &["STEAMPOWERED.com."],
+            vec![AppMatcher::Cmdline {
+                contains: "ab".into(),
+            }],
+        );
+        let mut st = State {
+            blocks: vec![saved],
+            active: vec![ActiveBlock {
+                block: active,
+                started_at_unix: 0,
+                ends_at_unix: 100,
+                originator: Originator::Manual,
+                break_until_unix: None,
+                apps_enforced: true,
+                lock: LockMode::Unlocked,
+                allowance: None,
+            }],
+            ..Default::default()
+        };
+
+        let notes = st.sanitize();
+        assert_eq!(
+            notes,
+            [
+                "block 1 (saved) \"Social\": domain \"Reddit.com\" normalized to \"reddit.com\"",
+                "block 1 (saved) \"Social\": removed duplicate domain \"reddit.com\"",
+                "block 1 (saved) \"Social\": dropped domain \"1.2.3.4\": IP addresses cannot be blocked — enter a hostname, e.g. reddit.com",
+                "block 1 (saved) \"Social\": domain \"https://twitter.com/x\" normalized to \"twitter.com\"",
+                "block 1 (saved) \"Social\": exe path \" /usr/bin/steam \" normalized to \"/usr/bin/steam\"",
+                "block 1 (saved) \"Social\": removed duplicate exe path \"/usr/bin/steam\"",
+                "block 1 (saved) \"Social\": dropped basename \"grepfocusd\": would match GrepFocus itself, which cannot block itself",
+                "block 2 (active) \"Games\": domain \"STEAMPOWERED.com.\" normalized to \"steampowered.com\"",
+                "block 2 (active) \"Games\": dropped cmdline pattern \"ab\": must be at least 3 characters — a shorter pattern would match nearly every process",
+            ]
+        );
+        assert_eq!(st.blocks[0].domains, ["reddit.com", "twitter.com"]);
+        assert_eq!(
+            st.blocks[0].apps,
+            [AppMatcher::ExePath {
+                path: "/usr/bin/steam".into()
+            }]
+        );
+        assert_eq!(st.active[0].block.domains, ["steampowered.com"]);
+        assert!(st.active[0].block.apps.is_empty());
+        // Names, ids and the rest of the active record are untouched.
+        assert_eq!(st.blocks[0].name, "Social");
+        assert_eq!(st.active[0].block.id, 2);
+        assert!(st.active[0].apps_enforced);
+        assert_eq!(st.active[0].ends_at_unix, 100);
+
+        // Idempotent: nothing left to change.
+        let again = st.clone();
+        assert!(st.sanitize().is_empty());
+        assert_eq!(st.blocks[0].domains, again.blocks[0].domains);
+        assert_eq!(st.blocks[0].apps, again.blocks[0].apps);
+        assert_eq!(st.active[0].block.domains, again.active[0].block.domains);
+    }
+
+    #[test]
+    fn sanitize_notes_over_cap_without_truncating() {
+        let n = validate::MAX_DOMAINS_PER_BLOCK + 3;
+        let domains: Vec<String> = (0..n).map(|i| format!("d{i}.example")).collect();
+        let mut over = legacy_block(7, "Big", &[], vec![]);
+        over.domains = domains;
+        let mut apps = legacy_block(8, "Apps", &[], vec![]);
+        apps.apps = (0..=validate::MAX_APPS_PER_BLOCK)
+            .map(|i| AppMatcher::Basename {
+                name: format!("app{i}"),
+            })
+            .collect();
+        let empty = legacy_block(9, "", &["1.2.3.4"], vec![]);
+        let mut st = State {
+            blocks: vec![over, apps, empty],
+            ..Default::default()
+        };
+
+        let notes = st.sanitize();
+        assert_eq!(
+            notes,
+            [
+                "block 7 (saved) \"Big\": 5003 domains exceeds the 5000 limit — edits will be refused until it is trimmed",
+                "block 8 (saved) \"Apps\": 501 app matchers exceeds the 500 limit — edits will be refused until it is trimmed",
+                "block 9 (saved) \"\": name is empty — edits will be refused until it is renamed",
+                "block 9 (saved) \"\": dropped domain \"1.2.3.4\": IP addresses cannot be blocked — enter a hostname, e.g. reddit.com",
+                "block 9 (saved) \"\": nothing left to block — edits will be refused until a domain or app is added",
+            ]
+        );
+        assert_eq!(st.blocks[0].domains.len(), n);
+        assert_eq!(st.blocks[1].apps.len(), validate::MAX_APPS_PER_BLOCK + 1);
+        assert_eq!(st.blocks.len(), 3, "a block is never dropped");
+        assert_eq!(st.blocks[2].name, "");
+
+        // The flag-only notes repeat on every start; the mutating ones do not.
+        let notes = st.sanitize();
+        assert_eq!(notes.len(), 4);
+        assert!(notes.iter().all(|n| n.contains("edits will be refused")));
+    }
+
+    // ── Health wire types ───────────────────────────────────────────────────
+
+    /// The `health` object the daemon emits for the dev box, as pinned in the
+    /// design record (§1). `health_wire_field_names_are_pinned` compares it to
+    /// the JSON literal there verbatim.
+    fn sample_health() -> Health {
+        Health {
+            daemon_version: "0.5.1".into(),
+            daemon_exe: "/usr/local/bin/grepfocusd".into(),
+            install_kind: InstallKind::Local,
+            nft: NftStatus::Ok,
+            hosts: HostsLockStatus::Locked,
+            hosts_reapplies: 0,
+            nft_reinstalls: 0,
+            proxy: ProxyStatus::Holding,
+            browser_policies: vec![
+                BrowserPolicyStatus {
+                    browser: "firefox".into(),
+                    path: "/etc/firefox/policies/policies.json".into(),
+                    state: BrowserPolicyState::Written,
+                    since_unix: 1790000000,
+                },
+                BrowserPolicyStatus {
+                    browser: "firefox-flatpak".into(),
+                    path: "/var/lib/flatpak/extension/org.mozilla.firefox.systemconfig/x86_64/stable/policies/policies.json".into(),
+                    state: BrowserPolicyState::NotInstalled,
+                    since_unix: 1790000000,
+                },
+                BrowserPolicyStatus {
+                    browser: "mullvad-browser".into(),
+                    path: "/usr/lib/mullvad-browser/distribution/policies.json".into(),
+                    state: BrowserPolicyState::Failed {
+                        kind: BrowserPolicyFailKind::ReadOnlyFs,
+                        reason: "opening …grepfocus.tmp: Read-only file system (os error 30)".into(),
+                    },
+                    since_unix: 1790000000,
+                },
+            ],
+            startup_notes: vec![],
+            last_error: None,
+            last_error_unix: None,
+        }
+    }
+
+    #[test]
+    fn health_wire_field_names_are_pinned() {
+        let want: serde_json::Value = serde_json::from_str(
+            r#"{
+              "daemon_version": "0.5.1",
+              "daemon_exe": "/usr/local/bin/grepfocusd",
+              "install_kind": "local",
+              "nft":   {"kind": "ok"},
+              "hosts": {"kind": "locked"},
+              "hosts_reapplies": 0,
+              "nft_reinstalls": 0,
+              "proxy": "holding",
+              "browser_policies": [
+                {"browser": "firefox",         "path": "/etc/firefox/policies/policies.json",              "state": {"kind": "written"},      "since_unix": 1790000000},
+                {"browser": "firefox-flatpak", "path": "/var/lib/flatpak/extension/org.mozilla.firefox.systemconfig/x86_64/stable/policies/policies.json", "state": {"kind": "not_installed"}, "since_unix": 1790000000},
+                {"browser": "mullvad-browser", "path": "/usr/lib/mullvad-browser/distribution/policies.json", "state": {"kind": "failed", "fail_kind": "read_only_fs", "reason": "opening …grepfocus.tmp: Read-only file system (os error 30)"}, "since_unix": 1790000000}
+              ],
+              "startup_notes": [],
+              "last_error": null,
+              "last_error_unix": null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(sample_health()).unwrap(), want);
+
+        // The other payload spellings the daemon emits.
+        for (v, wire) in [
+            (
+                serde_json::to_value(NftStatus::Failed { reason: "x".into() }).unwrap(),
+                r#"{"kind":"failed","reason":"x"}"#,
+            ),
+            (
+                serde_json::to_value(NftStatus::StaleTable { reason: "x".into() }).unwrap(),
+                r#"{"kind":"stale_table","reason":"x"}"#,
+            ),
+            (
+                serde_json::to_value(NftStatus::NotApplicable).unwrap(),
+                r#"{"kind":"not_applicable"}"#,
+            ),
+            (
+                serde_json::to_value(HostsLockStatus::Unlocked { reason: "x".into() }).unwrap(),
+                r#"{"kind":"unlocked","reason":"x"}"#,
+            ),
+            (
+                serde_json::to_value(ProxyStatus::Degraded).unwrap(),
+                r#""degraded""#,
+            ),
+            (serde_json::to_value(ProxyStatus::Off).unwrap(), r#""off""#),
+            (
+                serde_json::to_value(InstallKind::Package).unwrap(),
+                r#""package""#,
+            ),
+            (
+                serde_json::to_value(InstallKind::Unknown).unwrap(),
+                r#""unknown""#,
+            ),
+        ] {
+            assert_eq!(v, serde_json::from_str::<serde_json::Value>(wire).unwrap());
+        }
+    }
+
+    #[test]
+    fn health_round_trips_with_payload_variants() {
+        let h = Health {
+            daemon_version: "0.6.0".into(),
+            daemon_exe: "/usr/local/bin/grepfocusd (deleted)".into(),
+            install_kind: InstallKind::Local,
+            nft: NftStatus::Failed {
+                reason: "nft: command not found".into(),
+            },
+            hosts: HostsLockStatus::Unlocked {
+                reason: "chattr: Operation not supported".into(),
+            },
+            hosts_reapplies: 3,
+            nft_reinstalls: u32::MAX,
+            proxy: ProxyStatus::Degraded,
+            browser_policies: vec![BrowserPolicyStatus {
+                browser: "chromium".into(),
+                path: "/etc/chromium/policies/managed/grepfocus.json".into(),
+                state: BrowserPolicyState::Failed {
+                    kind: BrowserPolicyFailKind::ReadOnlyFs,
+                    reason: "Read-only file system".into(),
+                },
+                since_unix: 42,
+            }],
+            startup_notes: vec!["block 1 (saved) \"x\": dropped domain \"1.2.3.4\": …".into()],
+            last_error: Some("write /etc/hosts: Permission denied".into()),
+            last_error_unix: Some(1790000001),
+        };
+        let json = serde_json::to_string(&h).unwrap();
+        let back: Health = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, h);
+
+        let h = Health {
+            nft: NftStatus::StaleTable {
+                reason: "delete failed".into(),
+            },
+            ..Default::default()
+        };
+        let back: Health = serde_json::from_str(&serde_json::to_string(&h).unwrap()).unwrap();
+        assert_eq!(back, h);
+    }
+
+    #[test]
+    fn health_unknown_variants_degrade_to_unknown() {
+        let h: Health = serde_json::from_str(
+            r#"{"nft":{"kind":"quantum"},"hosts":{"kind":"welded"},"proxy":"warp","install_kind":"snap","browser_policies":[{"state":{"kind":"something_new"}},{"state":{"kind":"failed","fail_kind":"x"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(h.nft, NftStatus::Unknown);
+        assert_eq!(h.hosts, HostsLockStatus::Unknown);
+        assert_eq!(h.proxy, ProxyStatus::Unknown);
+        assert_eq!(h.install_kind, InstallKind::Unknown);
+        assert_eq!(h.browser_policies.len(), 2);
+        assert_eq!(h.browser_policies[0].state, BrowserPolicyState::Unknown);
+        assert_eq!(
+            h.browser_policies[1].state,
+            BrowserPolicyState::Failed {
+                kind: BrowserPolicyFailKind::Unknown,
+                reason: String::new(),
+            }
+        );
+
+        // An unknown tag may carry fields this build does not know.
+        let s: NftStatus =
+            serde_json::from_str(r#"{"kind":"quantum","qubits":3,"reason":"x"}"#).unwrap();
+        assert_eq!(s, NftStatus::Unknown);
+    }
+
+    #[test]
+    fn health_payload_without_reason_still_parses() {
+        assert_eq!(
+            serde_json::from_str::<NftStatus>(r#"{"kind":"failed"}"#).unwrap(),
+            NftStatus::Failed {
+                reason: String::new()
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<NftStatus>(r#"{"kind":"stale_table"}"#).unwrap(),
+            NftStatus::StaleTable {
+                reason: String::new()
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<HostsLockStatus>(r#"{"kind":"unlocked"}"#).unwrap(),
+            HostsLockStatus::Unlocked {
+                reason: String::new()
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<BrowserPolicyState>(r#"{"kind":"failed"}"#).unwrap(),
+            BrowserPolicyState::Failed {
+                kind: BrowserPolicyFailKind::Unknown,
+                reason: String::new()
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<BrowserPolicyState>(r#"{"kind":"failed","fail_kind":"io"}"#)
+                .unwrap(),
+            BrowserPolicyState::Failed {
+                kind: BrowserPolicyFailKind::Io,
+                reason: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn health_partial_object_fills_defaults() {
+        let h: Health = serde_json::from_str("{}").unwrap();
+        assert_eq!(h, Health::default());
+        assert_eq!(h.daemon_version, "");
+        assert_eq!(h.install_kind, InstallKind::Unknown);
+        assert_eq!(h.nft, NftStatus::NotApplicable);
+        assert_eq!(h.hosts, HostsLockStatus::NotApplicable);
+        assert_eq!(h.proxy, ProxyStatus::Off);
+        assert!(h.browser_policies.is_empty());
+        assert!(h.startup_notes.is_empty());
+        assert_eq!(h.last_error, None);
+        assert_eq!(h.last_error_unix, None);
+
+        let h: Health = serde_json::from_str(
+            r#"{"daemon_version":"0.6.0","proxy":"holding","future_field":1}"#,
+        )
+        .unwrap();
+        assert_eq!(h.daemon_version, "0.6.0");
+        assert_eq!(h.proxy, ProxyStatus::Holding);
+        assert_eq!(h.nft, NftStatus::NotApplicable);
+    }
+
+    #[test]
+    fn browser_policy_status_missing_since_unix_is_zero() {
+        let s: BrowserPolicyStatus = serde_json::from_str(
+            r#"{"browser":"firefox","path":"/etc/firefox/policies/policies.json","state":{"kind":"written"}}"#,
+        )
+        .unwrap();
+        assert_eq!(s.since_unix, 0);
+        assert_eq!(s.browser, "firefox");
+        assert_eq!(s.state, BrowserPolicyState::Written);
+
+        let s: BrowserPolicyStatus = serde_json::from_str("{}").unwrap();
+        assert_eq!(s, BrowserPolicyStatus::default());
+        assert_eq!(s.state, BrowserPolicyState::Unknown);
     }
 }

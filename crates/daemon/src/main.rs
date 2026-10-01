@@ -2,7 +2,9 @@
 //!
 //! Runs as root via systemd. Owns the persisted block state, edits
 //! /etc/hosts (with chattr +i during active blocks), and SIGKILLs blocked
-//! processes. Talks to the GUI over a Unix socket at /run/grepfocus/sock.
+//! processes. Keeps browser DNS-over-HTTPS switched off through enterprise
+//! policy files so the hosts block applies there (see `browser_policy`).
+//! Talks to the GUI over a Unix socket at /run/grepfocus/sock.
 //!
 //! Also ships the offline recovery path: `grepfocusd cleanup` tears down all
 //! enforcement without needing a working daemon (see `cleanup`).
@@ -14,9 +16,11 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 mod auth;
+mod browser_policy;
 mod cleanup;
 mod dns;
 mod enforce;
+mod health;
 mod hosts;
 mod ipc;
 mod listener;
@@ -75,11 +79,22 @@ pub struct Daemon {
     /// "accumulate in memory, persist when something else saves" pattern. No
     /// fsync per kill; a crash loses at most the unflushed count.
     pub app_kills_pending: std::sync::atomic::AtomicU64,
-    /// Whether instant breaks are wanted (setting on, a block active) but the
-    /// loopback proxy could not bind both ports — so breaks lag on this machine.
-    /// Set by `enforce::sync` each tick, read by `GetStatus` so the GUI can say
-    /// why. In-memory only; enforcement never depends on it.
-    pub instant_breaks_degraded: std::sync::atomic::AtomicBool,
+    /// Enforcement health and daemon identity, reported on `GetStatus`.
+    /// Written by `enforce::sync` (every outcome of an apply, re-probe or
+    /// teardown, and the live proxy state each tick), read by `GetStatus`.
+    /// In-memory only; enforcement never depends on it. A `std::sync::Mutex`
+    /// for the same reason as `forwardable`: a leaf lock held for
+    /// microseconds and never across an await, so it can be taken with
+    /// `applied` or `state` already held. Go through `Daemon::health()`.
+    pub health: std::sync::Mutex<health::HealthState>,
+}
+
+impl Daemon {
+    /// The health leaf lock. Poison is recovered rather than propagated: a
+    /// panicked prior holder must not wedge status reporting or enforcement.
+    pub fn health(&self) -> std::sync::MutexGuard<'_, health::HealthState> {
+        self.health.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 /// Wall-clock "now" (unix seconds) for license checks, clamped so a rewound
@@ -129,6 +144,12 @@ fn main() -> anyhow::Result<()> {
             }
             cleanup::run(opts)
         }
+        // Parsed by the AppImage installer's downgrade guard: keep the
+        // `grepfocusd <ver>` shape.
+        Some("--version") | Some("-V") => {
+            println!("grepfocusd {}", health::DAEMON_VERSION);
+            Ok(())
+        }
         Some(other) => usage(&format!("unknown subcommand: {}", other)),
     }
 }
@@ -145,6 +166,7 @@ fn usage(err: &str) -> ! {
     );
     eprintln!("         --force  skip the running-daemon check");
     eprintln!("         --purge  also delete /var/lib/grepfocus and /etc/grepfocus");
+    eprintln!("       grepfocusd --version | -V        print the version and exit");
     std::process::exit(2);
 }
 
@@ -220,6 +242,17 @@ async fn run_daemon() -> anyhow::Result<()> {
         }
     };
 
+    // Canonicalize stored block content — the saved blocks and the copies
+    // inside active blocks, which is what enforcement reads — before anything
+    // enforces it. Entries written by a pre-validation daemon (or a raw
+    // socket client) that cannot be normalized are dropped here; each change
+    // is one journal line, and the flag-only notes (over-cap lists, invalid
+    // names) repeat every start until the user fixes the block.
+    let notes = initial.sanitize();
+    for n in &notes {
+        warn!(note = %n, "sanitized stored block content");
+    }
+
     // Drop any active blocks that have already expired between shutdown and
     // startup. (They will simply never be re-applied.)
     let before = initial.active.len();
@@ -228,13 +261,24 @@ async fn run_daemon() -> anyhow::Result<()> {
     if dropped > 0 {
         info!(dropped, "discarded expired active blocks on startup");
     }
-    if dropped > 0 {
+    if dropped > 0 || !notes.is_empty() {
         if let Err(e) = state::save(&initial, &key) {
-            error!(?e, "failed to save state after dropping expired actives");
+            error!(?e, "failed to save state after startup sanitize");
         }
     }
 
+    // Identity for `GetStatus.health`, classified once: after an in-place
+    // upgrade `/proc/self/exe` would read differently, and the kind must
+    // describe the binary that is running.
+    let daemon_exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let install_kind = health::install_kind_for(std::path::Path::new(&daemon_exe));
+
     info!(
+        version = health::DAEMON_VERSION,
+        exe = %daemon_exe,
+        ?install_kind,
         block_count = initial.blocks.len(),
         active_count = initial.active.len(),
         schedule_count = initial.schedules.len(),
@@ -251,7 +295,7 @@ async fn run_daemon() -> anyhow::Result<()> {
         license: Mutex::new(license),
         break_challenges: Mutex::new(std::collections::HashMap::new()),
         app_kills_pending: std::sync::atomic::AtomicU64::new(0),
-        instant_breaks_degraded: std::sync::atomic::AtomicBool::new(false),
+        health: std::sync::Mutex::new(health::HealthState::new(daemon_exe, install_kind, notes)),
     });
 
     // Re-apply the union of all still-active blocks before accepting clients.
@@ -262,12 +306,14 @@ async fn run_daemon() -> anyhow::Result<()> {
     let ipc_handle = tokio::spawn(ipc::serve(daemon.clone()));
     let watch_handle = tokio::spawn(procwatch::run(daemon.clone()));
     let sched_handle = tokio::spawn(scheduler::run(daemon.clone()));
+    let policy_handle = tokio::spawn(browser_policy::run(daemon.clone()));
 
     // Run until any task fails or we receive SIGTERM/SIGINT.
     tokio::select! {
         r = ipc_handle => { error!(?r, "ipc task exited"); }
         r = watch_handle => { error!(?r, "procwatch task exited"); }
         r = sched_handle => { error!(?r, "scheduler task exited"); }
+        r = policy_handle => { error!(?r, "browser policy task exited"); }
         _ = tokio::signal::ctrl_c() => { info!("received SIGINT, shutting down"); }
     }
 

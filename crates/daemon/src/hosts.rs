@@ -17,8 +17,9 @@
 //! `enforce::sync` clears its memo, and the next 1s tick retries. A failed
 //! `chattr +i` (SELinux, or a filesystem without immutable-flag support) only
 //! logs a warning: the block is active, just not tamper-protected, and
-//! refusing to enforce at all would be strictly worse. `chattr -i` in the
-//! clear paths is likewise best-effort.
+//! refusing to enforce at all would be strictly worse. Both lock outcomes are
+//! returned as a `HostsLockStatus` so `enforce::sync` can report them on
+//! `GetStatus.health`. `chattr -i` in the clear paths is likewise best-effort.
 
 use std::fs;
 use std::net::Ipv4Addr;
@@ -26,6 +27,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::process::Command;
 
 use anyhow::{anyhow, Context};
+use grepfocus_core::HostsLockStatus;
 use tracing::{debug, info, warn};
 
 use crate::paths::{HOSTS, HOSTS_BEGIN, HOSTS_END, HOSTS_ORIG};
@@ -51,7 +53,16 @@ const HOSTS_ORIG_MODE: u32 = 0o600;
 /// unconditional regardless of license: it is the mechanical unlock needed
 /// to rewrite a possibly-still-locked file (e.g. locked by a previously
 /// licensed apply), not a license decision.
-pub fn apply_block(domains: &[String], sink: Ipv4Addr, tamper_protect: bool) -> anyhow::Result<()> {
+///
+/// Returns what happened to the immutable bit: `Locked`, `Unlocked` with the
+/// `chattr` error when it was wanted but refused, or `NotApplicable` when
+/// the license did not ask for it. An `Err` means the content itself did not
+/// land.
+pub fn apply_block(
+    domains: &[String],
+    sink: Ipv4Addr,
+    tamper_protect: bool,
+) -> anyhow::Result<HostsLockStatus> {
     chattr_immutable(HOSTS, false).ok(); // best-effort unlock if previously locked
     let original = fs::read_to_string(HOSTS).context("reading /etc/hosts")?;
     let stripped = strip_managed(&original);
@@ -71,27 +82,32 @@ pub fn apply_block(domains: &[String], sink: Ipv4Addr, tamper_protect: bool) -> 
         )
     };
     write_atomic(HOSTS, &new, HOSTS_MODE)?;
-    match hardening_for(tamper_protect) {
+    let lock = match hardening_for(tamper_protect) {
         // The immutable bit is hardening, not enforcement (see module docs):
         // the block is live once the write lands, so degrade gracefully here.
-        Hardening::SetImmutable => {
-            if let Err(e) = chattr_immutable(HOSTS, true) {
+        Hardening::SetImmutable => match chattr_immutable(HOSTS, true) {
+            Ok(()) => HostsLockStatus::Locked,
+            Err(e) => {
                 warn!(
                     ?e,
                     "chattr +i failed — hosts block is active but NOT tamper-protected \
                      (SELinux or the filesystem may forbid the immutable flag)"
                 );
+                HostsLockStatus::Unlocked {
+                    reason: crate::health::reason(&e),
+                }
             }
-        }
+        },
         // info! rather than debug!: apply_block runs only when the enforced
         // union changes or drift was detected — a handful of times per block
         // lifetime, never per tick — and the missing lock is the first thing
         // support will ask about ("why isn't /etc/hosts immutable?").
         Hardening::Skip => {
             info!("hosts block active without tamper protection (premium feature)");
+            HostsLockStatus::NotApplicable
         }
-    }
-    Ok(())
+    };
+    Ok(lock)
 }
 
 /// What `apply_block` does about the immutable bit after writing. Split out
@@ -150,6 +166,14 @@ pub(crate) fn contains_managed(s: &str) -> bool {
         .any(|line| line.trim_start().starts_with(HOSTS_BEGIN))
 }
 
+/// Whether `d` can stand as one name on one `/etc/hosts` line: printable
+/// ASCII, no whitespace (a second field would be a second alias, a newline a
+/// second line) and no `#` (a comment start). The last belt before root
+/// writes the file, deliberately independent of core's validator.
+fn line_safe(d: &str) -> bool {
+    d.bytes().all(|b| (0x21..0x7f).contains(&b) && b != b'#')
+}
+
 /// Render the managed region's body: one line per blocked name, plus the
 /// `www.` alias for any name that isn't already one, every line pointing at
 /// `sink`.
@@ -158,6 +182,10 @@ fn render_block(domains: &[String], sink: Ipv4Addr) -> String {
     for d in domains {
         let d = d.trim();
         if d.is_empty() {
+            continue;
+        }
+        if !line_safe(d) {
+            warn!(domain = ?d, "refusing to write unsafe hosts entry");
             continue;
         }
         out.push_str(&format!("{} {}\n", sink, d));
@@ -382,6 +410,66 @@ mod tests {
         // (free-tier enforcement) and only the hardening step is skipped.
         assert_eq!(hardening_for(true), Hardening::SetImmutable);
         assert_eq!(hardening_for(false), Hardening::Skip);
+    }
+
+    /// Nothing that could break out of its line reaches the file: a newline
+    /// (a second, attacker-chosen line), whitespace (a second alias on the
+    /// same line), a comment start, or anything outside printable ASCII.
+    #[test]
+    fn render_block_never_emits_an_unsafe_line() {
+        let unsafe_entries = [
+            "reddit.com\n0.0.0.0 evil.example",
+            "reddit.com\r\n0.0.0.0 evil.example",
+            "reddit.com evil.example",
+            "reddit.com\tevil.example",
+            "reddit.com#evil",
+            "#reddit.com",
+            "r\u{00e9}ddit.com",
+            "reddit.com\0",
+            "\u{7f}",
+        ];
+        let domains: Vec<String> = unsafe_entries.iter().map(|s| s.to_string()).collect();
+        assert_eq!(render_block(&domains, Ipv4Addr::UNSPECIFIED), "\n");
+        // And each one alone, so a later entry cannot mask an earlier miss.
+        for d in unsafe_entries {
+            assert_eq!(
+                render_block(&[d.to_string()], Ipv4Addr::UNSPECIFIED),
+                "\n",
+                "entry {d:?}"
+            );
+        }
+    }
+
+    /// Every accepted domain yields at most two lines (name + `www.` alias),
+    /// so the region's size is bounded by the list length — an entry cannot
+    /// smuggle extra lines in.
+    #[test]
+    fn render_block_line_count_is_bounded() {
+        let domains: Vec<String> = [
+            "reddit.com",
+            "www.example.com",
+            "reddit.com\n0.0.0.0 evil.example\n0.0.0.0 more.example",
+            "news.ycombinator.com",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let rendered = render_block(&domains, Ipv4Addr::UNSPECIFIED);
+        // The body opens with one blank line, then the entries.
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines[0], "");
+        assert!(lines.len() <= 1 + 2 * domains.len());
+        // Exactly: two names with an alias, one already-www, one refused.
+        assert_eq!(lines.len(), 1 + 2 + 1 + 2);
+        assert!(!rendered.contains("evil.example"));
+        assert!(!rendered.contains("more.example"));
+        // Every emitted line is `<sink> <name>` and nothing else.
+        for line in &lines[1..] {
+            let mut fields = line.split(' ');
+            assert_eq!(fields.next(), Some("0.0.0.0"));
+            assert!(fields.next().is_some_and(line_safe));
+            assert_eq!(fields.next(), None, "line {line:?}");
+        }
     }
 
     #[test]

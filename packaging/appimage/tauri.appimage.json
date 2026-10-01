@@ -1,0 +1,16 @@
+{
+  "build": {
+    "beforeBuildCommand": ""
+  },
+  "bundle": {
+    "resources": {
+      "appimage-payload/grepfocusd": "payload/grepfocusd",
+      "appimage-payload/grepfocusd.service": "payload/grepfocusd.service",
+      "appimage-payload/grepfocus.sysusers.conf": "payload/grepfocus.sysusers.conf",
+      "appimage-payload/grepfocus.tmpfiles.conf": "payload/grepfocus.tmpfiles.conf",
+      "appimage-payload/grepfocus.desktop": "payload/grepfocus.desktop",
+      "appimage-payload/appimage-install.sh": "payload/appimage-install.sh",
+      "appimage-payload/LICENSE": "payload/LICENSE"
+    }
+  }
+}

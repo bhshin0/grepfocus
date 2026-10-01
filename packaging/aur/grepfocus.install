@@ -1,0 +1,38 @@
+# pacman scriptlet for the grepfocus AUR package.
+#
+# pacman's systemd alpm hooks already run systemd-sysusers and systemd-tmpfiles
+# for the packaged /usr/lib/sysusers.d and /usr/lib/tmpfiles.d files, so the
+# grepfocus group and /run/grepfocus are created automatically. This scriptlet
+# only handles the service lifecycle and enforcement teardown.
+
+post_install() {
+    # Deliberately enable+start on install — Arch convention is to leave services
+    # disabled, but a blocker daemon that isn't running is broken. Same choice the
+    # RPM spec makes (%systemd_post + explicit start).
+    systemctl enable --now grepfocusd.service || true
+    cat <<'EOF'
+==> GrepFocus installed.
+
+    Add yourself to the grepfocus group, then log OUT and back in (the new
+    group membership needs a fresh login to talk to /run/grepfocus/sock):
+
+        sudo usermod -aG grepfocus "$USER"
+
+    Then launch GrepFocus from your application menu.
+EOF
+}
+
+post_upgrade() {
+    systemctl daemon-reload || true
+    systemctl try-restart grepfocusd.service || true
+}
+
+pre_remove() {
+    # Stop/disable FIRST: `grepfocusd cleanup` refuses while the unit is active.
+    systemctl disable --now grepfocusd.service || true
+    # Tear down enforcement (immutable /etc/hosts bit, managed hosts region,
+    # nftables table) while the binary still exists. Keeps saved blocks/config in
+    # /var/lib/grepfocus and /etc/grepfocus — a purge is a manual
+    # `grepfocusd cleanup --purge` before removal.
+    timeout --kill-after=5 30 /usr/bin/grepfocusd cleanup || true
+}

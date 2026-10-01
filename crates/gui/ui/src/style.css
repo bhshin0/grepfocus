@@ -4,6 +4,7 @@
   --fg: #1b1d21;
   --accent: #2a6df4;
   --danger: #c93b3b;
+  --warn: #b7791f;
   --muted: #6b7280;
   --card: #ffffff;
   --border: #e5e7eb;
@@ -15,10 +16,15 @@
     --card: #1f2227;
     --border: #2a2d33;
     --muted: #9ca3af;
+    --warn: #d69e2e;
   }
 }
 
 * { box-sizing: border-box; }
+/* The UA's [hidden] rule is a plain author-overridable declaration, so any
+   `display: grid/flex` rule below would win over the attribute (e.g. the grid
+   `label` rule on #old-pw-label). Make the attribute always mean hidden. */
+[hidden] { display: none !important; }
 body {
   margin: 0;
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -222,6 +228,35 @@ form label > input[type="checkbox"] { width: auto; margin-right: 6px; }
 .lock-state.locked { border-color: var(--danger); color: var(--danger); }
 .lock-state.unlocked { border-color: var(--accent); color: var(--accent); }
 
+/* Status: GUI/daemon version skew card (renderUpdateBanner in main.ts). A
+   .lock-state card with the advice, an optional button row and a message
+   line; `locked` (red) marks a daemon newer than this app. */
+.update-banner p { margin: 0; }
+.update-banner .row { display: flex; gap: 8px; align-items: center; }
+.update-banner .row > button { margin-top: 8px; }
+.update-banner .msg { margin-top: 6px; }
+
+/* Status: release-check strips (renderUpdateNotice in main.ts) — the one-time
+   disclosure and the newer-release notice. Quieter than the skew card above:
+   nothing here is wrong with the install. */
+.update-strip {
+  font-size: 13px;
+  padding: 8px 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  margin-bottom: 14px;
+  overflow-wrap: anywhere;
+}
+.update-strip p { margin: 0; }
+.update-strip .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+.update-strip .msg { margin-top: 6px; }
+
+/* Settings: "Check now" beside the last check's outcome. */
+.update-check-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.update-check-row .hint { margin: 0; }
+
 /* Unlock dialog */
 dialog {
   border: 1px solid var(--border);
@@ -298,6 +333,50 @@ dialog .row { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
 /* Non-blocking warning (e.g. password-locked breaks with no password set).
    Distinct from .msg.error: the save still goes through. */
 .msg.warn { color: var(--fg); opacity: 0.9; }
+
+/* Status-tab enforcement notices (healthNotices in main.ts): one card per
+   notice, severity carried by the left edge and text colour. RED (error) is
+   blocking that may not hold; YELLOW (warn) is degraded but enforced; INFO is
+   something worth knowing that needs no action. */
+#health-banner { display: grid; gap: 6px; margin-bottom: 14px; }
+.health-notice {
+  margin: 0;
+  font-size: 13px;
+  padding: 8px 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--muted);
+  border-radius: 8px;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+.health-notice.error { border-left-color: var(--danger); color: var(--danger); }
+.health-notice.warn { border-left-color: var(--warn); color: var(--warn); }
+.health-notice.info { border-left-color: var(--accent); }
+
+/* Settings: versions + diagnostics, set off from the password form above. */
+#about { margin-top: 20px; border-top: 1px solid var(--border); padding-top: 10px; }
+#about .hint { margin: 4px 0; overflow-wrap: anywhere; }
+
+/* Settings: "System service" (AppImage installs only), set off like #about. */
+#service-section { margin-top: 20px; border-top: 1px solid var(--border); padding-top: 10px; }
+#service-section h3 { margin: 0 0 4px; font-size: 14px; }
+
+/* Its confirmation dialog: a list of consequences needs more than the 360px
+   default, and the confirm button is the destructive one. */
+#service-remove-dialog { max-width: 460px; }
+#service-remove-dialog p { margin: 0; }
+.dialog-list { margin: 0; padding-left: 18px; font-size: 13px; display: grid; gap: 6px; }
+button.danger {
+  background: transparent;
+  color: var(--danger);
+  border: 1px solid var(--danger);
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+button.danger:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* Challenge dialog: wider than the 360px default so a 40-char string can
    breathe on one or two lines. */
@@ -577,4 +656,14 @@ dialog .row { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
   border-radius: 3px;
   border: 1px solid var(--border);
   display: inline-block;
+}
+
+/* Per-block mini grid inside a block card's schedule section. Reuses every
+   .week-* rule; just drops the 560px floor so it fits the card (still scrolls
+   sideways via the inherited .week-scroll) and shrinks the window text for the
+   smaller 12px/hour columns. */
+.week-mini .week-grid { min-width: 0; }
+.week-mini .week-window {
+  font-size: 10px;
+  padding: 0 3px;
 }

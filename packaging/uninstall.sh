@@ -53,9 +53,41 @@ else
     echo "==> Keeping saved data (re-run with --purge to delete it)"
 fi
 
+# Shell mirror of the daemon's Firefox-family policy removal
+# (browser_policy::remove_one), for one file and its recovery copy. The
+# daemon parses the JSON; this fallback only looks for the marker lines the
+# daemon's canonical render produces, so: no marker → not ours, keep it (and
+# any recovery copy); recovery copy present → put it back byte-exact (both
+# files stay if that fails: the rest of the teardown must still run);
+# marker says we created the file → delete it; otherwise the file is a merge
+# whose copy is gone, and the DNSOverHTTPS and grepfocus keys need a hand.
+restore_firefox_policy() {
+    local f="$1" orig="$2"
+    [[ -f "$f" ]] || return 0
+    if ! grep -q '^  "grepfocus": {' "$f"; then
+        if [[ -f "$orig" ]]; then
+            echo "note: $f is not managed by GrepFocus — keeping it and $orig" >&2
+        fi
+        return 0
+    fi
+    if [[ -f "$orig" ]]; then
+        if install -m 0644 "$orig" "$f"; then
+            rm -f "$orig"
+        else
+            echo "note: could not restore $f from $orig — both kept, restore it by hand" >&2
+        fi
+    elif grep -q '^    "created": true' "$f"; then
+        rm -f "$f"
+    else
+        echo "note: $f carries GrepFocus's DNSOverHTTPS policy and its recovery copy is gone — remove the \"DNSOverHTTPS\" and \"grepfocus\" keys by hand" >&2
+    fi
+}
+
 # Minimal teardown of the artifacts that block traffic on their own. Used
 # when the binary is missing (broken/partial install) or when delegation to
-# `grepfocusd cleanup` fails or times out.
+# `grepfocusd cleanup` fails or times out. The browser policy files do not
+# block traffic, but they outlive the daemon, so they go here too: every
+# path below is pinned to browser_policy::managed_paths by a daemon test.
 inline_teardown() {
     chattr -i /etc/hosts 2>/dev/null || true
     if [[ -f /etc/hosts ]]; then
@@ -69,6 +101,24 @@ inline_teardown() {
     fi
     rm -f /etc/hosts.grepfocus.tmp /var/lib/grepfocus/hosts.orig.grepfocus.tmp
     nft delete table inet grepfocus_doh 2>/dev/null || true
+    # Browser DoH policies. The Chromium-family files are ours outright (the
+    # filename is the marker); the Firefox-family files are shared.
+    rm -f /etc/chromium/policies/managed/grepfocus.json \
+        /var/snap/chromium/current/policies/managed/grepfocus.json \
+        /etc/opt/chrome/policies/managed/grepfocus.json \
+        /etc/brave/policies/managed/grepfocus.json
+    restore_firefox_policy /etc/firefox/policies/policies.json \
+        /var/lib/grepfocus/policies/_etc_firefox_policies_policies.json.orig
+    restore_firefox_policy /usr/lib/mullvad-browser/distribution/policies.json \
+        /var/lib/grepfocus/policies/_usr_lib_mullvad-browser_distribution_policies.json.orig
+    rm -f /etc/firefox/policies/policies.json.grepfocus.tmp \
+        /usr/lib/mullvad-browser/distribution/policies.json.grepfocus.tmp \
+        /etc/chromium/policies/managed/grepfocus.json.grepfocus.tmp \
+        /var/snap/chromium/current/policies/managed/grepfocus.json.grepfocus.tmp \
+        /etc/opt/chrome/policies/managed/grepfocus.json.grepfocus.tmp \
+        /etc/brave/policies/managed/grepfocus.json.grepfocus.tmp \
+        /var/lib/grepfocus/policies/_etc_firefox_policies_policies.json.orig.grepfocus.tmp \
+        /var/lib/grepfocus/policies/_usr_lib_mullvad-browser_distribution_policies.json.orig.grepfocus.tmp
     if [[ $PURGE -eq 1 ]]; then
         rm -rf /var/lib/grepfocus /etc/grepfocus
     else
@@ -89,8 +139,9 @@ pkill -x grepfocus-gui || true
 
 # Tear down enforcement while the binary still exists — the daemon's own
 # cleanup path handles the immutable bit, hosts strip/restore, atomic-write
-# orphans, the nftables table, and persisted active blocks. Removing the
-# binary first would strand a chattr +i /etc/hosts: that is the brick.
+# orphans, the nftables table, the browser DoH policy files, and persisted
+# active blocks. Removing the binary first would strand a chattr +i
+# /etc/hosts: that is the brick.
 if [[ -x /usr/local/bin/grepfocusd ]]; then
     echo "==> Tearing down enforcement (grepfocusd cleanup)"
     CLEANUP_ARGS=()
@@ -152,8 +203,10 @@ cat <<EOF
 
 ==> Uninstall complete.
 
-Removed: enforcement (/etc/hosts region, nftables table), binaries,
-systemd unit, launcher files for $INVOKING_USER, /run/grepfocus.
+Removed: enforcement (/etc/hosts region, nftables table, browser DoH
+policies), binaries, systemd unit, launcher files for $INVOKING_USER,
+/run/grepfocus. Restart any browser that was open so it drops the
+"managed by your organization" notice.
 EOF
 if [[ $PURGE -eq 1 ]]; then
     echo "Purged: /var/lib/grepfocus, /etc/grepfocus, and the grepfocus group."

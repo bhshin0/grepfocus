@@ -1,4 +1,15 @@
 //! Periodic /proc scan that SIGKILLs processes matching any active block.
+//!
+//! Guard set, checked before a process is even identified (see
+//! [`is_protected`]): pid 0 and 1, this daemon's own pid, kernel threads, and
+//! anything running as root are never signalled. Root is skipped outright —
+//! systemd, logind, our own `nft`/`chattr` children — rather than `uid <
+//! UID_MIN`, because `UID_MIN` is distro-configurable and a wrong boundary
+//! would silently stop blocking the user's own apps. The cost is documented:
+//! an app launched through `sudo`/`pkexec` runs as euid 0 and survives a
+//! block. Matchers are additionally re-canonicalized on every tick
+//! ([`enforced_groups`]), so an entry that would match GrepFocus itself or
+//! nearly every process never reaches the sweep.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -6,10 +17,11 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use grepfocus_core::validate::normalize_matcher;
 use grepfocus_core::{now_unix, ActiveBlock, AppMatcher};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use procfs::process::all_processes;
+use procfs::process::{all_processes, StatFlags};
 use tracing::{debug, warn};
 
 use crate::Daemon;
@@ -25,6 +37,8 @@ pub async fn run(daemon: Arc<Daemon>) {
     // so a later PID reuse counts again. Kept in the loop, not on `Daemon`,
     // because only this task needs it.
     let mut recently_killed: HashSet<i32> = HashSet::new();
+    // Read once: the pid never changes, and the sweep must never signal it.
+    let self_pid = std::process::id() as i32;
     loop {
         ticker.tick().await;
         let groups = {
@@ -41,7 +55,7 @@ pub async fn run(daemon: Arc<Daemon>) {
         }
         // /proc scanning is sync; do it on a blocking thread so we don't
         // stall the runtime.
-        let killed = match tokio::task::spawn_blocking(move || sweep(&groups)).await {
+        let killed = match tokio::task::spawn_blocking(move || sweep(&groups, self_pid)).await {
             Ok(k) => k,
             Err(e) => {
                 warn!(?e, "sweep task panicked");
@@ -66,17 +80,36 @@ pub async fn run(daemon: Arc<Daemon>) {
 /// that (a) snapshotted app enforcement at activation (`apps_enforced` — set
 /// from the license's `app_blocking` feature at that moment, so a mid-block
 /// license change in either direction never alters a running block) and
-/// (b) are not currently on a break. Blocks with no matchers are dropped.
-/// Pure, so the enforcement decision is unit-testable without a live `/proc`.
+/// (b) are not currently on a break. Each matcher passes through
+/// `normalize_matcher`, so one that would match GrepFocus itself, or nearly
+/// every process, is left out even if a stored copy still carries it; blocks
+/// with no matchers left are dropped. Pure, so the enforcement decision is
+/// unit-testable without a live `/proc`.
 fn enforced_groups(active: &[ActiveBlock], now: u64) -> Vec<(u64, Vec<AppMatcher>)> {
     active
         .iter()
         .filter(|a| a.apps_enforced)
         // Skip blocks currently on a break — their apps run freely.
         .filter(|a| a.break_until_unix.is_none_or(|t| t <= now))
-        .filter(|a| !a.block.apps.is_empty())
-        .map(|a| (a.block.id, a.block.apps.clone()))
+        .filter_map(|a| {
+            let apps: Vec<AppMatcher> = a
+                .block
+                .apps
+                .iter()
+                .filter_map(|m| normalize_matcher(m).ok())
+                .collect();
+            (!apps.is_empty()).then_some((a.block.id, apps))
+        })
         .collect()
+}
+
+/// Whether a process is off limits to the sweep regardless of what it runs:
+/// pid 0 (the idle task) and 1 (init), this daemon itself, a kernel thread,
+/// or anything whose effective uid is root (system services, setuid helpers,
+/// our own child processes, and — the documented cost — an app launched via
+/// `sudo`/`pkexec`). Pure, so the guard set is unit-testable.
+fn is_protected(pid: i32, uid: u32, kthread: bool, self_pid: i32) -> bool {
+    pid <= 1 || pid == self_pid || kthread || uid == 0
 }
 
 /// Number of PIDs in `killed` that were NOT killed on the previous tick.
@@ -88,10 +121,15 @@ fn count_new_kills(killed: &HashSet<i32>, recently_killed: &HashSet<i32>) -> usi
         .count()
 }
 
-/// Scan `/proc`, SIGKILL every process matching any group's matchers, and
-/// return the set of PIDs actually killed this tick (used both for dedup and
-/// the kill count). ESRCH (already gone) is not counted — nothing was killed.
-fn sweep(groups: &[(u64, Vec<AppMatcher>)]) -> HashSet<i32> {
+/// Scan `/proc`, SIGKILL every unprotected process matching any group's
+/// matchers, and return the set of PIDs actually killed this tick (used both
+/// for dedup and the kill count). ESRCH (already gone) is not counted —
+/// nothing was killed.
+///
+/// The guard runs before the process is identified, so `exe`/`cmdline` are
+/// never read for a protected one. A process that vanished between the
+/// listing and any read here is skipped: it is gone either way.
+fn sweep(groups: &[(u64, Vec<AppMatcher>)], self_pid: i32) -> HashSet<i32> {
     let mut killed = HashSet::new();
     let procs = match all_processes() {
         Ok(p) => p,
@@ -101,11 +139,32 @@ fn sweep(groups: &[(u64, Vec<AppMatcher>)]) -> HashSet<i32> {
         }
     };
     for proc in procs.flatten() {
-        // First matching group attributes the kill; one SIGKILL is enough.
-        let Some((block_id, _)) = groups.iter().find(|(_, m)| matches_any(&proc, m)) else {
+        let pid = proc.pid();
+        // One fstat of the pid directory. This is the EFFECTIVE uid: the
+        // kernel exempts the top-level pid dir from the non-dumpable→root
+        // ownership rule (`task_dump_owner`), so a setuid or ptrace-protected
+        // process still reports the user it runs as.
+        let Ok(uid) = proc.uid() else {
             continue;
         };
-        let pid = proc.pid();
+        // `stat` is read once and reused for `comm` below; the PF_KTHREAD
+        // flag is a belt over the uid rule (every kernel thread is uid 0).
+        let Ok(stat) = proc.stat() else {
+            continue;
+        };
+        let kthread = stat.flags & StatFlags::PF_KTHREAD.bits() != 0;
+        if is_protected(pid, uid, kthread, self_pid) {
+            continue;
+        }
+        let exe = proc.exe().ok();
+        let cmdline = proc.cmdline().ok();
+        // First matching group attributes the kill; one SIGKILL is enough.
+        let Some((block_id, _)) = groups
+            .iter()
+            .find(|(_, m)| proc_matches(exe.as_deref(), cmdline.as_deref(), Some(&stat.comm), m))
+        else {
+            continue;
+        };
         debug!(pid, block_id, "killing process");
         match kill(Pid::from_raw(pid), Signal::SIGKILL) {
             Ok(()) => {
@@ -116,18 +175,6 @@ fn sweep(groups: &[(u64, Vec<AppMatcher>)]) -> HashSet<i32> {
         }
     }
     killed
-}
-
-fn matches_any(proc: &procfs::process::Process, matchers: &[AppMatcher]) -> bool {
-    let exe = proc.exe().ok();
-    let cmdline = proc.cmdline().ok();
-    let comm = proc.stat().ok().map(|s| s.comm);
-    proc_matches(
-        exe.as_deref(),
-        cmdline.as_deref(),
-        comm.as_deref(),
-        matchers,
-    )
 }
 
 /// Pure matcher over a process's identity fields, split out so it can be tested
@@ -322,6 +369,80 @@ mod tests {
         assert!(enforced_groups(&[active(true, Some(200))], 100).is_empty());
         // Break elapsed: enforcement resumes.
         assert_eq!(enforced_groups(&[active(true, Some(100))], 100).len(), 1);
+    }
+
+    /// A stored copy that still carries an entry the validator refuses — one
+    /// aimed at GrepFocus itself, a two-character cmdline pattern that would
+    /// match nearly everything, a relative exe path — contributes nothing,
+    /// and its untrimmed neighbour reaches the sweep in canonical form.
+    #[test]
+    fn enforced_groups_drops_invalid_matchers() {
+        let mut a = active(true, None);
+        a.block.apps = vec![
+            AppMatcher::Basename {
+                name: "  steam  ".into(),
+            },
+            AppMatcher::Basename {
+                name: "grepfocus-gui".into(),
+            },
+            AppMatcher::Cmdline {
+                contains: "GrepFocus".into(),
+            },
+            AppMatcher::Cmdline {
+                contains: "ab".into(),
+            },
+            AppMatcher::ExePath {
+                path: "usr/bin/discord".into(),
+            },
+            AppMatcher::ExePath {
+                path: "/usr/bin/grepfocusd".into(),
+            },
+            AppMatcher::Basename { name: "".into() },
+        ];
+        assert_eq!(
+            enforced_groups(&[a], 100),
+            vec![(
+                1,
+                vec![AppMatcher::Basename {
+                    name: "steam".into()
+                }]
+            )]
+        );
+        // Nothing valid left: no group at all, not an empty one.
+        let mut a = active(true, None);
+        a.block.apps = vec![AppMatcher::Basename {
+            name: "grepfocusd".into(),
+        }];
+        assert!(enforced_groups(&[a], 100).is_empty());
+    }
+
+    // ── is_protected(): the guard set ───────────────────────────────────────
+
+    #[test]
+    fn is_protected_matrix() {
+        const SELF: i32 = 4242;
+        // pid 0 (idle task) and 1 (init), whoever they run as.
+        assert!(is_protected(0, 1000, false, SELF));
+        assert!(is_protected(1, 1000, false, SELF));
+        assert!(is_protected(1, 0, false, SELF));
+        // The daemon itself.
+        assert!(is_protected(SELF, 1000, false, SELF));
+        assert!(is_protected(SELF, 0, false, SELF));
+        // Kernel threads, even with an unexpected uid.
+        assert!(is_protected(2, 1000, true, SELF));
+        assert!(is_protected(2, 0, true, SELF));
+        // Root, whatever its pid — including a sudo-launched app.
+        assert!(is_protected(2, 0, false, SELF));
+        assert!(is_protected(99_999, 0, false, SELF));
+        // Everything else is fair game: the user, another user, nobody.
+        assert!(!is_protected(2, 1000, false, SELF));
+        assert!(!is_protected(SELF + 1, 1000, false, SELF));
+        assert!(!is_protected(2, 1001, false, SELF));
+        assert!(!is_protected(2, 65534, false, SELF));
+        // A system account that is not root is not exempt: the boundary is
+        // uid 0, deliberately not UID_MIN.
+        assert!(!is_protected(2, 1, false, SELF));
+        assert!(!is_protected(2, 999, false, SELF));
     }
 
     // ── count_new_kills(): per-PID dedup across ticks ───────────────────────

@@ -8,10 +8,11 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use grepfocus_core::license::{self, LicenseClaims};
+use grepfocus_core::validate::validate_block;
 use grepfocus_core::{
     compute_grant, evaluate_allowance, now_unix, validate_policy, ActiveBlock, AllowanceLedger,
     AllowancePolicy, AllowanceStatus, AppMatcher, BreakRecord, LockMode, Originator, PomodoroPhase,
-    PomodoroSession, PomodoroStatus, Request, Response, Schedule, State,
+    PomodoroSession, PomodoroStatus, ProxyStatus, Request, Response, Schedule, State,
 };
 use nix::unistd::Group;
 use tokio::net::{UnixListener, UnixStream};
@@ -211,6 +212,10 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 cycle_index: p.cycle_index,
                 cycles_total: p.cycles_total,
             });
+            let health = daemon.health().snapshot();
+            // The legacy flag is derived, never stored separately, so the two
+            // cannot disagree on one frame.
+            let instant_breaks_degraded = health.proxy == ProxyStatus::Degraded;
             Response::Status {
                 active: st.active.clone(),
                 now_unix: now,
@@ -226,9 +231,8 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 licensed_features: lic.features,
                 pomodoro,
                 settings: st.settings.clone(),
-                instant_breaks_degraded: daemon
-                    .instant_breaks_degraded
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                instant_breaks_degraded,
+                health: Box::new(health),
             }
         }
 
@@ -236,6 +240,12 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             let mut st = daemon.state.lock().await;
             if let Some(resp) = gate_config(daemon, &st).await {
                 return resp;
+            }
+            // Content validation comes before the premium gates so a typo
+            // gets the typo error rather than a feature pitch, and so the
+            // app-count gate sees the deduplicated list.
+            if let Err(msg) = validate_block(&mut block) {
+                return err(msg);
             }
             {
                 let lic = daemon.license.lock().await;
@@ -283,6 +293,13 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             }
             if st.active.iter().any(|a| a.block.id == block.id) {
                 return err("cannot edit a block while it is active");
+            }
+            // Canonicalize before the app-list comparison below: a retyped
+            // but equal app list must compare equal to the canonical saved
+            // one, or a grandfathered block could not be re-saved after a
+            // downgrade.
+            if let Err(msg) = validate_block(&mut block) {
+                return err(msg);
             }
             // License gate for the app list, against the SAVED block (see
             // update_needs_app_license for the grandfathering rationale:
@@ -1414,8 +1431,60 @@ mod tests {
             license: tokio::sync::Mutex::new(None),
             break_challenges: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             app_kills_pending: std::sync::atomic::AtomicU64::new(0),
-            instant_breaks_degraded: std::sync::atomic::AtomicBool::new(false),
+            health: std::sync::Mutex::new(crate::health::HealthState::default()),
         })
+    }
+
+    // `health` rides on every Status frame straight from the daemon's health
+    // state, and the legacy `instant_breaks_degraded` is derived from it —
+    // never a second source that could drift.
+    #[tokio::test]
+    async fn get_status_carries_health_and_derives_legacy_degraded_flag() {
+        let daemon = test_daemon();
+        match dispatch(Request::GetStatus {}, &daemon).await {
+            Response::Status {
+                instant_breaks_degraded,
+                health,
+                ..
+            } => {
+                assert!(!instant_breaks_degraded);
+                assert_eq!(health.daemon_version, env!("CARGO_PKG_VERSION"));
+                assert_eq!(health.proxy, ProxyStatus::Off);
+                assert_eq!(health.nft, grepfocus_core::NftStatus::NotApplicable);
+                assert_eq!(health.hosts, grepfocus_core::HostsLockStatus::NotApplicable);
+                assert!(health.browser_policies.is_empty());
+                assert_eq!(health.last_error, None);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+
+        daemon.health().set_proxy(ProxyStatus::Degraded);
+        daemon.health().hosts_drift_detected();
+        match dispatch(Request::GetStatus {}, &daemon).await {
+            Response::Status {
+                instant_breaks_degraded,
+                health,
+                ..
+            } => {
+                assert!(instant_breaks_degraded);
+                assert_eq!(health.proxy, ProxyStatus::Degraded);
+                assert_eq!(health.hosts_reapplies, 1);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+
+        daemon.health().set_proxy(ProxyStatus::Holding);
+        match dispatch(Request::GetStatus {}, &daemon).await {
+            Response::Status {
+                instant_breaks_degraded,
+                health,
+                ..
+            } => {
+                assert!(!instant_breaks_degraded);
+                assert_eq!(health.proxy, ProxyStatus::Holding);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
     }
 
     /// An active record whose embedded block carries `policy`.
@@ -2174,6 +2243,252 @@ mod tests {
         )
         .await;
         assert_not_premium_gated(&resp);
+    }
+
+    // ── content validation (validate_block) ─────────────────────────────────
+    //
+    // The daemon is the authority: the GUI runs the same validator for the
+    // message, but a raw socket client gets exactly these refusals, before
+    // any state is touched. Messages are core's verbatim.
+
+    fn blk_with_domains(id: u64, domains: &[&str]) -> Block {
+        let mut b = blk(id, vec![]);
+        b.domains = domains.iter().map(|s| s.to_string()).collect();
+        b
+    }
+
+    /// A newline inside a domain would become a second, attacker-chosen
+    /// `/etc/hosts` line written by root.
+    #[tokio::test]
+    async fn add_block_refuses_injection_domain() {
+        let daemon = test_daemon();
+        let block = blk_with_domains(0, &["reddit.com\n0.0.0.0 evil.example"]);
+        let resp = dispatch(Request::AddBlock { block }, &daemon).await;
+        assert_eq!(
+            err_msg(resp),
+            "domain \"reddit.com\\n0.0.0.0 evil.example\": hostname contains an invalid \
+             character — only letters, digits, dots and hyphens, one hostname per entry"
+        );
+        assert!(daemon.state.lock().await.blocks.is_empty());
+    }
+
+    /// An empty `cmdline:` pattern is a substring of every process's argv.
+    #[tokio::test]
+    async fn add_block_refuses_empty_cmdline_matcher() {
+        let daemon = test_daemon();
+        let block = blk(
+            0,
+            vec![AppMatcher::Cmdline {
+                contains: "".into(),
+            }],
+        );
+        let resp = dispatch(Request::AddBlock { block }, &daemon).await;
+        assert_eq!(err_msg(resp), "cmdline pattern \"\": must not be empty");
+        // And the shortest non-empty one that is still too broad.
+        let block = blk(
+            0,
+            vec![AppMatcher::Cmdline {
+                contains: "ab".into(),
+            }],
+        );
+        let resp = dispatch(Request::AddBlock { block }, &daemon).await;
+        assert_eq!(
+            err_msg(resp),
+            "cmdline pattern \"ab\": must be at least 3 characters — a shorter pattern \
+             would match nearly every process"
+        );
+        assert!(daemon.state.lock().await.blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_block_refuses_self_matcher() {
+        let daemon = test_daemon();
+        for (m, text) in [
+            (
+                AppMatcher::Basename {
+                    name: "grepfocus-gui".into(),
+                },
+                "basename \"grepfocus-gui\"",
+            ),
+            (
+                AppMatcher::ExePath {
+                    path: "/usr/local/bin/grepfocusd".into(),
+                },
+                "exe path \"/usr/local/bin/grepfocusd\"",
+            ),
+            (
+                AppMatcher::Cmdline {
+                    contains: "GrepFocus".into(),
+                },
+                "cmdline pattern \"GrepFocus\"",
+            ),
+        ] {
+            let resp = dispatch(
+                Request::AddBlock {
+                    block: blk(0, vec![m]),
+                },
+                &daemon,
+            )
+            .await;
+            assert_eq!(
+                err_msg(resp),
+                format!("{text}: would match GrepFocus itself, which cannot block itself")
+            );
+        }
+        assert!(daemon.state.lock().await.blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_block_refuses_empty_block() {
+        let daemon = test_daemon();
+        let block = blk_with_domains(0, &[]);
+        let resp = dispatch(Request::AddBlock { block }, &daemon).await;
+        assert_eq!(
+            err_msg(resp),
+            "a block needs at least one domain or app to block"
+        );
+        // Whitespace-only entries count as nothing, with the domain's own
+        // error rather than the empty-block one (it is refused first).
+        let block = blk_with_domains(0, &["   "]);
+        let resp = dispatch(Request::AddBlock { block }, &daemon).await;
+        assert_eq!(err_msg(resp), "domain \"   \": hostname is empty");
+        assert!(daemon.state.lock().await.blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_block_refuses_bad_domain_without_mutation() {
+        let daemon = test_daemon();
+        daemon.state.lock().await.blocks.push(blk(1, vec![]));
+        for (raw, msg) in [
+            (
+                "1.2.3.4",
+                "IP addresses cannot be blocked — enter a hostname, e.g. reddit.com",
+            ),
+            (
+                "localhost",
+                "enter a full hostname with a dot, e.g. reddit.com",
+            ),
+            (
+                "*.reddit.com",
+                "wildcards are not supported — reddit.com also blocks www.reddit.com; list \
+                 other subdomains explicitly",
+            ),
+        ] {
+            let mut update = blk(1, vec![]);
+            update.name = "renamed".into();
+            update.domains = vec!["reddit.com".into(), raw.into()];
+            let resp = dispatch(Request::UpdateBlock { block: update }, &daemon).await;
+            assert_eq!(err_msg(resp), format!("domain {raw:?}: {msg}"));
+        }
+        // Refused before any mutation: the saved block is what was seeded,
+        // name included.
+        let st = daemon.state.lock().await;
+        let seeded = blk(1, vec![]);
+        assert_eq!(st.blocks.len(), 1);
+        assert_eq!(st.blocks[0].name, seeded.name);
+        assert_eq!(st.blocks[0].domains, seeded.domains);
+        assert!(st.blocks[0].apps.is_empty());
+    }
+
+    /// Free tier with the block cap already reached and app matchers in the
+    /// frame: the content error is what comes back, not a premium pitch. A
+    /// typo is a typo whatever the license says.
+    #[tokio::test]
+    async fn add_block_validation_precedes_premium_gate() {
+        let daemon = test_daemon();
+        daemon.state.lock().await.blocks.push(blk(1, vec![]));
+        let mut block = blk_with_domains(0, &["not a hostname"]);
+        block.apps = vec![steam()];
+        block.lock = LockMode::PasswordBreaks;
+        let resp = dispatch(Request::AddBlock { block }, &daemon).await;
+        assert_eq!(
+            err_msg(resp),
+            "domain \"not a hostname\": hostname contains an invalid character — only \
+             letters, digits, dots and hyphens, one hostname per entry"
+        );
+        // The same frame with valid content hits the cap: the gate is still
+        // there, just behind the validator.
+        let mut block = blk(0, vec![steam()]);
+        block.lock = LockMode::PasswordBreaks;
+        let resp = dispatch(Request::AddBlock { block }, &daemon).await;
+        assert_eq!(err_msg(resp), MSG_BLOCK_CAP);
+        assert_eq!(daemon.state.lock().await.blocks.len(), 1);
+    }
+
+    /// A block seeded past the cap (a legacy state file, or a pre-validation
+    /// daemon) stays saved and startable, but cannot be re-saved as is: the
+    /// startup sanitize notes it every start, and an edit is refused until
+    /// the list is trimmed.
+    #[tokio::test]
+    async fn update_block_refuses_over_cap_legacy_block() {
+        use grepfocus_core::validate::MAX_DOMAINS_PER_BLOCK;
+        let daemon = test_daemon();
+        let mut legacy = blk(1, vec![]);
+        legacy.domains = (0..=MAX_DOMAINS_PER_BLOCK)
+            .map(|i| format!("site-{i}.example"))
+            .collect();
+        daemon.state.lock().await.blocks.push(legacy.clone());
+        let resp = dispatch(
+            Request::UpdateBlock {
+                block: legacy.clone(),
+            },
+            &daemon,
+        )
+        .await;
+        assert_eq!(
+            err_msg(resp),
+            format!("a block can hold at most {MAX_DOMAINS_PER_BLOCK} domains")
+        );
+        // Untouched: nothing was truncated on its way through the refusal.
+        let st = daemon.state.lock().await;
+        assert_eq!(st.blocks.len(), 1);
+        assert_eq!(st.blocks[0].domains, legacy.domains);
+    }
+
+    /// Free tier, premium-era block: the user re-types the same app list
+    /// with stray whitespace and a duplicate. Canonicalization runs before
+    /// the app-list comparison, so it compares equal to the saved list and
+    /// is grandfathered through rather than gated.
+    #[tokio::test]
+    async fn update_block_retyped_apps_not_gated_after_downgrade() {
+        let daemon = test_daemon();
+        daemon.state.lock().await.blocks.push(blk(1, vec![steam()]));
+        let update = blk(
+            1,
+            vec![
+                AppMatcher::Basename {
+                    name: "  steam ".into(),
+                },
+                steam(),
+            ],
+        );
+        let resp = dispatch(Request::UpdateBlock { block: update }, &daemon).await;
+        assert_not_premium_gated(&resp);
+    }
+
+    /// The counterpart: a list that is genuinely different after
+    /// canonicalization (basenames are case-sensitive, a second matcher is a
+    /// change) is still a premium action on the free tier.
+    #[tokio::test]
+    async fn update_block_changed_apps_still_gated_after_downgrade() {
+        let daemon = test_daemon();
+        daemon.state.lock().await.blocks.push(blk(1, vec![steam()]));
+        for apps in [
+            vec![AppMatcher::Basename {
+                name: "Steam".into(),
+            }],
+            vec![steam(), discord()],
+        ] {
+            let resp = dispatch(
+                Request::UpdateBlock {
+                    block: blk(1, apps),
+                },
+                &daemon,
+            )
+            .await;
+            assert_eq!(err_msg(resp), MSG_APP_BLOCKING);
+        }
+        assert_eq!(daemon.state.lock().await.blocks[0].apps, vec![steam()]);
     }
 
     #[tokio::test]

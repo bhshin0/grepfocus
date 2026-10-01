@@ -1,9 +1,15 @@
-//! DoH (DNS-over-HTTPS) endpoint blocking via `nft`.
+//! DoH (DNS-over-HTTPS) endpoint blocking via `nft` — the second line of
+//! defence.
 //!
-//! We install a small `inet` table that drops TCP 443 (DoH) and TCP/UDP
-//! 853 (DNS-over-TLS) traffic to known public DoH resolver IPs. This
-//! closes the bypass where browsers — chiefly Firefox — skip `/etc/hosts`
-//! by resolving names directly via Cloudflare/Mozilla over HTTPS.
+//! The first line is `browser_policy`, which turns DoH off in every
+//! detected browser via enterprise policy. This table catches what that
+//! cannot: browsers that have not restarted since the policy was written
+//! (Firefox reads policies only at start), browsers we do not policy
+//! (Flatpak Firefox, Vivaldi/Edge/Opera, per-user installs) and DoT. It
+//! is a small `inet` table that drops TCP 443 (DoH) and TCP/UDP 853
+//! (DNS-over-TLS) traffic to known public DoH resolver IPs, so a browser
+//! skipping `/etc/hosts` by resolving directly via Cloudflare/Mozilla/
+//! Mullvad over HTTPS gets no answer.
 //!
 //! Trade-offs (documented, not fixed):
 //! - Doesn't catch DoH providers we don't list (custom endpoints,
@@ -14,6 +20,10 @@
 //!   line we draw for custom DoH. An unscoped 853 drop would kill ALL
 //!   DNS for a system resolver (e.g. systemd-resolved) doing DoT to a
 //!   private or custom endpoint: an effective network brick.
+//! - Mullvad Browser: with its policy in place it falls back to the
+//!   native resolver and keeps working; only one started before the
+//!   policy was written, or on a read-only `/usr` (no policy file), still
+//!   hits the listed-resolver case and loses DNS during active blocks.
 //! - A system resolver doing DoT to a *listed* public IP (e.g.
 //!   `1.1.1.1:853`) still loses DNS during active blocks. The README
 //!   documents it.
@@ -32,7 +42,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context};
-use tracing::{debug, warn};
+use tracing::debug;
 
 const NFT: &str = "/usr/sbin/nft";
 const TABLE: &str = "grepfocus_doh";
@@ -64,6 +74,18 @@ const DOH_V4: &[&str] = &[
     // NextDNS anycast
     "45.90.28.0/24",
     "45.90.30.0/24",
+    // Mullvad (dns/adblock/base/extended/family/all.dns.mullvad.net —
+    // Mullvad Browser's built-in TRR-only default resolver)
+    "194.242.2.2",
+    "194.242.2.3",
+    "194.242.2.4",
+    "194.242.2.5",
+    "194.242.2.6",
+    "194.242.2.9",
+    // Mozilla's Firefox DoH default (mozilla.cloudflare-dns.com — anycast,
+    // distinct from 1.1.1.1; IPs can rotate, best-effort)
+    "162.159.61.4",
+    "172.64.41.4",
 ];
 
 const DOH_V6: &[&str] = &[
@@ -79,6 +101,18 @@ const DOH_V6: &[&str] = &[
     // AdGuard
     "2a10:50c0::ad1:ff",
     "2a10:50c0::ad2:ff",
+    // Mullvad (dns/adblock/base/extended/family/all.dns.mullvad.net —
+    // Mullvad Browser's built-in TRR-only default resolver)
+    "2a07:e340::2",
+    "2a07:e340::3",
+    "2a07:e340::4",
+    "2a07:e340::5",
+    "2a07:e340::6",
+    "2a07:e340::9",
+    // Mozilla's Firefox DoH default (mozilla.cloudflare-dns.com — anycast,
+    // distinct from 1.1.1.1; IPs can rotate, best-effort)
+    "2803:f800:53::4",
+    "2a06:98c1:52::4",
 ];
 
 /// Build an `nft` invocation bounded by coreutils `timeout` (SIGTERM at
@@ -138,22 +172,28 @@ pub fn table_exists() -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Remove the table if present. Idempotent — silent on absence.
+/// Remove the table if present. Idempotent — silent on absence. Any other
+/// non-zero exit is an error: a table left behind after a block keeps
+/// dropping DoH, so `enforce::sync` reports it and retries the delete at the
+/// re-verify cadence.
 pub fn clear() -> anyhow::Result<()> {
     let out = nft_command(&["delete", "table", "inet", TABLE])
         .output()
         .context("spawning nft delete")?;
-    if !out.status.success() {
-        // Common case: table doesn't exist (first run, or already cleared).
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if stderr.contains("No such file or directory") || stderr.contains("does not exist") {
-            return Ok(());
-        }
-        warn!(stderr = %stderr.trim(), "nft delete returned non-zero");
-    } else {
+    if out.status.success() {
         debug!("removed nftables DoH block table");
+        return Ok(());
     }
-    Ok(())
+    // Common case: table doesn't exist (first run, or already cleared).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("No such file or directory") || stderr.contains("does not exist") {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "nft delete failed (status {}): {}",
+        out.status,
+        stderr.trim()
+    ))
 }
 
 fn build_ruleset() -> String {
@@ -191,6 +231,9 @@ mod tests {
         assert!(r.contains("1.1.1.1"));
         assert!(r.contains("8.8.8.8"));
         assert!(r.contains("2606:4700:4700::1111"));
+        assert!(r.contains("194.242.2.2"));
+        assert!(r.contains("2a07:e340::2"));
+        assert!(r.contains("162.159.61.4"));
         assert!(r.contains("tcp dport 443 drop"));
         assert!(r.contains("tcp dport 853 drop"));
         assert!(r.contains("udp dport 853 drop"));

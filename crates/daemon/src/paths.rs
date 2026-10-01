@@ -9,6 +9,9 @@ pub const HOSTS: &str = "/etc/hosts";
 /// managed-region edit so the real hosts file can be restored by hand.
 pub const HOSTS_ORIG: &str = "/var/lib/grepfocus/hosts.orig";
 pub const STATE_DIR: &str = "/var/lib/grepfocus";
+/// Pre-existing browser policy files, byte-exact, saved before the first
+/// merge so removal can put them back (see `browser_policy`).
+pub const POLICY_ORIG_DIR: &str = "/var/lib/grepfocus/policies";
 pub const SECRET_DIR: &str = "/etc/grepfocus";
 pub const SECRET_FILE: &str = "/etc/grepfocus/secret";
 pub const RUN_DIR: &str = "/run/grepfocus";

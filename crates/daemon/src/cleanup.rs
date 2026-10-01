@@ -3,8 +3,10 @@
 //! Recovery path for a wedged or half-uninstalled system: clears the
 //! immutable bit, strips the managed `/etc/hosts` region (restoring from the
 //! recovery copy if the live file is gone), removes stale atomic-write
-//! orphans, drops the nftables DoH table, and clears persisted active blocks
-//! so a later `systemctl start` doesn't re-apply them. Every step is
+//! orphans, drops the nftables DoH table, removes or restores the browser
+//! DoH policy files (`browser_policy::remove_all` — the only path that does;
+//! stopping the daemon leaves them in place), and clears persisted active
+//! blocks so a later `systemctl start` doesn't re-apply them. Every step is
 //! best-effort and idempotent, and the command copes with missing or corrupt
 //! state. Only a failed hosts strip exits nonzero — that is the one artifact
 //! that keeps blocking traffic on its own.
@@ -18,7 +20,7 @@ use std::process::Command;
 use anyhow::Context;
 use tracing::debug;
 
-use crate::{hosts, nftables, paths, state};
+use crate::{browser_policy, hosts, nftables, paths, state};
 
 /// Options for `grepfocusd cleanup`, parsed in `main`.
 pub struct Opts {
@@ -61,7 +63,9 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
     }
 
     // Refuse to fight a live daemon: its 1s reconcile tick would re-apply
-    // enforcement right behind us. The socket probe alone can't be trusted:
+    // enforcement right behind us, and its 60s browser-policy pass would
+    // recreate the policy files (so `--force` under a live daemon gets them
+    // back within a minute). The socket probe alone can't be trusted:
     // under systemd's Restart=always a kill -9'd daemon respawns about a
     // second later and re-applies enforcement BEFORE binding its socket, so
     // a probe against the stale socket reads "not running" while the respawn
@@ -147,11 +151,11 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
     steps.push(("stale tmp files", {
         let mut removed = Vec::new();
         let mut failed = Vec::new();
-        for target in [paths::HOSTS, paths::HOSTS_ORIG] {
-            match remove_stale_tmp(target) {
-                Ok(true) => removed.push(write_atomic_tmp_path(target)),
+        for target in stale_tmp_targets() {
+            match remove_stale_tmp(&target) {
+                Ok(true) => removed.push(write_atomic_tmp_path(&target)),
                 Ok(false) => {}
-                Err(e) => failed.push(format!("{}: {}", write_atomic_tmp_path(target), e)),
+                Err(e) => failed.push(format!("{}: {}", write_atomic_tmp_path(&target), e)),
             }
         }
         if !failed.is_empty() {
@@ -172,6 +176,13 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
         },
     ));
 
+    // (e2) Remove or restore the browser DoH policy files. A file we merged
+    // into goes back to its recovery copy; one we created is deleted.
+    let policy_targets = browser_policy::targets(Path::new("/"), Path::new(paths::POLICY_ORIG_DIR));
+    let (policy_outcome, surviving_origs) =
+        browser_policy::fold_cleanup(&browser_policy::remove_all(&policy_targets));
+    steps.push(("browser DoH policies", policy_outcome));
+
     // (f) Clear persisted active blocks so a later `systemctl start` doesn't
     // re-apply them.
     steps.push((
@@ -184,11 +195,13 @@ pub fn run(opts: Opts) -> anyhow::Result<()> {
     // hosts strip failed, /etc/hosts may still contain the managed region and
     // hosts.orig inside the state dir is the recovery copy needed to fix
     // exactly that — purging would burn the safety net, so keep everything.
+    // Same for a browser policy file whose restore failed while its `.orig`
+    // is still there.
     if opts.purge {
         steps.push((
             "purge dirs",
-            if hosts_strip_error.is_some() {
-                Outcome::Skipped("hosts strip failed — keeping state and recovery copy".into())
+            if let Some(why) = purge_blocker(hosts_strip_error.is_some(), &surviving_origs) {
+                Outcome::Skipped(why)
             } else {
                 let mut removed = Vec::new();
                 let mut failed = Vec::new();
@@ -308,6 +321,36 @@ pub(crate) fn clear_active_blocks(state_dir: &Path, secret_path: &Path) -> Outco
             }
         },
     }
+}
+
+/// Every file written through `hosts::write_atomic` whose orphaned scratch
+/// file step (d) sweeps: the hosts pair plus the browser policy files and
+/// their recovery copies.
+pub(crate) fn stale_tmp_targets() -> Vec<String> {
+    let mut targets = vec![paths::HOSTS.to_string(), paths::HOSTS_ORIG.to_string()];
+    targets.extend(browser_policy::managed_paths(
+        Path::new("/"),
+        Path::new(paths::POLICY_ORIG_DIR),
+    ));
+    targets
+}
+
+/// Why `--purge` must keep the state dir: it holds the only copy of
+/// something an earlier step still needs. `None` means purge may proceed.
+pub(crate) fn purge_blocker(
+    hosts_strip_failed: bool,
+    surviving_origs: &[String],
+) -> Option<String> {
+    if hosts_strip_failed {
+        return Some("hosts strip failed — keeping state and recovery copy".into());
+    }
+    if !surviving_origs.is_empty() {
+        return Some(format!(
+            "browser policy restore failed — keeping state and {}",
+            surviving_origs.join(", ")
+        ));
+    }
+    None
 }
 
 /// Path of the scratch file `hosts::write_atomic` uses when writing `path`.
@@ -518,6 +561,36 @@ mod tests {
         // Everything else survives — cleanup drops the actives, not the config.
         assert_eq!(reloaded.blocks.len(), 1);
         assert_eq!(reloaded.next_id, 2);
+    }
+
+    #[test]
+    fn stale_tmp_sweep_covers_the_policy_files() {
+        let targets = stale_tmp_targets();
+        assert_eq!(targets[0], paths::HOSTS);
+        assert_eq!(targets[1], paths::HOSTS_ORIG);
+        let policy =
+            browser_policy::managed_paths(Path::new("/"), Path::new(paths::POLICY_ORIG_DIR));
+        assert_eq!(policy.len(), 8);
+        for p in &policy {
+            assert!(targets.contains(p), "{p}");
+        }
+        assert_eq!(targets.len(), 2 + policy.len());
+    }
+
+    #[test]
+    fn purge_is_blocked_while_a_policy_recovery_copy_survives() {
+        assert_eq!(purge_blocker(false, &[]), None);
+        assert!(purge_blocker(true, &[])
+            .unwrap()
+            .contains("hosts strip failed"));
+        let orig = "/var/lib/grepfocus/policies/_etc_firefox_policies_policies.json.orig";
+        let why = purge_blocker(false, &[orig.into()]).unwrap();
+        assert!(why.contains("browser policy restore failed"), "{why}");
+        assert!(why.contains(orig), "{why}");
+        // The hosts failure is the one named when both apply.
+        assert!(purge_blocker(true, &[orig.into()])
+            .unwrap()
+            .contains("hosts strip failed"));
     }
 
     #[test]

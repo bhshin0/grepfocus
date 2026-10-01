@@ -23,6 +23,45 @@
     <main>
       <section id="status" class="tab active">
         <h2>Status</h2>
+        <!--
+          Enforcement notices (see healthNotices in main.ts). A sibling ABOVE
+          #status-content, which refreshStatus rewrites every poll — this one
+          is rewritten only when its notices change.
+        -->
+        <div id="health-banner" role="status" aria-live="polite" hidden></div>
+        <!--
+          GUI/daemon version skew (renderUpdateBanner in main.ts): the one
+          banner with a pkexec button. Same sibling rule as #health-banner.
+        -->
+        <div id="update-banner" class="lock-state update-banner" hidden>
+          <p id="update-text"></p>
+          <div class="row">
+            <button type="button" id="update-action" hidden>Update system service</button>
+            <button type="button" id="update-download" class="ghost" hidden>Download</button>
+          </div>
+          <p id="update-msg" class="msg"></p>
+        </div>
+        <!--
+          Release check (renderUpdateNotice in main.ts): the one-time
+          disclosure, then the newer-release notice. Same sibling rule as
+          #health-banner; the notice yields to an active block and to
+          #update-banner.
+        -->
+        <div id="update-disclosure" class="update-strip" hidden>
+          <p>GrepFocus checks grepfocus.com once a day for a newer release. Only the version number is exchanged and nothing is downloaded; you can turn this off in Settings.</p>
+          <div class="row">
+            <button type="button" id="update-disclosure-ok" class="ghost">Got it</button>
+            <button type="button" id="update-disclosure-off" class="ghost">Turn off</button>
+          </div>
+        </div>
+        <div id="update-notice" class="update-strip" hidden>
+          <p id="update-notice-text"></p>
+          <div class="row">
+            <button type="button" id="update-notes" class="ghost" hidden>What's new</button>
+            <button type="button" id="update-dismiss" class="ghost">Dismiss</button>
+          </div>
+          <p id="update-notice-msg" class="msg error" hidden></p>
+        </div>
         <div id="status-content">Loading…</div>
       </section>
 
@@ -30,11 +69,11 @@
         <h2>New block</h2>
         <form id="new-block-form">
           <label>Name <input name="name" required /></label>
-          <label>Domains (one per line)
+          <label>Domains (one per line — hostnames only, e.g. reddit.com; the www. form is blocked too)
             <textarea name="domains" rows="4" placeholder="reddit.com&#10;twitter.com"></textarea>
           </label>
-          <label>App exe paths or basenames (one per line)
-            <textarea name="apps" rows="4" placeholder="/usr/bin/steam&#10;discord"></textarea>
+          <label>App exe paths, basenames, or cmdline:&lt;substring&gt; (one per line)
+            <textarea name="apps" rows="4" placeholder="/usr/bin/steam&#10;discord&#10;cmdline:com.discordapp.Discord"></textarea>
           </label>
           <label>Break allowance
             <select name="allowance_kind">
@@ -102,6 +141,17 @@
             Instant breaks (a blocked site becomes reachable the moment a break starts, even in an already-open tab)
           </label>
           <p id="instant-breaks-note" class="msg warn" hidden></p>
+          <!-- GUI-local and per user (renderUpdateSettings in main.ts): not a
+               daemon setting, so the settings password does not gate it. -->
+          <label class="checkbox-row">
+            <input type="checkbox" id="update-check-toggle" />
+            Check grepfocus.com once a day for a newer release (version number only; nothing is downloaded)
+          </label>
+          <div id="update-check-row" class="update-check-row" hidden>
+            <button type="button" id="update-check-now" class="ghost">Check now</button>
+            <span id="update-check-status" class="hint"></span>
+          </div>
+          <p id="update-check-persist" class="msg error" hidden></p>
           <p id="prefs-msg" class="msg"></p>
         </div>
 
@@ -119,6 +169,25 @@
           <button type="button" id="password-clear" class="ghost" hidden>Remove password</button>
           <p id="password-msg" class="msg"></p>
         </form>
+
+        <!-- Versions (GUI + daemon) and the enforcement diagnostics line. -->
+        <div id="about">
+          <p id="about-line" class="hint"></p>
+          <p id="health-diag" class="hint"></p>
+        </div>
+
+        <!--
+          AppImage installs only (serviceRemovalOffered in main.ts): the
+          service this app installed outlives the AppImage file, so this is
+          where it is taken off the machine again. Never shown over a package
+          install — the package manager owns that daemon.
+        -->
+        <div id="service-section" hidden>
+          <h3>System service</h3>
+          <p class="hint">This AppImage installed the background service that enforces blocks. Deleting the AppImage file does not remove it — remove the service here first.</p>
+          <button type="button" id="service-remove" class="ghost">Remove system service…</button>
+          <p id="service-msg" class="msg"></p>
+        </div>
       </section>
 
       <section id="license" class="tab">
@@ -227,6 +296,50 @@
           <button type="button" id="schedule-cancel" class="ghost">Cancel</button>
         </div>
         <p id="schedule-msg" class="msg"></p>
+      </form>
+    </dialog>
+
+    <!--
+      Confirmation for Settings' "Remove system service" (main.ts). Says what
+      the pkexec'd uninstall does before it asks for the password; stays open
+      while it runs, and on failure to show the installer's message.
+    -->
+    <dialog id="service-remove-dialog">
+      <form id="service-remove-form" method="dialog">
+        <h3>Remove the system service?</h3>
+        <p>You'll be asked to authorize with your password. Then:</p>
+        <ul class="dialog-list">
+          <li>Blocking stops: the GrepFocus service (grepfocusd) and its systemd unit are removed from this computer.</li>
+          <li>The browser DNS-over-HTTPS policy files are removed, or put back as they were before GrepFocus — restart your browsers once afterwards.</li>
+          <li>Your saved blocks, schedules, stats, license and settings password are kept, in /var/lib/grepfocus and /etc/grepfocus.</li>
+        </ul>
+        <p class="hint">To reinstall, run the AppImage again — it offers to install the service.</p>
+        <div class="row">
+          <button type="button" id="service-remove-confirm" class="danger">Remove system service</button>
+          <button type="button" id="service-remove-cancel" class="ghost">Cancel</button>
+        </div>
+        <p id="service-remove-msg" class="msg"></p>
+      </form>
+    </dialog>
+
+    <!--
+      Daemon-unreachable dialog (modes in main.ts's showFirstRun): "not
+      installed yet" offers the pkexec installer (AppImage only), "installed
+      but this login predates the group" asks for a relogin, and an installed
+      daemon that is not running asks for a systemctl start — with a
+      "Reinstall service" fallback when it is the AppImage's own install.
+      "removed" is where "Remove system service" ends: it says so and offers
+      the installer again. Driven from main.ts's refreshStatus.
+    -->
+    <dialog id="firstrun-dialog">
+      <form id="firstrun-form" method="dialog">
+        <h3 id="firstrun-title">Set up GrepFocus</h3>
+        <p class="hint" id="firstrun-body"></p>
+        <div class="row">
+          <button type="button" id="firstrun-action">Install system service</button>
+          <button type="button" id="firstrun-secondary" class="ghost" hidden>Reinstall service</button>
+        </div>
+        <p id="firstrun-msg" class="msg"></p>
       </form>
     </dialog>
 

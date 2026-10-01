@@ -101,6 +101,97 @@ interface Settings {
   instant_breaks: boolean;
 }
 
+// ─── Health (mirrors core's wire types, snake_case on the wire) ─────────────
+//
+// Every enum below can carry a tag this build does not know — a newer daemon
+// may add one — which core folds to `"unknown"`; the UI says nothing for it.
+
+/// Where the daemon binary lives, classified once at daemon start.
+type InstallKind = "package" | "local" | "unknown";
+
+/// State of the DoH-blocking nftables table.
+type NftStatus =
+  | { kind: "ok" }
+  /// `nft` could not install the table: the hosts block is live, DoH is open.
+  | { kind: "failed"; reason: string }
+  /// The block ended but `nft delete` failed; the daemon keeps retrying.
+  | { kind: "stale_table"; reason: string }
+  /// Nothing enforced, no table left behind.
+  | { kind: "not_applicable" }
+  | { kind: "unknown" };
+
+/// State of the immutable flag on `/etc/hosts`.
+type HostsLockStatus =
+  | { kind: "locked" }
+  /// Licensed for tamper protection but `chattr +i` failed.
+  | { kind: "unlocked"; reason: string }
+  /// Nothing enforced, or not licensed (no lock attempted).
+  | { kind: "not_applicable" }
+  | { kind: "unknown" };
+
+/// State of the instant-breaks loopback proxy. `degraded` is what the legacy
+/// `Status.instant_breaks_degraded` flag is derived from.
+type ProxyStatus = "holding" | "degraded" | "off" | "unknown";
+
+/// Why a browser's DoH policy file could not be written. `unsupported` and
+/// `read_only_fs` are not fixable from inside GrepFocus; the rest are.
+type BrowserPolicyFailKind =
+  | "unsupported"
+  | "read_only_fs"
+  | "not_json"
+  | "symlink"
+  | "io"
+  | "unknown";
+
+/// What the daemon did about one browser's DoH policy file. The failure
+/// payload is `fail_kind` on the wire because the tag already owns `kind`.
+type BrowserPolicyState =
+  | { kind: "not_installed" }
+  | { kind: "written" }
+  | { kind: "merged" }
+  | { kind: "failed"; fail_kind: BrowserPolicyFailKind; reason: string }
+  | { kind: "unknown" };
+
+/// One browser's DoH policy file, as the daemon last saw it. `browser` is a
+/// slug (`firefox | firefox-flatpak | mullvad-browser | chromium |
+/// chromium-snap | chrome | brave`); the UI maps slugs to display names.
+interface BrowserPolicyStatus {
+  browser: string;
+  path: string;
+  state: BrowserPolicyState;
+  /// `written`/`merged`: mtime of the file; otherwise when this daemon first
+  /// saw the state.
+  since_unix: number;
+}
+
+/// Enforcement health plus daemon identity, carried on `Status`. An OLD
+/// daemon never emits it and core's default arrives instead — an empty
+/// `daemon_version` is the tell, and every other field is then meaningless.
+interface Health {
+  daemon_version: string;
+  daemon_exe: string;
+  install_kind: InstallKind;
+  nft: NftStatus;
+  hosts: HostsLockStatus;
+  /// Times a re-probe found the hosts region missing and re-applied it — a
+  /// tamper signal.
+  hosts_reapplies: number;
+  /// Times a re-probe found the table gone while nft worked and re-installed
+  /// it — a firewall reload.
+  nft_reinstalls: number;
+  proxy: ProxyStatus;
+  /// Fixed slug order after the first browser-policy pass; empty before it
+  /// and on an old daemon.
+  browser_policies: BrowserPolicyStatus[];
+  /// What the daemon's startup sanitize changed or flagged (capped at 200
+  /// lines, the last one a count of the rest).
+  startup_notes: string[];
+  /// The last enforcement error (hosts read/write, install or teardown);
+  /// cleared by the next success.
+  last_error: string | null;
+  last_error_unix: number | null;
+}
+
 interface Status {
   active: ActiveBlock[];
   now_unix: number;
@@ -118,10 +209,61 @@ interface Status {
   licensed_features: string[];
   pomodoro: PomodoroStatus | null;
   settings: Settings;
-  /// True when instant breaks are on and a block is active but the loopback
-  /// proxy could not bind a port (something else holds :80 or :443), so breaks
-  /// lag on this machine. Drives an explanatory notice.
+  /// DEPRECATED, still emitted: equal to `health.proxy === "degraded"` —
+  /// instant breaks are on and a block is active but the loopback proxy could
+  /// not bind a port (something else holds :80 or :443), so breaks lag on
+  /// this machine. Drives an explanatory notice.
   instant_breaks_degraded: boolean;
+  /// Enforcement health and daemon identity — see `Health`.
+  health: Health;
+  /// GUI/daemon version skew advice, computed by the Rust side on every poll
+  /// — see `UpdateAdvice`.
+  update: UpdateAdvice;
+}
+
+/// Mirrors `version::UpdateAdvice` in src/main.rs: what the GUI/daemon
+/// version skew calls for. `from` is the daemon's version (null = it predates
+/// version reporting), `to` this app's. Only `update_service` comes with a
+/// button; `gui_outdated` is never an install offer.
+type UpdateAdvice =
+  | { kind: "up_to_date" }
+  | { kind: "update_service"; from: string | null; to: string }
+  | { kind: "package_manager"; from: string | null; to: string }
+  | { kind: "both_installs"; from: string | null; to: string }
+  | { kind: "manual"; from: string | null; to: string }
+  | { kind: "gui_outdated"; gui: string; daemon: string };
+
+/// Mirrors `update::Release` in src/update.rs: what the GUI keeps of the
+/// site's `latest.json`. `notes_url` arrives only when it is a grepfocus.com
+/// link — the Rust side drops anything else before it gets here.
+interface Release {
+  version: string;
+  published: string | null;
+  notes_url: string | null;
+}
+
+/// Mirrors `update::UpdateInfo`: the daily release check as the Rust side
+/// sees it. `status` and `notice` are finished copy; this side only decides
+/// where and when they show.
+interface UpdateInfo {
+  enabled: boolean;
+  /// The one-time disclosure strip has been rendered (this launch or an
+  /// earlier one).
+  disclosed: boolean;
+  current: string;
+  latest: Release | null;
+  available: boolean;
+  dismissed: boolean;
+  checking: boolean;
+  last_check_unix: number | null;
+  /// The Settings row.
+  status: string;
+  /// The Status-tab strip; null unless a newer, undismissed release is known
+  /// and checks are on.
+  notice: string | null;
+  /// A preference file that could not be read or saved — its own line,
+  /// never mixed into `status`.
+  persist_error: string | null;
 }
 
 interface Schedule {
@@ -157,14 +299,22 @@ tabs.forEach((btn) => {
 
 // ─── New block form ────────────────────────────────────────────────────────
 
+/// Spelling of a `cmdline` matcher in the app textarea. The block card renders
+/// a saved cmdline matcher with the same prefix, so an Edit → Save round trip
+/// keeps its kind instead of silently turning it into a basename.
+const CMDLINE_PREFIX = "cmdline:";
+
 function parseAppLines(raw: string): AppMatcher[] {
   return raw
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean)
-    .map((line): AppMatcher =>
-      line.startsWith("/") ? { kind: "exe_path", path: line } : { kind: "basename", name: line },
-    );
+    .map((line): AppMatcher => {
+      if (line.startsWith(CMDLINE_PREFIX)) {
+        return { kind: "cmdline", contains: line.slice(CMDLINE_PREFIX.length) };
+      }
+      return line.startsWith("/") ? { kind: "exe_path", path: line } : { kind: "basename", name: line };
+    });
 }
 
 /// Show only the inputs the selected allowance kind actually uses: "none"
@@ -229,9 +379,10 @@ function readBlockForm(form: HTMLFormElement, id: number): Block {
   return {
     id,
     name: String(fd.get("name") ?? "").trim(),
+    // Any whitespace or comma separates entries, so a pasted `reddit.com
+    // twitter.com` becomes two domains rather than one refused entry.
     domains: String(fd.get("domains") ?? "")
-      .split("\n")
-      .map((s) => s.trim())
+      .split(/[\s,]+/)
       .filter(Boolean),
     apps: parseAppLines(String(fd.get("apps") ?? "")),
     allowance_secs_per_day: allowance.kind === "none" ? 0 : allowance.secs,
@@ -305,7 +456,7 @@ const listEl = document.querySelector<HTMLUListElement>("#block-list")!;
 const listMsg = document.querySelector<HTMLParagraphElement>("#list-msg")!;
 
 async function refreshList() {
-  listMsg.classList.remove("error");
+  listMsg.classList.remove("error", "warn");
   listMsg.textContent = "";
   listEl.innerHTML = "";
   try {
@@ -322,16 +473,26 @@ async function refreshList() {
     //
     // A failed status read is not fatal here — fall back to no active blocks
     // and no allowance views (each card then renders its static policy
-    // summary) and let the daemon have the last word on save.
+    // summary) and let the daemon have the last word on save. But it is not
+    // silent either: a card that reads "idle, full allowance" because the
+    // read failed is misinformation, so the failure is stated above the list.
     //
     // Schedules ride along for the same reason they now live inside the cards:
     // a schedule has no meaning apart from the block it drives. Storage is
     // still one flat list keyed by `block_id`, so grouping happens here.
-    const [blocks, status, schedules] = await Promise.all([
+    const [blocks, statusRead, schedules] = await Promise.all([
       invoke<Block[]>("list_blocks"),
-      invoke<Status>("get_status").catch(() => null),
+      invoke<Status>("get_status").then(
+        (status) => ({ status, err: "" }),
+        (e: unknown) => ({ status: null, err: String(e) }),
+      ),
       invoke<Schedule[]>("list_schedules"),
     ]);
+    const status = statusRead.status;
+    if (status === null) {
+      listMsg.classList.add("warn");
+      listMsg.textContent = `Live status could not be read (${statusRead.err}) — which blocks are active and their remaining allowance are unknown; cards show saved configuration only.`;
+    }
     const active = new Set((status?.active ?? []).map((a) => a.block.id));
     // Absent on an OLD daemon that predates the field, in which case this map
     // stays empty and every card falls back to its static summary.
@@ -458,11 +619,11 @@ function renderBlockCard(
       <form class="edit-block-form">
         <p class="msg warn edit-active-note" hidden>This block is running. Editing is disabled until it ends — the daemon refuses changes to an active block so a running block's allowance and lock cannot be softened mid-flight.</p>
         <label>Name <input name="name" required /></label>
-        <label>Domains (one per line)
-          <textarea name="domains" rows="4"></textarea>
+        <label>Domains (one per line — hostnames only, e.g. reddit.com; the www. form is blocked too)
+          <textarea name="domains" rows="4" placeholder="reddit.com&#10;twitter.com"></textarea>
         </label>
-        <label>App exe paths or basenames (one per line)
-          <textarea name="apps" rows="4"></textarea>
+        <label>App exe paths, basenames, or cmdline:&lt;substring&gt; (one per line)
+          <textarea name="apps" rows="4" placeholder="/usr/bin/steam&#10;discord&#10;cmdline:com.discordapp.Discord"></textarea>
         </label>
         <label>Break allowance
           <select name="allowance_kind">
@@ -499,7 +660,7 @@ function renderBlockCard(
   const apps = b.apps.map((a) => {
     if (a.kind === "exe_path") return a.path;
     if (a.kind === "basename") return a.name;
-    return `cmdline:${a.contains}`;
+    return `${CMDLINE_PREFIX}${a.contains}`;
   });
   const allowanceNote = policyNote(blockPolicy(b)) + liveAllowanceNote(allowance);
   li.querySelector(".meta")!.textContent =
@@ -507,7 +668,7 @@ function renderBlockCard(
   const dur = li.querySelector<HTMLInputElement>(".duration")!;
   li.querySelector<HTMLButtonElement>(".start-btn")!.addEventListener("click", async () => {
     const minutes = Math.max(1, parseInt(dur.value, 10) || 30);
-    listMsg.classList.remove("error");
+    listMsg.classList.remove("error", "warn");
     try {
       await invoke("start_block", { id: b.id, durationSecs: minutes * 60 });
       listMsg.textContent = `started for ${minutes} minute(s)`;
@@ -518,7 +679,7 @@ function renderBlockCard(
     }
   });
   li.querySelector<HTMLButtonElement>(".delete-btn")!.addEventListener("click", async () => {
-    listMsg.classList.remove("error");
+    listMsg.classList.remove("error", "warn");
     if (!(await ensureUnlocked())) return;
     try {
       await invoke("delete_block", { id: b.id });
@@ -589,6 +750,17 @@ function renderBlockCard(
   if (schedules.length === 0) {
     schedList.appendChild(emptyLi("No schedules for this block yet."));
   } else {
+    // Compact week grid above the text rows: one column set for THIS block, so
+    // drop the redundant block name from each window label. The now line stays
+    // for at-a-glance "is a window live right now" context.
+    const mini = buildWeekGrid(schedules, {
+      blockName: () => b.name,
+      windowLabel: (_s, _n, range) => range,
+      hourPx: 12,
+      showNow: true,
+    });
+    mini.classList.add("week-mini");
+    schedList.before(mini);
     for (const s of schedules) schedList.appendChild(renderScheduleRow(s));
   }
   li.querySelector<HTMLButtonElement>(".add-sched-btn")!.addEventListener("click", () => {
@@ -632,9 +804,267 @@ function statusInteractionBusy(): boolean {
   return el instanceof HTMLInputElement && statusEl.contains(el);
 }
 
+// ─── Health: Status banner, Settings about + diagnostics lines ─────────────
+//
+// `healthNotices`, `healthSummary` and `aboutLine` are pure (status in, text
+// out) so every severity rule reads in one place; the render functions after
+// them are the only DOM writers. All of it is silent on a daemon too old to
+// report (`health.daemon_version === ""`) and for any `unknown` value.
+
+const healthBannerEl = document.querySelector<HTMLDivElement>("#health-banner")!;
+const aboutLineEl = document.querySelector<HTMLParagraphElement>("#about-line")!;
+const healthDiagEl = document.querySelector<HTMLParagraphElement>("#health-diag")!;
+
+/// RED = blocking may not hold; YELLOW = enforced but degraded; INFO = worth
+/// knowing, nothing to do.
+type NoticeLevel = "error" | "warn" | "info";
+
+interface HealthNotice {
+  level: NoticeLevel;
+  text: string;
+}
+
+/// Display names for the daemon's browser slugs. An unknown slug (a newer
+/// daemon's browser) renders raw rather than being dropped.
+const BROWSER_NAME: Record<string, string> = {
+  firefox: "Firefox",
+  "firefox-flatpak": "Firefox (Flatpak)",
+  "mullvad-browser": "Mullvad Browser",
+  chromium: "Chromium",
+  "chromium-snap": "Chromium (snap)",
+  chrome: "Google Chrome",
+  brave: "Brave",
+};
+
+function browserName(slug: string): string {
+  return BROWSER_NAME[slug] ?? slug;
+}
+
+/// "Firefox" · "Firefox and Chromium" · "Firefox, Mullvad Browser and Chromium".
+function joinNames(names: string[]): string {
+  if (names.length <= 1) return names.join("");
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+/// How long after a policy file was written the "restart your browser" hint
+/// stays up. Firefox-based browsers read policies only at start, so one that
+/// was open at write time keeps DoH until restarted; past this window assume
+/// it has been.
+const RESTART_HINT_SECS = 900;
+
+/// The Status-tab notices for a status, RED → YELLOW → INFO.
+///
+/// The two RED rules are mirrored by `enforcement_red` in src/main.rs, which
+/// drives the tray notification — change together.
+function healthNotices(s: Status): HealthNotice[] {
+  const h = s.health;
+  if (h.daemon_version === "") return [];
+  const domainBlockActive = s.active.some((a) => a.block.domains.length > 0);
+  const red: HealthNotice[] = [];
+  const yellow: HealthNotice[] = [];
+  const info: HealthNotice[] = [];
+
+  // RED: the hosts write itself failed. Always shown — with no domain block
+  // active it is a failed teardown, and the previous block's entries may
+  // still be in /etc/hosts.
+  if (h.last_error != null) {
+    red.push({
+      level: "error",
+      text: domainBlockActive
+        ? `Website blocking may not be enforced: the /etc/hosts change could not be applied (${h.last_error}). The daemon retries every second; see journalctl -u grepfocusd`
+        : `The last /etc/hosts change could not be applied (${h.last_error}) — previously blocked sites may still be blocked. The daemon retries every second; see journalctl -u grepfocusd`,
+    });
+  }
+  // RED: no DoH table under a live domain block. Without one there is nothing
+  // to bypass, and the state clears at the next apply.
+  if (h.nft.kind === "failed" && domainBlockActive) {
+    red.push({
+      level: "error",
+      text: `Active blocks can be bypassed: DoH protection (nftables) failed — ${h.nft.reason}. Browsers using DNS-over-HTTPS (Firefox, Mullvad Browser) may still reach blocked sites.`,
+    });
+  }
+
+  if (h.hosts.kind === "unlocked") {
+    yellow.push({
+      level: "warn",
+      text: `Tamper protection off: /etc/hosts is not locked (${h.hosts.reason}). Blocking still works, but the file can be edited while a block is active.`,
+    });
+  }
+  if (h.nft.kind === "stale_table") {
+    yellow.push({
+      level: "warn",
+      text: `The DoH block table could not be removed after the last block (${h.nft.reason}) — DNS-over-HTTPS resolvers stay blocked (Mullvad Browser loses DNS). The daemon retries every 30 s; to remove it now: sudo nft delete table inet grepfocus_doh`,
+    });
+  }
+
+  // Browser policies: a fixable failure is YELLOW with its remedy, one the
+  // daemon cannot fix on this layout is INFO, and a fresh write earns the
+  // one-time restart hint.
+  const recentlyWritten: string[] = [];
+  let lastWriteUnix = 0;
+  for (const bp of h.browser_policies) {
+    const name = browserName(bp.browser);
+    const st = bp.state;
+    if (st.kind === "failed") {
+      switch (st.fail_kind) {
+        case "not_json":
+        case "symlink":
+        case "io": {
+          const remedy =
+            st.fail_kind === "not_json"
+              ? `Fix or remove ${bp.path}; GrepFocus retries every minute.`
+              : st.fail_kind === "symlink"
+                ? `Replace ${bp.path} with a real file or add DNSOverHTTPS there yourself.`
+                : "GrepFocus retries every minute.";
+          yellow.push({
+            level: "warn",
+            text: `${name}: DoH policy not installed (${st.reason}). ${name} may bypass blocks via DNS-over-HTTPS. ${remedy}`,
+          });
+          break;
+        }
+        case "unsupported":
+          info.push({
+            level: "info",
+            text: `${name} is present but not covered (${st.reason}). DoH may bypass blocks in it — see README → Known limits.`,
+          });
+          break;
+        case "read_only_fs":
+          info.push({
+            level: "info",
+            text: `Cannot write ${bp.path}: read-only filesystem. DoH may bypass blocks in ${name}; not fixable on this system layout.`,
+          });
+          break;
+        default:
+          // `unknown`: a newer daemon's kind this build cannot judge.
+          break;
+      }
+    } else if (
+      (st.kind === "written" || st.kind === "merged") &&
+      s.now_unix - bp.since_unix < RESTART_HINT_SECS
+    ) {
+      recentlyWritten.push(name);
+      // The latest write is the conservative cut-off for "open before".
+      lastWriteUnix = Math.max(lastWriteUnix, bp.since_unix);
+    }
+  }
+
+  if (h.startup_notes.length > 0) {
+    yellow.push({
+      level: "warn",
+      text: `${h.startup_notes.length} stored block entries were changed or dropped when the daemon started (invalid domains or app matchers from an older version). Details: journalctl -u grepfocusd | grep sanitized`,
+    });
+  }
+  if (recentlyWritten.length > 0) {
+    info.push({
+      level: "info",
+      text: `GrepFocus switched DNS-over-HTTPS off in ${joinNames(recentlyWritten)} through a system policy so blocks apply there (they will say 'managed by your organization'). Restart Firefox-based browsers once if they were open before ${fmtClock(lastWriteUnix)}.`,
+    });
+  }
+  // The Settings tab carries the same note off the legacy bool; this one is
+  // on the Status tab because that is where a lagging break is noticed.
+  if (h.proxy === "degraded" && s.settings.instant_breaks) {
+    info.push({
+      level: "info",
+      text: "Instant breaks unavailable — port 80 or 443 is in use, so breaks may take up to a minute to show in an already-open tab. Blocking is unaffected.",
+    });
+  }
+  return [...red, ...yellow, ...info];
+}
+
+/// The Settings diagnostics line: every enforcement state on one row, for a
+/// bug report or a journal cross-check. The drift counters are diagnostics
+/// only — they never raise a notice. "off (premium feature)" is this side's
+/// reading of a hosts lock that was never attempted; the daemon stays the only
+/// source of "NOT locked" (attempted and failed).
+function healthSummary(s: Status): string {
+  const h = s.health;
+  const domainBlockActive = s.active.some((a) => a.block.domains.length > 0);
+  const tamperLicensed = s.license_valid && s.licensed_features.includes("tamper_protection");
+  let nft: string;
+  switch (h.nft.kind) {
+    case "ok":
+      nft = "ok";
+      break;
+    case "failed":
+      nft = "FAILED";
+      break;
+    case "stale_table":
+      nft = `stale table (${h.nft.reason})`;
+      break;
+    case "not_applicable":
+      nft = "not applicable";
+      break;
+    default:
+      nft = "unknown";
+  }
+  let hosts: string;
+  switch (h.hosts.kind) {
+    case "locked":
+      hosts = "locked";
+      break;
+    case "unlocked":
+      hosts = "NOT locked";
+      break;
+    case "not_applicable":
+      hosts = domainBlockActive && !tamperLicensed ? "off (premium feature)" : "not applicable";
+      break;
+    default:
+      hosts = "unknown";
+  }
+  return `Enforcement — DoH block (nft): ${nft} · /etc/hosts lock: ${hosts} · instant-break proxy: ${h.proxy} · re-applies since daemon start: hosts ${h.hosts_reapplies}, nft ${h.nft_reinstalls}`;
+}
+
+/// The Settings about line: our version beside the daemon's. `h` null means
+/// the daemon could not be reached; an empty `daemon_version` means it
+/// answered but predates health reporting. `gui` null means `app_env` itself
+/// failed, which leaves the version out rather than guessing one.
+function aboutLine(gui: string | null, h: Health | null): string {
+  const app = gui ? `GrepFocus ${gui}` : "GrepFocus";
+  if (h === null) return `${app} · daemon unreachable`;
+  if (h.daemon_version === "") return `${app} · daemon: older version (no health reporting)`;
+  return `${app} · daemon ${h.daemon_version} (${h.daemon_exe || h.install_kind})`;
+}
+
+/// What the banner currently shows, so a poll that changes nothing leaves the
+/// DOM alone (a rewrite every 5 s flickers and re-announces to screen readers
+/// through the aria-live region).
+let healthBannerKey = "";
+
+function renderHealthBanner(notices: HealthNotice[]) {
+  const key = notices.map((n) => `${n.level}\u0000${n.text}`).join("\u0001");
+  if (key === healthBannerKey) return;
+  healthBannerKey = key;
+  healthBannerEl.innerHTML = "";
+  for (const n of notices) {
+    const p = document.createElement("p");
+    p.className = `health-notice ${n.level}`;
+    p.textContent = n.text;
+    healthBannerEl.appendChild(p);
+  }
+  healthBannerEl.hidden = notices.length === 0;
+}
+
+/// `null` from the status poll's catch branch: the daemon is unreachable.
+function renderAboutLine(s: Status | null) {
+  aboutLineEl.textContent = aboutLine(appEnv?.gui_version ?? null, s?.health ?? null);
+}
+
 async function refreshStatus() {
   try {
     const s = await invoke<Status>("get_status");
+    // Reaching the daemon means any first-run installer prompt is now moot,
+    // and so is "the service was removed": something is answering again.
+    hideFirstRun();
+    serviceRemoved = false;
+    // Before the no-active-block early return below: a failed teardown must
+    // show above "No active block", not vanish with it.
+    renderAboutLine(s);
+    renderHealthBanner(healthNotices(s));
+    renderUpdateBanner(s.update, s.health.install_kind);
+    // Only a successful poll moves these: a daemon stop or restart must not
+    // flash the release notice over a block or a version skew it was hiding.
+    blockActive = s.active.length > 0;
+    skewActive = s.update.kind !== "up_to_date";
     activeServerSkew = s.now_unix - Math.floor(Date.now() / 1000);
     // Premium is all-or-nothing: a valid license reveals the Stats tab, an
     // invalid/absent one hides it. This poll is the single place license
@@ -660,12 +1090,34 @@ async function refreshStatus() {
       countdownTimer = window.setInterval(tickCountdowns, 1000);
     }
   } catch (e) {
+    // Notices describe a daemon we can talk to; with none, the error below
+    // is the whole story.
+    renderAboutLine(null);
+    renderHealthBanner([]);
     statusEl.innerHTML = "";
     const p = document.createElement("p");
-    p.className = "msg error";
-    p.textContent = String(e);
+    if (installBusy) {
+      // The installer is restarting the service (or the removal is stopping
+      // it): this connect failure is expected, not a fault to paint red. The
+      // skew banner keeps its progress line.
+      p.className = "msg";
+      p.textContent = removingService ? "Removing service…" : "Restarting service…";
+    } else {
+      p.className = "msg error";
+      p.textContent = String(e);
+      // A skew read off the last answer is stale once there is no answer;
+      // the hold keeps a just-finished update's outcome readable.
+      if (Date.now() >= updateHoldUntil) hideUpdateBanner();
+    }
     statusEl.appendChild(p);
     stopCountdownTimer();
+    // A daemon-unreachable error is the first-run / service-down signal.
+    handleDaemonUnreachable(e);
+  } finally {
+    // The release check is the GUI's own and needs no daemon, so it rides
+    // this poll whether the daemon answered or not — after the skew banner
+    // and `blockActive` above, which decide whether the notice may show.
+    void refreshUpdateInfo();
   }
 }
 
@@ -1120,7 +1572,7 @@ function renderScheduleRow(s: Schedule): HTMLLIElement {
   // Row actions report into the block list's message line, not the dialog's:
   // the dialog is closed while a row is being toggled or deleted.
   toggle.addEventListener("click", async () => {
-    listMsg.classList.remove("error");
+    listMsg.classList.remove("error", "warn");
     if (!(await ensureUnlocked())) return;
     try {
       await invoke("update_schedule", { schedule: { ...s, enabled: !s.enabled } });
@@ -1134,7 +1586,7 @@ function renderScheduleRow(s: Schedule): HTMLLIElement {
     openScheduleDialog({ mode: "edit", sched: s });
   });
   li.querySelector<HTMLButtonElement>(".delete-btn")!.addEventListener("click", async () => {
-    listMsg.classList.remove("error");
+    listMsg.classList.remove("error", "warn");
     if (!(await ensureUnlocked())) return;
     try {
       await invoke("delete_schedule", { id: s.id });
@@ -1186,9 +1638,14 @@ function openScheduleDialog(intent: SchedIntent, blockName?: string) {
     // reset() already restored the markup defaults; `id` has no wire meaning
     // on an add, and the daemon assigns the real one.
     idInput.value = "";
+    // Default the name to the block this schedule is under — the common case is
+    // one schedule per block, so prefill it (selected below, so it's trivial to
+    // type over when you do want a distinct name).
+    if (blockName) nameInput.value = blockName;
   }
   schedDialog.showModal();
   nameInput.focus();
+  nameInput.select();
 }
 
 function closeScheduleDialog() {
@@ -1296,28 +1753,32 @@ function fmtMinute(m: number): string {
   return `${String(h).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 }
 
-/// Rebuild the Week grid from scratch: one 7-day × 24-hour column set showing
-/// every schedule's windows, colour-coded per block. Read-only apart from
-/// click-to-edit. Mirrors `refreshList`'s fetch (degrade to empty on failure).
-async function refreshWeek() {
-  weekEl.innerHTML = "";
-  const [blocks, schedules] = await Promise.all([
-    invoke<Block[]>("list_blocks").catch(() => []),
-    invoke<Schedule[]>("list_schedules").catch(() => []),
-  ]);
-
-  if (schedules.length === 0) {
-    weekEl.appendChild(emptyDiv("No schedules yet — add one from a block's card."));
-    return;
-  }
-
-  const blockName = new Map<number, string>();
-  for (const b of blocks) blockName.set(b.id, b.name);
+/// Build the read-only week grid DOM shared by the Week tab and each block
+/// card's mini grid: a `.week-scroll` box wrapping a `.week-grid` with a time
+/// axis and 7 day columns (Mon→Sun), every schedule window colour-coded per
+/// block and click-to-edit. Returns the `.week-scroll` node; the caller owns
+/// any legend. `opts.blockName` maps a block id to its display name;
+/// `opts.windowLabel` overrides the default `${name} ${range}` window text (the
+/// title tooltip is unchanged); `opts.hourPx` (default 22) sets the per-hour
+/// column height via the `--week-hour` CSS var; `opts.showNow` (default true)
+/// toggles the local-clock "now" line.
+function buildWeekGrid(
+  schedules: Schedule[],
+  opts: {
+    blockName: (id: number) => string;
+    windowLabel?: (s: Schedule, name: string, range: string) => string;
+    hourPx?: number;
+    showNow?: boolean;
+  },
+): HTMLElement {
+  const hourPx = opts.hourPx ?? 22;
+  const showNow = opts.showNow ?? true;
 
   // Scroll the grid inside its own box: on a narrow window the grid scrolls
   // sideways here, the page body never does.
   const scroller = document.createElement("div");
   scroller.className = "week-scroll";
+  scroller.style.setProperty("--week-hour", hourPx + "px");
   const grid = document.createElement("div");
   grid.className = "week-grid";
 
@@ -1346,7 +1807,6 @@ async function refreshWeek() {
   const now = new Date();
   const todayBit = now.getDay(); // 0 = Sun … 6 = Sat — matches the wire bitmask.
   const nowMinutes = now.getHours() * 60 + now.getMinutes();
-  const usedBlockIds = new Set<number>();
 
   for (const bit of DISPLAY_DAYS) {
     const col = document.createElement("div");
@@ -1379,7 +1839,6 @@ async function refreshWeek() {
     const laneCount = Math.max(1, laneEnds.length);
 
     for (const s of todays) {
-      usedBlockIds.add(s.block_id);
       const lane = laneOf.get(s) ?? 0;
       const win = document.createElement("div");
       win.className = `week-window${s.enabled ? "" : " disabled"}`;
@@ -1391,9 +1850,10 @@ async function refreshWeek() {
       const pal = WEEK_PALETTE[s.block_id % WEEK_PALETTE.length];
       win.style.background = pal.fill;
       win.style.color = pal.text;
-      const name = blockName.get(s.block_id) ?? `#${s.block_id}`;
+      const name = opts.blockName(s.block_id);
       const range = `${fmtMinute(s.start_minute)}–${fmtMinute(s.start_minute + s.duration_minutes)}`;
-      win.textContent = `${name} ${range}${s.enabled ? "" : " (off)"}`;
+      const label = opts.windowLabel ? opts.windowLabel(s, name, range) : `${name} ${range}`;
+      win.textContent = `${label}${s.enabled ? "" : " (off)"}`;
       win.title = `${name} · ${DAY_LABEL[bit]} · ${range}${s.enabled ? "" : " (disabled)"}`;
       // Reuse the exact edit entry point the block-card rows use — no new dialog.
       win.addEventListener("click", () => {
@@ -1404,7 +1864,7 @@ async function refreshWeek() {
 
     // "Now" marker across today's column at the current local minute. A
     // wall-clock week view wants the local clock — no `activeServerSkew`.
-    if (bit === todayBit) {
+    if (showNow && bit === todayBit) {
       const line = document.createElement("div");
       line.className = "week-now";
       line.style.top = `${(nowMinutes / 1440) * 100}%`;
@@ -1416,7 +1876,47 @@ async function refreshWeek() {
   }
 
   scroller.appendChild(grid);
-  weekEl.appendChild(scroller);
+  return scroller;
+}
+
+/// Rebuild the Week grid from scratch: one 7-day × 24-hour column set showing
+/// every schedule's windows, colour-coded per block. Read-only apart from
+/// click-to-edit. A failed fetch renders as the error it is — a dead daemon
+/// must never read as "No schedules yet".
+async function refreshWeek() {
+  weekEl.innerHTML = "";
+  let blocks: Block[];
+  let schedules: Schedule[];
+  try {
+    [blocks, schedules] = await Promise.all([
+      invoke<Block[]>("list_blocks"),
+      invoke<Schedule[]>("list_schedules"),
+    ]);
+  } catch (e) {
+    const p = document.createElement("p");
+    p.className = "msg error";
+    p.textContent = String(e);
+    weekEl.appendChild(p);
+    return;
+  }
+
+  if (schedules.length === 0) {
+    weekEl.appendChild(emptyDiv("No schedules yet — add one from a block's card."));
+    return;
+  }
+
+  const blockName = new Map<number, string>();
+  for (const b of blocks) blockName.set(b.id, b.name);
+
+  weekEl.appendChild(
+    buildWeekGrid(schedules, { blockName: (id) => blockName.get(id) ?? `#${id}` }),
+  );
+
+  // Which blocks have a window rendered somewhere in the grid — a schedule
+  // shows iff it fires on at least one of the 7 display days (bits 0–6). Mirrors
+  // the `usedBlockIds` the inlined grid used to accumulate, for the legend.
+  const usedBlockIds = new Set<number>();
+  for (const s of schedules) if ((s.days & 0b1111111) !== 0) usedBlockIds.add(s.block_id);
 
   // Legend: one chip per block that has at least one schedule, in config order.
   const legend = document.createElement("div");
@@ -1519,6 +2019,12 @@ async function refreshSettings() {
   pwForm.reset();
   prefsMsg.classList.remove("error");
   prefsMsg.textContent = "";
+  // Before the daemon round trip: the update-check row is GUI-local and must
+  // be current even when the daemon is down.
+  void refreshUpdateInfo();
+  renderServiceSection();
+  serviceMsgEl.classList.remove("error");
+  serviceMsgEl.textContent = "";
   try {
     const s = await invoke<Status>("get_status");
     // Reflect current preferences. Setting `.checked` in code does not fire a
@@ -1535,6 +2041,8 @@ async function refreshSettings() {
       instantBreaksNote.hidden = true;
       instantBreaksNote.textContent = "";
     }
+    // The about line beside it is kept by the status poll.
+    healthDiagEl.textContent = s.health.daemon_version === "" ? "" : healthSummary(s);
     if (!s.password_set) {
       lockStateEl.textContent = "No settings password is set. Configuration can be changed freely.";
       lockStateEl.className = "lock-state";
@@ -1553,6 +2061,7 @@ async function refreshSettings() {
   } catch (e) {
     lockStateEl.textContent = String(e);
     lockStateEl.className = "lock-state locked";
+    healthDiagEl.textContent = "";
   }
 }
 
@@ -2275,7 +2784,758 @@ function emptyLi(text: string): HTMLLIElement {
   return li;
 }
 
+// ─── System-service installer: first run, service down, update, removal ──────
+//
+// The daemon-unreachable dialog and the Status-tab skew banner share one
+// installer path (`installServiceAndWait`, the only `install_service` caller)
+// and one busy flag, which Settings' "Remove system service" takes too. The
+// dialog is shown when the daemon is unreachable: "not installed yet" offers
+// the pkexec installer (AppImage only — a package GUI has no payload),
+// "installed but this login predates the group" asks for a relogin, and an
+// installed daemon that is not running asks for a systemctl start, with
+// "Reinstall service" as the fallback when the install is the AppImage's own.
+// After a removal from Settings the same dialog says so ("removed") instead
+// of offering the first-run install as if nothing had happened. A
+// non-AppImage run with no daemon binary anywhere keeps the per-tab error,
+// which already names install.sh.
+
+interface AppEnv {
+  appimage: boolean;
+  /// The app's own version, for the Settings about line (`aboutLine`).
+  gui_version: string;
+  /// `/usr/bin/grepfocusd` exists — a package install owns the daemon.
+  packaged_daemon: boolean;
+  /// `/usr/local/bin/grepfocusd` exists — the AppImage installer's or the
+  /// dev scripts' daemon.
+  local_daemon: boolean;
+}
+
+let appEnv: AppEnv | null = null;
+
+const firstRunDialog = document.querySelector<HTMLDialogElement>("#firstrun-dialog")!;
+const firstRunTitle = document.querySelector<HTMLElement>("#firstrun-title")!;
+const firstRunBody = document.querySelector<HTMLElement>("#firstrun-body")!;
+const firstRunMsg = document.querySelector<HTMLElement>("#firstrun-msg")!;
+const firstRunAction = document.querySelector<HTMLButtonElement>("#firstrun-action")!;
+const firstRunSecondary = document.querySelector<HTMLButtonElement>("#firstrun-secondary")!;
+
+type FirstRunMode = "install" | "relogin" | "packaged" | "stopped" | "removed";
+let firstRunMode: FirstRunMode | null = null;
+// True while an install click owns the UI (pkexec in flight or waiting for
+// the fresh daemon to answer), from either the dialog or the skew banner, and
+// while a removal from Settings is in flight. Blocks the background status
+// poll's error handler from resetting the dialog mid-flow — a poll landing
+// between "install finished" and "daemon accepting connections" would
+// otherwise flip the dialog back to the install screen, and one landing
+// mid-removal would pop "service not running" — and keeps the poll from
+// repainting the skew banner under a click.
+let installBusy = false;
+// The busy flag is held by a removal, not an install: picks the Status tab's
+// progress word.
+let removingService = false;
+// "Remove system service" succeeded in this session. While it stands, an
+// unreachable daemon with no binary left is the expected end state, not a
+// first run. Cleared by the first poll that gets an answer.
+let serviceRemoved = false;
+
+// Esc must not dismiss this into an unusable app.
+firstRunDialog.addEventListener("cancel", (ev) => ev.preventDefault());
+
+function showFirstRun(mode: FirstRunMode) {
+  firstRunMode = mode;
+  firstRunMsg.classList.remove("error");
+  firstRunMsg.textContent = "";
+  firstRunAction.disabled = false;
+  firstRunSecondary.hidden = true;
+  firstRunSecondary.disabled = false;
+  switch (mode) {
+    case "install":
+      firstRunTitle.textContent = "Set up GrepFocus";
+      firstRunBody.textContent =
+        "GrepFocus needs a small background service to enforce blocks. Install it now? You'll be asked to authorize with your password. It also switches DNS-over-HTTPS off in Firefox, Chromium and similar browsers through a system policy so blocks apply there — those browsers will say they are \"managed by your organization\"; restart them once after installing.";
+      firstRunAction.textContent = "Install system service";
+      break;
+    case "relogin":
+      firstRunTitle.textContent = "Almost there";
+      firstRunBody.textContent =
+        "The GrepFocus service is installed. Log out and back in to finish — your new group membership needs a fresh login — then reopen GrepFocus.";
+      firstRunAction.textContent = "Retry";
+      break;
+    case "packaged":
+      firstRunTitle.textContent = "Service not running";
+      firstRunBody.textContent =
+        "GrepFocus is installed by your package manager (/usr/bin/grepfocusd), but its service is not running. Start it with: sudo systemctl start grepfocusd — then press Retry.";
+      firstRunAction.textContent = "Retry";
+      break;
+    case "stopped": {
+      // The reinstall re-runs the bundled installer, which only an AppImage
+      // carries.
+      const reinstall = appEnv?.appimage === true;
+      firstRunTitle.textContent = "Service not running";
+      firstRunBody.textContent =
+        "The GrepFocus service is installed (/usr/local/bin/grepfocusd) but not running. Start it with: sudo systemctl start grepfocusd — then press Retry." +
+        (reinstall
+          ? " If it will not start, Reinstall service re-runs the installer (you'll be asked to authorize)."
+          : "");
+      firstRunAction.textContent = "Retry";
+      firstRunSecondary.hidden = !reinstall;
+      break;
+    }
+    case "removed":
+      firstRunTitle.textContent = "Service removed";
+      firstRunBody.textContent =
+        "The GrepFocus system service has been removed and blocking is off. Your saved blocks, schedules, stats and license are still in /var/lib/grepfocus and /etc/grepfocus. To finish, quit GrepFocus (Quit in its tray icon's menu; with no tray icon, closing the window quits) and delete the AppImage file. To keep using GrepFocus, reinstall the service: you'll be asked to authorize with your password, and DNS-over-HTTPS is switched off in your browsers again.";
+      firstRunAction.textContent = "Reinstall system service";
+      break;
+  }
+  if (!firstRunDialog.open) firstRunDialog.showModal();
+}
+
+function hideFirstRun() {
+  firstRunMode = null;
+  if (firstRunDialog.open) firstRunDialog.close();
+}
+
+/// Which dialog mode a failed daemon call asks for; null leaves the dialog
+/// alone. The error strings come from crates/gui/src/client.rs; only the two
+/// connect-class failures pick a mode — a deserialize or protocol error is a
+/// daemon we DID reach, and never opens the dialog. `removed` is
+/// `serviceRemoved`: with no binary left it turns "not installed yet" into
+/// "you just removed it"; once a reinstall has put a binary back the ordinary
+/// modes apply again.
+function unreachableMode(msg: string, env: AppEnv | null, removed: boolean): FirstRunMode | null {
+  // Socket exists but we lack group membership — installed, needs relogin.
+  if (msg.includes("not allowed to talk")) return "relogin";
+  if (!msg.includes("daemon is not running")) return null;
+  // Nothing listening on the socket: which binary exists says whether that
+  // is "not installed" or "installed but stopped".
+  if (env?.packaged_daemon) return "packaged";
+  if (env?.local_daemon) return "stopped";
+  if (env?.appimage) return removed ? "removed" : "install";
+  // Non-AppImage, no daemon binary: leave the per-tab error.
+  return null;
+}
+
+function handleDaemonUnreachable(err: unknown) {
+  if (installBusy) return; // the install or removal flow owns the UI right now
+  // A removal that failed after stopping the service leaves its error in the
+  // confirmation dialog; opening "service not running" over it would hide
+  // the one line that says why. The next poll after it closes gets here.
+  if (serviceRemoveDialog.open) return;
+  const mode = unreachableMode(String(err), appEnv, serviceRemoved);
+  // The dialog already says this: showing it again would wipe its message
+  // line, and an installer error must outlive the next 5 s poll.
+  if (mode === null || (firstRunDialog.open && firstRunMode === mode)) return;
+  showFirstRun(mode);
+}
+
+/// Poll the daemon until it answers, the socket denies us (needs relogin), or
+/// the timeout runs out. The freshly-installed unit is Type=simple, so
+/// systemctl returns before the socket exists — a fixed post-install sleep
+/// would be a guess; polling reacts the moment it is actually up.
+async function waitForDaemon(timeoutMs: number): Promise<"ok" | "denied" | "timeout"> {
+  const start = Date.now();
+  for (;;) {
+    try {
+      await invoke("get_status");
+      return "ok";
+    } catch (e) {
+      if (String(e).includes("not allowed to talk")) return "denied";
+      if (Date.now() - start >= timeoutMs) return "timeout";
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+}
+
+/// The one `install_service` caller: run the pkexec installer, then wait for
+/// the (re)started daemon to answer. `report` gets every progress line and,
+/// on "error", the installer's message with `error` set; the caller decides
+/// what each outcome means for its own surface. The caller owns `installBusy`.
+async function installServiceAndWait(
+  report: (text: string, error?: boolean) => void,
+  waitMs: number,
+): Promise<"ok" | "denied" | "timeout" | "error"> {
+  report("Installing… authorize when prompted.");
+  try {
+    await invoke("install_service");
+  } catch (e) {
+    report(String(e), true);
+    return "error";
+  }
+  // The binaries on disk just changed; the dialog's mode picker, the skew
+  // advice and Settings' "System service" section read them from here.
+  try {
+    appEnv = await invoke<AppEnv>("app_env");
+  } catch {
+    // Keep the boot-time answer.
+  }
+  renderServiceSection();
+  report("Service installed — waiting for it to start…");
+  return waitForDaemon(waitMs);
+}
+
+/// The dialog's install (or reinstall) flow.
+async function runFirstRunInstall() {
+  installBusy = true;
+  firstRunAction.disabled = true;
+  firstRunSecondary.disabled = true;
+  try {
+    const outcome = await installServiceAndWait((text, error) => {
+      firstRunMsg.classList.toggle("error", error === true);
+      firstRunMsg.textContent = text;
+    }, 15000);
+    switch (outcome) {
+      case "ok":
+        // Already in the grepfocus group (e.g. reinstall) — done, no relogin.
+        hideFirstRun();
+        refreshStatus();
+        // A reinstall after "Remove system service" ends on the Settings tab,
+        // whose lock line was read from the daemon that is gone.
+        if (settingsTabVisible()) void refreshSettings();
+        break;
+      case "denied":
+        // Fresh install: usermod ran but this login predates it.
+        showFirstRun("relogin");
+        break;
+      case "timeout":
+        firstRunMsg.classList.add("error");
+        firstRunMsg.textContent =
+          "The service was installed but isn't answering yet. It may still be starting — this screen will close by itself once it's reachable.";
+        firstRunAction.disabled = false;
+        firstRunSecondary.disabled = false;
+        break;
+      case "error":
+        // The message is already on the dialog.
+        firstRunAction.disabled = false;
+        firstRunSecondary.disabled = false;
+        break;
+    }
+  } finally {
+    installBusy = false;
+  }
+}
+
+firstRunAction.addEventListener("click", async () => {
+  if (firstRunMode === "install" || firstRunMode === "removed") {
+    void runFirstRunInstall();
+    return;
+  }
+  // relogin / packaged / stopped: the user says the service should answer
+  // now — re-poll; success hides the dialog.
+  firstRunMsg.classList.remove("error");
+  firstRunMsg.textContent = "Checking…";
+  await refreshStatus();
+  // Still open in the same mode: nothing re-showed the dialog, so the
+  // progress word is ours to take down.
+  if (firstRunDialog.open && firstRunMsg.textContent === "Checking…") {
+    firstRunMsg.textContent = "";
+  }
+});
+
+firstRunSecondary.addEventListener("click", () => {
+  void runFirstRunInstall();
+});
+
+// ─── Settings: remove the system service (AppImage installs) ─────────────────
+//
+// The daemon an AppImage installs is a root service that outlives the
+// AppImage file; this is its one in-app way out. The pkexec'd script is the
+// installer's `uninstall` (stop and disable the unit, `grepfocusd cleanup`,
+// delete binary and unit; saved data stays). Removing the service ends every
+// block, so it is refused while one runs — by `serviceRemovalRefusal` before
+// the confirmation and again by the Rust command right before the script.
+
+const settingsSection = document.querySelector<HTMLElement>("#settings")!;
+const serviceSectionEl = document.querySelector<HTMLDivElement>("#service-section")!;
+const serviceRemoveEl = document.querySelector<HTMLButtonElement>("#service-remove")!;
+const serviceMsgEl = document.querySelector<HTMLParagraphElement>("#service-msg")!;
+const serviceRemoveDialog = document.querySelector<HTMLDialogElement>("#service-remove-dialog")!;
+const serviceRemoveConfirmEl = document.querySelector<HTMLButtonElement>("#service-remove-confirm")!;
+const serviceRemoveCancelEl = document.querySelector<HTMLButtonElement>("#service-remove-cancel")!;
+const serviceRemoveMsgEl = document.querySelector<HTMLParagraphElement>("#service-remove-msg")!;
+
+/// The section is for the service this AppImage installed: running as an
+/// AppImage, a daemon at /usr/local/bin, and none at /usr/bin — a package's
+/// daemon is the package manager's to remove (the script refuses it, exit 98).
+function serviceRemovalOffered(env: AppEnv | null): boolean {
+  return env !== null && env.appimage && env.local_daemon && !env.packaged_daemon;
+}
+
+/// Why the service may not be removed right now, null when it may. Mirrors
+/// the two running-block sentences of `removal_refusal` in src/main.rs, which
+/// has the last word — change together.
+function serviceRemovalRefusal(s: Status): string | null {
+  if (s.pomodoro != null) {
+    return "A pomodoro session is running — the service cannot be removed until it ends.";
+  }
+  if (s.active.length > 0) {
+    return "A block is running — the service cannot be removed until it ends.";
+  }
+  return null;
+}
+
+function renderServiceSection() {
+  serviceSectionEl.hidden = !serviceRemovalOffered(appEnv);
+}
+
+function settingsTabVisible(): boolean {
+  return settingsSection.classList.contains("active");
+}
+
+function serviceError(text: string) {
+  serviceMsgEl.classList.add("error");
+  serviceMsgEl.textContent = text;
+}
+
+serviceRemoveEl.addEventListener("click", async () => {
+  serviceMsgEl.classList.remove("error");
+  serviceMsgEl.textContent = "";
+  if (installBusy) return;
+  if (!(await ensureUnlocked())) return;
+  let s: Status;
+  try {
+    s = await invoke<Status>("get_status");
+  } catch (e) {
+    // Without an answer there is no telling whether a block is running.
+    serviceError(String(e));
+    return;
+  }
+  const refusal = serviceRemovalRefusal(s);
+  if (refusal !== null) {
+    serviceError(refusal);
+    return;
+  }
+  serviceRemoveMsgEl.classList.remove("error");
+  serviceRemoveMsgEl.textContent = "";
+  serviceRemoveConfirmEl.disabled = false;
+  serviceRemoveCancelEl.disabled = false;
+  if (!serviceRemoveDialog.open) serviceRemoveDialog.showModal();
+  // showModal() focuses the first button, which is the destructive one: a
+  // stray Enter must land on Cancel.
+  serviceRemoveCancelEl.focus();
+});
+
+serviceRemoveCancelEl.addEventListener("click", () => serviceRemoveDialog.close());
+// Esc closes it like Cancel, but not from under a running removal.
+serviceRemoveDialog.addEventListener("cancel", (ev) => {
+  if (removingService) ev.preventDefault();
+});
+
+serviceRemoveConfirmEl.addEventListener("click", async () => {
+  if (installBusy) return;
+  installBusy = true;
+  removingService = true;
+  serviceRemoveConfirmEl.disabled = true;
+  serviceRemoveCancelEl.disabled = true;
+  serviceRemoveMsgEl.classList.remove("error");
+  serviceRemoveMsgEl.textContent = "Removing… authorize when prompted.";
+  try {
+    try {
+      await invoke("uninstall_service");
+    } catch (e) {
+      // A running block, a dismissed prompt or the script's own error: the
+      // text is `removal_refusal`'s or `installer_error`'s.
+      serviceRemoveMsgEl.classList.add("error");
+      serviceRemoveMsgEl.textContent = String(e);
+      serviceRemoveCancelEl.disabled = false;
+      // A removal whose cleanup failed has already stopped the service, and
+      // `uninstall_service` refuses when the daemon cannot be asked: a second
+      // click could only replace the script's recovery steps with that
+      // refusal. The button comes back when the dialog is opened again.
+      let answering = true;
+      try {
+        await invoke<Status>("get_status");
+      } catch {
+        answering = false;
+      }
+      serviceRemoveConfirmEl.disabled = !answering;
+      return;
+    }
+    serviceRemoved = true;
+    // Still under the busy flag: a poll landing before the binary probe is
+    // refreshed would read the stale "installed" answer and say "stopped".
+    try {
+      appEnv = await invoke<AppEnv>("app_env");
+    } catch {
+      if (appEnv) appEnv = { ...appEnv, local_daemon: false };
+    }
+    serviceRemoveDialog.close();
+    renderServiceSection();
+    showFirstRun("removed");
+  } finally {
+    installBusy = false;
+    removingService = false;
+  }
+  // Repaint the tabs behind the dialog for a daemon that is gone.
+  refreshStatus();
+});
+
+// ─── Status tab: GUI/daemon version skew banner ──────────────────────────────
+//
+// `get_status` computes the advice (Rust `version::advise`, one decision
+// table); this side turns it into copy and, for `update_service` only, a
+// button that re-runs the AppImage's pkexec installer. `updateAdviceText` is
+// pure; `renderUpdateBanner` is the only DOM writer and, like the health
+// banner, rewrites only when the advice changes.
+
+const updateBannerEl = document.querySelector<HTMLDivElement>("#update-banner")!;
+const updateTextEl = document.querySelector<HTMLParagraphElement>("#update-text")!;
+const updateActionEl = document.querySelector<HTMLButtonElement>("#update-action")!;
+const updateMsgEl = document.querySelector<HTMLParagraphElement>("#update-msg")!;
+const updateDownloadEl = document.querySelector<HTMLButtonElement>("#update-download")!;
+
+/// Where an outdated AppImage is sent: selectable text in the advice, and
+/// the "Download" button beside it opens the same page (`open_url`). The
+/// website keeps this route stable for exactly that.
+const DOWNLOAD_URL = "https://grepfocus.com/download";
+
+/// How long a finished update's outcome stays readable before the poll's
+/// `up_to_date` (or a renewed unreachable error) takes the card away.
+const UPDATE_HOLD_MS = 10_000;
+
+/// The opening sentence: which service, how it compares. A pre-reporting
+/// daemon (`from` null) is older than any app that asks.
+function serviceOlder(from: string | null, to: string): string {
+  return from === null
+    ? `The installed GrepFocus service predates version reporting and is older than this app (${to})`
+    : `The GrepFocus service (${from}) is older than this app (${to})`;
+}
+
+/// The one advice answered with `DOWNLOAD_URL`: an AppImage older than a
+/// service no package owns. Decides both the copy and the "Download" button.
+function adviceOffersDownload(a: UpdateAdvice, appimage: boolean, kind: InstallKind): boolean {
+  return a.kind === "gui_outdated" && appimage && kind !== "package";
+}
+
+/// The skew card's copy. `gui_outdated` branches on how this app and the
+/// daemon were installed: a packaged app should be launched instead, an
+/// AppImage replaced, a checkout rebuilt. A pre-reporting daemon's
+/// `install_kind` is necessarily `unknown`, so `manual` with `from` null
+/// names every install path rather than a location.
+function updateAdviceText(a: UpdateAdvice, appimage: boolean, kind: InstallKind): string {
+  const restartNote =
+    "Active blocks stay enforced across the restart; settings relock, and a pending break challenge is lost.";
+  switch (a.kind) {
+    case "up_to_date":
+      return "";
+    case "update_service":
+      return `${serviceOlder(a.from, a.to)}. Update the service so both match — you'll be asked to authorize with your password. ${restartNote}`;
+    case "package_manager":
+      return `${serviceOlder(a.from, a.to)}. It was installed by your package manager — update the grepfocus package (rpm/deb/AUR) to ${a.to}; this app cannot replace a packaged service.`;
+    case "both_installs":
+      return `${serviceOlder(a.from, a.to)}. grepfocusd is installed twice — by a package (/usr/bin/grepfocusd) and locally (/usr/local/bin/grepfocusd) — and the installer will not run over a package install: remove one of the two (the package with your package manager), then update the other.`;
+    case "manual":
+      if (a.from === null || kind === "local") {
+        return `${serviceOlder(a.from, a.to)}. Update it the way it was installed: ./packaging/upgrade.sh from a source checkout, your package manager, or the newer AppImage, which offers the update on this tab.`;
+      }
+      return `${serviceOlder(a.from, a.to)} and is not at a location this app can update. Update it the way it was installed.`;
+    case "gui_outdated": {
+      const lead = `The GrepFocus service (${a.daemon}) is newer than this app (${a.gui})`;
+      if (kind === "package") {
+        return `${lead}. Launch the GrepFocus that came with the package instead of this ${appimage ? "AppImage" : "build"}.`;
+      }
+      if (adviceOffersDownload(a, appimage, kind)) {
+        return `${lead}. Download the latest AppImage from ${DOWNLOAD_URL}.`;
+      }
+      if (kind === "local") {
+        return `${lead} — quit and relaunch GrepFocus; if this notice stays, ./packaging/upgrade.sh from the checkout rebuilds both.`;
+      }
+      return `${lead} — quit and relaunch GrepFocus; if this notice stays, update the app the way it was installed.`;
+    }
+  }
+}
+
+/// What the card currently shows, so an unchanged advice leaves the DOM (and
+/// a message from the last click) alone.
+let updateBannerKey = "";
+/// Until when `renderUpdateBanner` must not repaint — a finished update's
+/// outcome line is being read.
+let updateHoldUntil = 0;
+/// The version the visible button installs, for the outcome line.
+let updateTarget = "";
+
+function renderUpdateBanner(a: UpdateAdvice, kind: InstallKind) {
+  if (installBusy || Date.now() < updateHoldUntil) return;
+  if (a.kind === "up_to_date") {
+    hideUpdateBanner();
+    return;
+  }
+  const appimage = appEnv?.appimage === true;
+  const text = updateAdviceText(a, appimage, kind);
+  const key = `${a.kind}\u0000${text}`;
+  if (key === updateBannerKey) return;
+  updateBannerKey = key;
+  const offer = a.kind === "update_service";
+  updateTextEl.textContent = text;
+  updateBannerEl.className = `lock-state update-banner${a.kind === "gui_outdated" ? " locked" : ""}`;
+  updateActionEl.hidden = !offer;
+  updateActionEl.disabled = false;
+  updateActionEl.textContent = offer ? `Update system service to ${a.to}` : "Update system service";
+  updateDownloadEl.hidden = !adviceOffersDownload(a, appimage, kind);
+  updateTarget = offer ? a.to : "";
+  updateMsgEl.classList.remove("error");
+  updateMsgEl.textContent = "";
+  updateBannerEl.hidden = false;
+}
+
+function hideUpdateBanner() {
+  if (updateBannerEl.hidden && updateBannerKey === "") return;
+  updateBannerKey = "";
+  updateTarget = "";
+  updateBannerEl.hidden = true;
+  updateActionEl.hidden = true;
+  updateDownloadEl.hidden = true;
+  updateMsgEl.classList.remove("error");
+  updateMsgEl.textContent = "";
+}
+
+updateDownloadEl.addEventListener("click", async () => {
+  updateMsgEl.classList.remove("error");
+  updateMsgEl.textContent = "";
+  try {
+    await invoke("open_url", { url: DOWNLOAD_URL });
+  } catch (e) {
+    updateMsgEl.classList.add("error");
+    updateMsgEl.textContent = String(e);
+  }
+});
+
+updateActionEl.addEventListener("click", async () => {
+  if (installBusy) return;
+  installBusy = true;
+  updateActionEl.disabled = true;
+  const to = updateTarget;
+  try {
+    const outcome = await installServiceAndWait((text, error) => {
+      updateMsgEl.classList.toggle("error", error === true);
+      updateMsgEl.textContent = text;
+    }, 20000);
+    switch (outcome) {
+      case "ok":
+        updateMsgEl.textContent = `Service updated to ${to}.`;
+        updateActionEl.hidden = true;
+        // Hold the outcome; the next poll would otherwise take the card away
+        // (up_to_date) before it could be read. The key reset makes the
+        // first repaint after the hold unconditional.
+        updateHoldUntil = Date.now() + UPDATE_HOLD_MS;
+        updateBannerKey = "";
+        break;
+      case "denied":
+        updateMsgEl.classList.add("error");
+        updateMsgEl.textContent =
+          "The service restarted, but this login is not allowed to talk to it — log out and back in.";
+        break;
+      case "timeout":
+        updateMsgEl.classList.add("error");
+        updateMsgEl.textContent =
+          "The service was updated but isn't answering yet. It may still be starting — this notice clears by itself once it is reachable.";
+        updateActionEl.disabled = false;
+        // Keep this readable through the next unreachable polls; after the
+        // hold the service-down dialog takes over.
+        updateHoldUntil = Date.now() + UPDATE_HOLD_MS;
+        break;
+      case "error":
+        // The installer's message is already on the card.
+        updateActionEl.disabled = false;
+        break;
+    }
+  } finally {
+    installBusy = false;
+  }
+});
+
+// ─── Release check: disclosure, notice strip, Settings row ───────────────────
+//
+// The Rust side (src/update.rs) owns the fetch, the cadence, the preference
+// file and every sentence; this side polls `get_update_info` alongside the
+// status poll and decides where the answer shows. Two rules live only here:
+// the disclosure strip is on screen before `acknowledge_update_check` lets
+// the checker contact the site, and the notice yields to an active block and
+// to the skew banner (fix what is installed first — the Settings row still
+// reports the release).
+
+const updateDisclosureEl = document.querySelector<HTMLDivElement>("#update-disclosure")!;
+const updateDisclosureOkEl = document.querySelector<HTMLButtonElement>("#update-disclosure-ok")!;
+const updateDisclosureOffEl = document.querySelector<HTMLButtonElement>("#update-disclosure-off")!;
+const updateNoticeEl = document.querySelector<HTMLDivElement>("#update-notice")!;
+const updateNoticeTextEl = document.querySelector<HTMLParagraphElement>("#update-notice-text")!;
+const updateNotesEl = document.querySelector<HTMLButtonElement>("#update-notes")!;
+const updateDismissEl = document.querySelector<HTMLButtonElement>("#update-dismiss")!;
+const updateNoticeMsgEl = document.querySelector<HTMLParagraphElement>("#update-notice-msg")!;
+const updateCheckToggle = document.querySelector<HTMLInputElement>("#update-check-toggle")!;
+const updateCheckRowEl = document.querySelector<HTMLDivElement>("#update-check-row")!;
+const updateCheckNowEl = document.querySelector<HTMLButtonElement>("#update-check-now")!;
+const updateCheckStatusEl = document.querySelector<HTMLSpanElement>("#update-check-status")!;
+const updateCheckPersistEl = document.querySelector<HTMLParagraphElement>("#update-check-persist")!;
+
+/// A block is running, as of the last status poll that got an answer.
+let blockActive = false;
+/// GUI and daemon versions differ, as of the last status poll that got an
+/// answer. The skew card itself is taken down while the daemon is
+/// unreachable, so its visibility alone would let the notice through then.
+let skewActive = false;
+/// The strip has been put up this launch. It goes up once: a poll that has
+/// to repeat the acknowledgement (the call failed) must not reopen a strip
+/// the user already closed.
+let disclosureShown = false;
+/// The last answer, for the handlers that re-render without a round trip.
+let lastUpdateInfo: UpdateInfo | null = null;
+/// What the notice currently shows, so a poll that changes nothing leaves the
+/// strip (and an `open_url` failure line under it) alone.
+let updateNoticeKey = "";
+/// A toggle write is in flight: a poll answered before it landed must not
+/// flip the checkbox back under the user's click.
+let updateToggleBusy = false;
+
+function renderUpdateNotice(info: UpdateInfo) {
+  // `!updateBannerEl.hidden` on top of `skewActive`: a finished service
+  // update holds the card for its outcome line after the skew is gone.
+  if (blockActive || skewActive || !updateBannerEl.hidden || info.notice === null) {
+    updateNoticeEl.hidden = true;
+    return;
+  }
+  const notesUrl = info.latest?.notes_url ?? null;
+  const key = `${info.notice}\u0000${notesUrl ?? ""}`;
+  if (key !== updateNoticeKey) {
+    updateNoticeKey = key;
+    updateNoticeTextEl.textContent = info.notice;
+    updateNotesEl.hidden = notesUrl === null;
+    updateNoticeMsgEl.hidden = true;
+    updateNoticeMsgEl.textContent = "";
+  }
+  updateNoticeEl.hidden = false;
+}
+
+function renderUpdateSettings(info: UpdateInfo) {
+  if (!updateToggleBusy) updateCheckToggle.checked = info.enabled;
+  updateCheckRowEl.hidden = !info.enabled;
+  updateCheckNowEl.disabled = info.checking;
+  updateCheckStatusEl.textContent = info.status;
+  updateCheckPersistEl.textContent = info.persist_error ?? "";
+  updateCheckPersistEl.hidden = info.persist_error === null;
+}
+
+function renderUpdate(info: UpdateInfo) {
+  lastUpdateInfo = info;
+  renderUpdateNotice(info);
+  renderUpdateSettings(info);
+}
+
+/// Polled from `refreshStatus` (every 5 s, daemon up or down) and on opening
+/// Settings.
+async function refreshUpdateInfo() {
+  try {
+    let info = await invoke<UpdateInfo>("get_update_info");
+    // Checks that are off need no disclosure — and acknowledging would
+    // rewrite a preference file that failed to load, taking its "could not
+    // be read" line away before anyone saw it.
+    if (info.enabled && !info.disclosed) {
+      if (!disclosureShown) {
+        disclosureShown = true;
+        updateDisclosureEl.hidden = false;
+      }
+      // Only after the strip is up: this is what permits the first request,
+      // which the Rust side still holds back for a few seconds ("Turn off"
+      // inside them means it is never made).
+      info = await invoke<UpdateInfo>("acknowledge_update_check");
+    }
+    renderUpdate(info);
+  } catch {
+    // The last render stands; the next poll asks again.
+  }
+}
+
+function closeDisclosure() {
+  updateDisclosureEl.hidden = true;
+}
+
+/// The one writer of the preference (Settings toggle and the disclosure's
+/// "Turn off"). No settings-password gate: it is a per-user privacy choice
+/// the daemon never sees. False when the write could not be sent; the reason
+/// goes to the Settings message line and the checkbox returns to what is in
+/// effect.
+async function setUpdateCheckEnabled(enabled: boolean): Promise<boolean> {
+  prefsMsg.classList.remove("error");
+  prefsMsg.textContent = "";
+  updateToggleBusy = true;
+  let info: UpdateInfo;
+  try {
+    info = await invoke<UpdateInfo>("set_update_check_enabled", { enabled });
+  } catch (e) {
+    updateToggleBusy = false;
+    updateCheckToggle.checked = lastUpdateInfo?.enabled ?? !enabled;
+    prefsMsg.classList.add("error");
+    prefsMsg.textContent = String(e);
+    return false;
+  }
+  updateToggleBusy = false;
+  renderUpdate(info);
+  return true;
+}
+
+/// A check now, whatever the cadence says ("Check now", and the toggle going
+/// on). The poll keeps the row on "Checking…" while it runs.
+async function runUpdateCheck() {
+  updateCheckNowEl.disabled = true;
+  updateCheckStatusEl.textContent = "Checking…";
+  try {
+    renderUpdate(await invoke<UpdateInfo>("check_for_update"));
+  } catch (e) {
+    updateCheckNowEl.disabled = false;
+    updateCheckStatusEl.textContent = String(e);
+  }
+}
+
+updateDisclosureOkEl.addEventListener("click", closeDisclosure);
+
+updateDisclosureOffEl.addEventListener("click", async () => {
+  // A write that could not be sent leaves the strip up: the click did not
+  // take.
+  if (await setUpdateCheckEnabled(false)) closeDisclosure();
+});
+
+updateCheckToggle.addEventListener("change", async () => {
+  const enabled = updateCheckToggle.checked;
+  // The answer, not the click, decides: without a config directory the
+  // switch stays off.
+  if ((await setUpdateCheckEnabled(enabled)) && lastUpdateInfo?.enabled) void runUpdateCheck();
+});
+
+updateCheckNowEl.addEventListener("click", () => void runUpdateCheck());
+
+updateDismissEl.addEventListener("click", async () => {
+  try {
+    renderUpdate(await invoke<UpdateInfo>("dismiss_update"));
+  } catch (e) {
+    updateNoticeMsgEl.textContent = String(e);
+    updateNoticeMsgEl.hidden = false;
+  }
+});
+
+updateNotesEl.addEventListener("click", async () => {
+  const url = lastUpdateInfo?.latest?.notes_url;
+  if (!url) return;
+  updateNoticeMsgEl.hidden = true;
+  updateNoticeMsgEl.textContent = "";
+  try {
+    await invoke("open_url", { url });
+  } catch (e) {
+    // Typically xdg-open missing; the message names the link to open by hand.
+    updateNoticeMsgEl.textContent = String(e);
+    updateNoticeMsgEl.hidden = false;
+  }
+});
+
 // ─── Boot ──────────────────────────────────────────────────────────────────
 
-refreshStatus();
-window.setInterval(refreshStatus, 5000);
+void (async () => {
+  // Learn whether we're an AppImage before the first poll so a daemon-down
+  // first tick can show the installer immediately instead of after 5s.
+  try {
+    appEnv = await invoke<AppEnv>("app_env");
+  } catch {
+    appEnv = null;
+  }
+  refreshStatus();
+  window.setInterval(refreshStatus, 5000);
+})();
