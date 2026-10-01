@@ -58,8 +58,9 @@ review findings — so they don't have to be re-derived later.
   tooltip kept reporting the last-known "N active". On poll failure it now sets
   "GrepFocus — daemon unreachable" (without touching the notification
   baseline `prev`).
-- **[MITIGATION — 2026-09-30; root cause not identified, owner's live check
-  pending] Tray icon reported lost after the tray host restarts** —
+- **[VERIFIED — 2026-09-30; the owner's live check passed: AppIndicator
+  extension off, then on → icon and a working menu back within ~10 s]
+  Tray icon reported lost after the tray host restarts** —
   `crates/gui/src/tray.rs` (`probe_host`, `TrayWatch`),
   `crates/gui/src/main.rs` (`reregister_tray`). Reported: after the
   StatusNotifier host went away and came back (GNOME: the AppIndicator

@@ -17,6 +17,10 @@ url="https://grepfocus.com"
 # Source-available, not OSI open source: PolyForm Shield permits any use except
 # building something that competes with GrepFocus. See the bundled LICENSE.
 license=('custom:PolyForm-Shield-1.0.0')
+# makepkg's default LTO compiles the C parts of Rust dependencies (ring) to
+# GCC bytecode that the Rust linker cannot consume: undefined ring_core_* at
+# link time. Disable it for this package.
+options=('!lto')
 depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3' 'nftables' 'libayatana-appindicator')
 makedepends=('rust' 'nodejs' 'pnpm')
 # The app opens its grepfocus.com links ("What's new", "Download") by spawning

@@ -1,7 +1,12 @@
 # Hardening, health signals, browser DoH policies and update paths — implementation plan
 
-Status: **implemented — live verification pending** (2026-09-30) — see the
-checklist below. Designed 2026-09-28 and written against commit
+Status: **implemented and live-verified** (2026-09-30/10-01, shipped in 0.6.0) —
+the owner ran the checklist below on the dev box (browser policies in Firefox,
+Mullvad Browser and Chromium; injection refused; root processes survive app
+blocks; nft drift, failure and recovery with the health banner; tray
+re-registration after an extension off/on; the in-app AppImage service update).
+Still unconfirmed by eye: the lock-screen rescue and the RED desktop
+notification (both pass in the unit/headless harnesses). Designed 2026-09-28 and written against commit
 `3dff97e` on branch `hardening-health` (same HEAD as `release-0.5.1`, clean tree).
 Line references are as of that commit — treat symbols as authoritative, lines as
 hints. Five item designs (browser DoH policies, input hardening, health signals,

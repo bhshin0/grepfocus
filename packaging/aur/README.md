@@ -45,13 +45,26 @@ container mounts this checkout, and `release.sh` refuses to start while
 such a container is running.
 
 ```sh
-podman run --rm -it -v "$PWD":/pkg:Z archlinux:latest bash -c '
-  pacman -Syu --noconfirm base-devel git &&
-  useradd -m build && chown -R build /pkg &&
+podman run --rm -v "$PWD":/pkg:Z,ro archlinux:latest bash -c '
+  pacman -Syu --noconfirm --needed base-devel git sudo &&
+  useradd -m build && echo "build ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/build &&
   cp -r /pkg /home/build/aur && chown -R build /home/build/aur &&
-  su build -c "cd /home/build/aur && makepkg -s --noconfirm"
+  su build -c "cd /home/build/aur && makepkg -s --noconfirm" &&
+  pacman -U --noconfirm /home/build/aur/grepfocus-*-x86_64.pkg.tar.zst &&
+  /usr/bin/grepfocusd --version && /usr/bin/grepfocus-gui --version
 '
 ```
+
+`makepkg -s` installs the build dependencies with `sudo`, so the throwaway
+`build` user needs a passwordless sudoers entry; the mount is read-only and the
+checkout is copied, because a `chown` on the bind mount under rootless podman
+re-owns the host files (undo with `podman unshare rm -rf` / `chown`). Arch's
+`makepkg.conf` enables LTO by default, which turns the C parts of `ring` into
+GCC bytecode the Rust linker cannot use — hence `options=('!lto')` in the
+PKGBUILD. The `pacman -U` line installs the built package in the container
+and proves both binaries report the version. Arch ships pnpm 11, which reads
+the esbuild allow-list from `crates/gui/ui/pnpm-workspace.yaml` only; the
+PKGBUILD's `prepare()` writes that file for tags that predate it.
 
 (`makepkg` refuses to run as root, hence the throwaway `build` user.)
 
