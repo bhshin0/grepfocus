@@ -10,6 +10,13 @@
 //!
 //! After mutating, persist the new state and (if anything changed)
 //! recompute the hosts file outside the lock.
+//!
+//! Before those three, the tick folds in what the other tasks counted since
+//! the last one — app kills from procwatch, refused connections from the
+//! proxy (`apply_attempts`) — and persists those credits on a one-a-minute
+//! throttle (`attempt_save_due`): a crash or SIGKILL loses at most a minute
+//! of counts, while a quiet block does not fsync every second. The final
+//! save on graceful stop (`run_daemon`) catches whatever is left.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -17,15 +24,22 @@ use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
 use grepfocus_core::license::features;
+use grepfocus_core::validate::normalize_domain;
 use grepfocus_core::{
-    day_set, now_unix, prune_breaks, ActiveBlock, FocusSession, Origin, Originator, PomodoroPhase,
-    PomodoroSession, Schedule, State, UsageStats, BREAKS_CAP, MAX_ALLOWANCE_WINDOW_SECS,
+    day_set, now_unix, prune_breaks, ActiveBlock, EventKind, FocusSession, Origin, Originator,
+    PomodoroPhase, PomodoroSession, Schedule, State, UsageStats, BREAKS_CAP,
+    MAX_ALLOWANCE_WINDOW_SECS,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::{enforce, has_feature, state, Daemon};
+use crate::{enforce, events, has_feature, state, Daemon};
 
 const TICK: Duration = Duration::from_secs(1);
+
+/// At most one state save a minute for credits alone — attempts and app
+/// kills folded in by the tick. This is the bound on what a crash or SIGKILL
+/// can lose, and on the fsync rate of a block that is being hammered.
+const ATTEMPT_SAVE_SECS: u64 = 60;
 
 /// License-derived permissions for one reconcile pass. Computed by `tick`
 /// from the daemon's cached license claims (via `crate::has_feature`) and
@@ -50,13 +64,23 @@ pub async fn run(daemon: Arc<Daemon>) {
     // each *occurrence* of a weekly window logs exactly once, not once per 1s
     // tick; reconcile prunes entries once their window has passed.
     let mut skipped_fires: HashSet<(u64, u64)> = HashSet::new();
+    // Unix time of the last save this loop made BECAUSE a credit landed — an
+    // attempt or an app kill folded in by the tick — as opposed to one for a
+    // reconcile or a pomodoro transition. `attempt_save_due` throttles the
+    // credit-driven saves to one a minute against it. `0` is "none yet", so
+    // the first credit after start persists on its own tick.
+    let mut last_attempt_save_unix: u64 = 0;
     loop {
         ticker.tick().await;
-        tick(&daemon, &mut skipped_fires).await;
+        tick(&daemon, &mut skipped_fires, &mut last_attempt_save_unix).await;
     }
 }
 
-async fn tick(daemon: &Arc<Daemon>, skipped_fires: &mut HashSet<(u64, u64)>) {
+async fn tick(
+    daemon: &Arc<Daemon>,
+    skipped_fires: &mut HashSet<(u64, u64)>,
+    last_attempt_save_unix: &mut u64,
+) {
     let now_unix = now_unix();
     let now_local = Local::now();
     let today = now_local.date_naive().num_days_from_ce() as i64;
@@ -74,15 +98,35 @@ async fn tick(daemon: &Arc<Daemon>, skipped_fires: &mut HashSet<(u64, u64)>) {
             st.high_water_unix = now_unix;
         }
         // Fold any app kills procwatch counted since the last tick into today's
-        // rollup. Like the high-water mark above, this is an in-memory bump
-        // that persists opportunistically on the next save from any cause — no
-        // fsync of its own. Drained to zero here whether or not we save this
-        // tick; if we don't, the credit still lives in `st.stats` and rides the
-        // next save (a crash loses at most this unflushed count).
-        let drained = daemon
+        // rollup. An in-memory bump like the high-water mark above, drained to
+        // zero here whether or not we save this tick — but unlike the mark it
+        // does not merely ride the next save from any cause: a credit is what
+        // the status card shows, so `attempt_save_due` below persists it
+        // within a minute (at most one credit-driven fsync a minute).
+        let kills = daemon
             .app_kills_pending
             .swap(0, std::sync::atomic::Ordering::Relaxed);
-        st.stats.credit_app_kills(today, drained);
+        st.stats.credit_app_kills(today, kills);
+        // Same again for the refused connections the proxy observed since the
+        // last tick: this is the buffer's single consumer. Two leaf locks,
+        // each taken and released in a statement with `state` already held —
+        // the `health`/`forwardable` exception to the lock order. The overflow
+        // line is a count, never a host: hostnames stay at `debug!` in the
+        // proxy.
+        let drained = daemon.attempts().drain(now_unix);
+        let credited_attempts = !drained.attempts.is_empty()
+            && apply_attempts(&mut st, &drained.attempts, today, &mut daemon.events());
+        if drained.dropped > 0 {
+            debug!(
+                dropped = drained.dropped,
+                "attempt buffer overflowed between ticks"
+            );
+        }
+        let attempt_save = attempt_save_due(
+            kills > 0 || credited_attempts,
+            now_unix,
+            *last_attempt_save_unix,
+        );
         let gates = {
             let lic = daemon.license.lock().await;
             Gates {
@@ -109,9 +153,14 @@ async fn tick(daemon: &Arc<Daemon>, skipped_fires: &mut HashSet<(u64, u64)>) {
             advance_pomodoro(pomodoro, active, now_unix)
         };
         let reconciled = reconcile(&mut st, now_unix, &now_local, today, &gates, skipped_fires);
-        if pomo_changed || reconciled {
-            if let Err(e) = state::save(&st, &daemon.key) {
-                error!(?e, "scheduler save failed");
+        if pomo_changed || reconciled || attempt_save {
+            match state::save(&st, &daemon.key) {
+                // The marker moves only on a save that was due for a credit
+                // and succeeded: a failed one is retried by the next credit,
+                // and a reconcile-only save leaves the minute's clock alone.
+                Ok(()) if attempt_save => *last_attempt_save_unix = now_unix,
+                Ok(()) => {}
+                Err(e) => error!(?e, "scheduler save failed"),
             }
         }
 
@@ -441,6 +490,92 @@ fn record_ended_session(stats: &mut UsageStats, a: &ActiveBlock, now_unix: u64, 
         duration_secs: now_unix.saturating_sub(a.started_at_unix),
     };
     stats.credit_session(session, today);
+}
+
+/// Credit the attempts the proxy observed since the last tick. For each
+/// `(host, unix)`: bump `attempts` on every ACTIVE, NOT-on-break block whose
+/// hosts lines covered `host` — its canonical domains contain `host` itself,
+/// or the bare `x` of a `www.x` (`hosts::render_block` writes the `www.`
+/// alias for every bare entry, so that block's line matched too). If any
+/// did, credit the day's stats and push one `Attempt` event, both keyed on
+/// the entry text: `host` when a matching block holds it exactly, else the
+/// bare name — the fold `enforce::canonical_attempt` makes itself when only
+/// the bare entry is enforced — and attributed to the lowest matching block
+/// id. Returns whether anything was credited; the caller decides whether
+/// that is worth a save (`attempt_save_due`). Pure — no clock, no IO.
+///
+/// A host no active block claims credits nothing at all. The hook already
+/// filtered against the enforced set, so this is defence in depth — and it is
+/// what keeps `credit_attempt`'s contract: the key is always a canonical
+/// entry of a live block. Each block's domains are normalized once per call,
+/// not once per attempt. `today` is the tick's local day, which is the
+/// attempt's day too: the buffer is at most a tick old.
+fn apply_attempts(
+    st: &mut State,
+    attempts: &[(String, u64)],
+    today: i64,
+    log: &mut events::Log,
+) -> bool {
+    let canonical: Vec<HashSet<String>> = st
+        .active
+        .iter()
+        .map(|a| {
+            a.block
+                .domains
+                .iter()
+                .filter_map(|d| normalize_domain(d).ok())
+                .collect()
+        })
+        .collect();
+    let mut credited = false;
+    for (host, unix) in attempts {
+        let bare = www_alias_of(host);
+        let mut lowest: Option<u64> = None;
+        let mut exact = false;
+        for (a, domains) in st.active.iter_mut().zip(&canonical) {
+            if a.break_until_unix.is_some_and(|t| t > *unix) {
+                continue; // on a break: its domains were not being refused
+            }
+            let holds_host = domains.contains(host.as_str());
+            if !holds_host && !bare.is_some_and(|b| domains.contains(b)) {
+                continue;
+            }
+            exact |= holds_host;
+            a.attempts = a.attempts.saturating_add(1);
+            lowest = Some(lowest.map_or(a.block.id, |l| l.min(a.block.id)));
+        }
+        if let Some(block_id) = lowest {
+            // `bare` is `Some` whenever `exact` is false: the alias was the
+            // only other way in.
+            let entry = if exact {
+                host.as_str()
+            } else {
+                bare.unwrap_or(host)
+            };
+            st.stats.credit_attempt(today, entry);
+            log.push(EventKind::Attempt, block_id, entry, *unix);
+            credited = true;
+        }
+    }
+    credited
+}
+
+/// The bare entry whose `www.` alias `host` is — `x` for `www.x` — or `None`
+/// when `host` is not one. Mirrors `hosts::render_block`, which writes
+/// `www.x` for an entry `x` unless `x` is itself a `www.` name: `www.www.x`
+/// is nobody's alias.
+fn www_alias_of(host: &str) -> Option<&str> {
+    host.strip_prefix("www.")
+        .filter(|bare| !bare.is_empty() && !bare.starts_with("www."))
+}
+
+/// Whether the tick should save for the credits it just folded in — see
+/// `tick`. Due when something was credited (`credited`) and the last such
+/// save (`last_save`, unix seconds; `0` for none yet) lies at least
+/// [`ATTEMPT_SAVE_SECS`] from `now` in either direction, so a clock that
+/// jumped back cannot stall the saves. Pure, so the boundary is unit-tested.
+fn attempt_save_due(credited: bool, now: u64, last_save: u64) -> bool {
+    credited && now.abs_diff(last_save) >= ATTEMPT_SAVE_SECS
 }
 
 /// Days since the Common-Era epoch in local time. The absolute value is
@@ -1291,5 +1426,216 @@ mod tests {
             &mut skipped,
         );
         assert!(skipped.is_empty());
+    }
+
+    // ── apply_attempts() ────────────────────────────────────────────────────
+
+    /// An active block `id` over `domains`, on a break until `break_until`
+    /// if set.
+    fn active_over(id: u64, domains: &[&str], break_until: Option<u64>) -> ActiveBlock {
+        let mut a = manual_active(id, u64::MAX);
+        a.block.domains = domains.iter().map(|d| d.to_string()).collect();
+        a.break_until_unix = break_until;
+        a
+    }
+
+    fn attempt(host: &str, unix: u64) -> (String, u64) {
+        (host.to_string(), unix)
+    }
+
+    #[test]
+    fn attempt_credits_day_totals_active_counter_and_event() {
+        let mut st = State::default();
+        st.active.push(active_over(5, &["reddit.com"], None));
+        let mut log = events::Log::default();
+        assert!(apply_attempts(
+            &mut st,
+            &[attempt("reddit.com", 1_000), attempt("reddit.com", 1_010)],
+            42,
+            &mut log,
+        ));
+        // The live per-run counter on the block.
+        assert_eq!(st.active[0].attempts, 2);
+        // The day row, its total and the lifetime total.
+        assert_eq!(st.stats.days.len(), 1);
+        assert_eq!(st.stats.days[0].day, 42);
+        assert_eq!(st.stats.days[0].attempts["reddit.com"], 2);
+        assert_eq!(st.stats.days[0].attempts_total, 2);
+        assert_eq!(st.stats.totals.attempts, 2);
+        // One event per attempt, stamped with the attempt's own time.
+        let events = log.snapshot();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, EventKind::Attempt);
+        assert_eq!(events[0].block_id, 5);
+        assert_eq!(events[0].detail, "reddit.com");
+        assert_eq!(events[0].unix, 1_000);
+        assert_eq!(events[1].unix, 1_010);
+    }
+
+    #[test]
+    fn on_break_block_is_not_credited() {
+        let mut st = State::default();
+        // On a break at the attempt's time: the domain was resolving again,
+        // so nothing refused belongs to this block.
+        st.active.push(active_over(5, &["reddit.com"], Some(2_000)));
+        let mut log = events::Log::default();
+        assert!(!apply_attempts(
+            &mut st,
+            &[attempt("reddit.com", 1_000)],
+            42,
+            &mut log
+        ));
+        assert_eq!(st.active[0].attempts, 0);
+        assert!(st.stats.days.is_empty());
+        assert_eq!(st.stats.totals.attempts, 0);
+        assert!(log.snapshot().is_empty());
+
+        // The break has elapsed by the attempt's time: credited again.
+        assert!(apply_attempts(
+            &mut st,
+            &[attempt("reddit.com", 2_000)],
+            42,
+            &mut log
+        ));
+        assert_eq!(st.active[0].attempts, 1);
+        assert_eq!(log.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn host_in_two_blocks_bumps_both_but_emits_one_event() {
+        let mut st = State::default();
+        // A stored copy need not be canonical: the match is on the
+        // normalized domain, as the hosts file was written.
+        st.active.push(active_over(9, &["Reddit.com."], None));
+        st.active
+            .push(active_over(3, &["reddit.com", "x.com"], None));
+        st.active.push(active_over(4, &["x.com"], None));
+        let mut log = events::Log::default();
+        apply_attempts(&mut st, &[attempt("reddit.com", 1_000)], 42, &mut log);
+        assert_eq!(st.active[0].attempts, 1);
+        assert_eq!(st.active[1].attempts, 1);
+        assert_eq!(st.active[2].attempts, 0, "x.com was not attempted");
+        // One attempt is one attempt: the stats count it once, and the one
+        // event goes to the lowest matching block id, whatever the order.
+        assert_eq!(st.stats.days[0].attempts["reddit.com"], 1);
+        assert_eq!(st.stats.totals.attempts, 1);
+        let events = log.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].block_id, 3);
+    }
+
+    #[test]
+    fn unknown_host_is_ignored() {
+        let mut st = State::default();
+        st.active.push(active_over(5, &["reddit.com"], None));
+        let mut log = events::Log::default();
+        // Not an entry of any active block — a subdomain, a stranger —
+        // credits nothing: no counter, no stats row, no event, and the call
+        // reports it. Nothing active at all, same. (The `www.` alias of an
+        // entry is not a stranger: see the test below.)
+        for host in ["old.reddit.com", "myapp.test"] {
+            assert!(!apply_attempts(
+                &mut st,
+                &[attempt(host, 1_000)],
+                42,
+                &mut log
+            ));
+        }
+        assert_eq!(st.active[0].attempts, 0);
+        assert!(st.stats.days.is_empty());
+        assert_eq!(st.stats.totals.attempts, 0);
+        assert!(log.snapshot().is_empty());
+        st.active.clear();
+        assert!(!apply_attempts(
+            &mut st,
+            &[attempt("reddit.com", 1_000)],
+            42,
+            &mut log
+        ));
+        assert!(st.stats.days.is_empty());
+        assert!(log.snapshot().is_empty());
+    }
+
+    #[test]
+    fn www_alias_credits_every_block_whose_hosts_line_matched() {
+        // Two blocks cover `www.reddit.com`: one holds that entry, the other
+        // holds `reddit.com`, for which the hosts file writes the `www.` line
+        // too. The hook reports the exact enforced entry; both blocks' lines
+        // matched, so both are credited, and the stats row and the one event
+        // use the exact entry.
+        let mut st = State::default();
+        st.active.push(active_over(9, &["reddit.com"], None));
+        st.active.push(active_over(3, &["www.reddit.com"], None));
+        let mut log = events::Log::default();
+        assert!(apply_attempts(
+            &mut st,
+            &[attempt("www.reddit.com", 1_000)],
+            42,
+            &mut log
+        ));
+        assert_eq!(st.active[0].attempts, 1);
+        assert_eq!(st.active[1].attempts, 1);
+        assert_eq!(st.stats.days[0].attempts["www.reddit.com"], 1);
+        assert_eq!(st.stats.days[0].attempts.get("reddit.com"), None);
+        assert_eq!(st.stats.totals.attempts, 1);
+        let events = log.snapshot();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].block_id, 3);
+        assert_eq!(events[0].detail, "www.reddit.com");
+
+        // Only the bare entry is active: the alias folds to it, exactly as
+        // the hook would have folded had `www.reddit.com` not been enforced.
+        st.active.remove(1);
+        assert!(apply_attempts(
+            &mut st,
+            &[attempt("www.reddit.com", 1_010)],
+            42,
+            &mut log
+        ));
+        assert_eq!(st.active[0].attempts, 2);
+        assert_eq!(st.stats.days[0].attempts["reddit.com"], 1);
+        assert_eq!(st.stats.totals.attempts, 2);
+        assert_eq!(log.snapshot()[1].detail, "reddit.com");
+
+        // A `www.` entry gets no `www.www.` line, so it is nobody's alias.
+        st.active.clear();
+        st.active.push(active_over(4, &["www.only.example"], None));
+        assert!(!apply_attempts(
+            &mut st,
+            &[attempt("www.www.only.example", 1_020)],
+            42,
+            &mut log
+        ));
+        assert_eq!(st.active[0].attempts, 0);
+        assert_eq!(log.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn www_alias_of_mirrors_the_hosts_file() {
+        assert_eq!(www_alias_of("www.reddit.com"), Some("reddit.com"));
+        assert_eq!(www_alias_of("reddit.com"), None);
+        assert_eq!(www_alias_of("www.www.x"), None);
+        assert_eq!(www_alias_of("www."), None);
+        assert_eq!(www_alias_of(""), None);
+    }
+
+    // ── attempt_save_due() ──────────────────────────────────────────────────
+
+    #[test]
+    fn attempt_save_is_due_a_minute_after_the_last_one() {
+        let last = 10_000;
+        // Nothing credited: never due, however long it has been.
+        assert!(!attempt_save_due(false, last + 3_600, last));
+        assert!(!attempt_save_due(false, last + 3_600, 0));
+        // Credited: due at exactly a minute, not a second before.
+        assert!(!attempt_save_due(true, last, last));
+        assert!(!attempt_save_due(true, last + ATTEMPT_SAVE_SECS - 1, last));
+        assert!(attempt_save_due(true, last + ATTEMPT_SAVE_SECS, last));
+        assert!(attempt_save_due(true, last + ATTEMPT_SAVE_SECS + 1, last));
+        // No save yet (`0`): the first credit saves at once.
+        assert!(attempt_save_due(true, last, 0));
+        // A clock that jumped back past the window does not stall the saves.
+        assert!(!attempt_save_due(true, last - ATTEMPT_SAVE_SECS + 1, last));
+        assert!(attempt_save_due(true, last - ATTEMPT_SAVE_SECS, last));
     }
 }

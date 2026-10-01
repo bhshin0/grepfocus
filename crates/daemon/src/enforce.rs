@@ -43,7 +43,7 @@ use grepfocus_core::{now_unix, ActiveBlock, HostsLockStatus, NftStatus, ProxySta
 use tracing::{debug, info, warn};
 
 use crate::health;
-use crate::listener::{Decide, ProxyListener};
+use crate::listener::{Decide, Observe, ProxyListener};
 use crate::{dns, has_feature, hosts, nftables, Daemon};
 
 /// How long a live-system verification stays fresh. While a domain block is
@@ -143,6 +143,11 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
         // panicked prior holder from wedging enforcement.
         *daemon.forwardable.lock().unwrap_or_else(|p| p.into_inner()) =
             forwardable_set(&st.active, now, &domains);
+        // And its counterpart for the observe hook: what is enforced right
+        // now, so a refused hostname can be folded to the blocklist entry it
+        // belongs to — or discarded as not ours. Same leaf-lock rules.
+        *daemon.enforced.lock().unwrap_or_else(|p| p.into_inner()) =
+            domains.iter().cloned().collect();
         (
             domains,
             has_feature(lic.as_ref(), &st, features::TAMPER_PROTECTION),
@@ -396,7 +401,24 @@ async fn ensure_detection(daemon: &Daemon, want: bool) -> Detection {
                 .unwrap_or_else(|p| p.into_inner())
                 .contains(host)
         });
-        let started = ProxyListener::start(decide).await;
+        // The observe hook, same shape: fold the refused hostname to the
+        // blocklist entry it belongs to via the live enforced set, and record
+        // it for the scheduler to credit. Two leaf locks, taken one after the
+        // other, never nested and never across an await. Not ours — a
+        // developer's own hosts line pointed at loopback — records nothing.
+        let enforced = daemon.enforced.clone();
+        let attempts = daemon.attempts.clone();
+        let observe: Observe = Arc::new(move |host: &str| {
+            let canonical =
+                canonical_attempt(host, &enforced.lock().unwrap_or_else(|p| p.into_inner()));
+            if let Some(c) = canonical {
+                attempts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .record(c, now_unix());
+            }
+        });
+        let started = ProxyListener::start(decide, observe).await;
         if !started.fully_bound() {
             // Once, at the transition. The instant-refusal is the only
             // casualty: the sink stays 0.0.0.0 and every blocked name still
@@ -486,6 +508,28 @@ fn forwardable_set(active: &[ActiveBlock], now: u64, union: &[String]) -> HashSe
         }
     }
     out
+}
+
+/// The blocklist entry a refused hostname belongs to, or `None` if it is not
+/// ours.
+///
+/// `enforced` is the canonical union `sync` last wrote (`union_domains`), and
+/// the proxy hands over hostnames already lowercased, so a direct hit needs no
+/// normalizing. `www.x` folds to `x` because `hosts::render_block` writes both
+/// lines for an entry `x` — the browser's `www.` request lands on us exactly
+/// as the bare one does. Nothing else is folded: subdomains are not blocked,
+/// so `old.reddit.com` never reaches the proxy for an entry `reddit.com` and
+/// must not be counted if some other hosts line sends it here.
+///
+/// What comes back is the entry text itself, which is what makes it safe as a
+/// key in the sealed state file and a row in the stats table
+/// (`UsageStats::credit_attempt` insists on exactly that).
+fn canonical_attempt(host: &str, enforced: &HashSet<String>) -> Option<String> {
+    if enforced.contains(host) {
+        return Some(host.to_string());
+    }
+    let bare = host.strip_prefix("www.")?;
+    enforced.contains(bare).then(|| bare.to_string())
 }
 
 /// What one successful `apply` left behind: the nft half and the hosts lock,
@@ -675,6 +719,42 @@ mod tests {
             union,
             vec!["reddit.com".to_string(), "twitter.com".to_string()]
         );
+    }
+
+    /// Only an enforced entry — or its `www.` alias, which the hosts file
+    /// points at us too — is an attempt, and it is reported as the entry.
+    /// Anything else landing on the proxy is not ours to count.
+    #[test]
+    fn canonical_attempt_folds_www_and_rejects_strangers() {
+        let enforced: HashSet<String> = ["reddit.com", "www.only.example"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            canonical_attempt("reddit.com", &enforced).as_deref(),
+            Some("reddit.com")
+        );
+        assert_eq!(
+            canonical_attempt("www.reddit.com", &enforced).as_deref(),
+            Some("reddit.com"),
+            "the www. alias is the same entry"
+        );
+        // An entry that IS a www. name matches itself and nothing shorter:
+        // the hosts file never wrote the bare name for it.
+        assert_eq!(
+            canonical_attempt("www.only.example", &enforced).as_deref(),
+            Some("www.only.example")
+        );
+        assert_eq!(canonical_attempt("only.example", &enforced), None);
+        // Subdomains are not blocked, so they are not attempts either.
+        assert_eq!(canonical_attempt("old.reddit.com", &enforced), None);
+        assert_eq!(canonical_attempt("www.old.reddit.com", &enforced), None);
+        // A developer's own loopback hosts line, a bare `www.`, nothing.
+        assert_eq!(canonical_attempt("myapp.test", &enforced), None);
+        assert_eq!(canonical_attempt("www.", &enforced), None);
+        assert_eq!(canonical_attempt("", &enforced), None);
+        // Nothing enforced: nothing is an attempt.
+        assert_eq!(canonical_attempt("reddit.com", &HashSet::new()), None);
     }
 
     #[test]

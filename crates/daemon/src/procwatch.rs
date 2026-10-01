@@ -17,8 +17,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use grepfocus_core::validate::normalize_matcher;
-use grepfocus_core::{now_unix, ActiveBlock, AppMatcher};
+use grepfocus_core::validate::{matcher_text, normalize_matcher};
+use grepfocus_core::{now_unix, ActiveBlock, AppMatcher, EventKind};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use procfs::process::{all_processes, StatFlags};
@@ -65,13 +65,49 @@ pub async fn run(daemon: Arc<Daemon>) {
         // Count only PIDs not already killed last tick, so a distinct process
         // is counted once per continuous presence. Accumulate in memory; the
         // scheduler tick folds this into today's rollup on its next save.
-        let new_kills = count_new_kills(&killed, &recently_killed);
-        if new_kills > 0 {
+        // Each new kill is also one event for `GetStatus.recent_events`,
+        // pushed under the events leaf lock alone — no other lock is held
+        // here.
+        let new = new_kills(&killed, &recently_killed);
+        if !new.is_empty() {
             daemon
                 .app_kills_pending
-                .fetch_add(new_kills as u64, Ordering::Relaxed);
+                .fetch_add(new.len() as u64, Ordering::Relaxed);
+            let now = now_unix();
+            let mut events = daemon.events();
+            for k in &new {
+                events.push(EventKind::AppKill, k.block_id, &k.label, now);
+            }
         }
-        recently_killed = killed;
+        recently_killed = killed.iter().map(|k| k.pid).collect();
+    }
+}
+
+/// One process the sweep killed: for the per-PID dedup, the stats counter
+/// and the event log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Kill {
+    pub pid: i32,
+    /// The block whose matcher claimed it (first matching group).
+    pub block_id: u64,
+    /// What to call it on the wire — see [`kill_label`].
+    pub label: String,
+}
+
+/// The user-facing name for a kill: the text of the matcher that claimed the
+/// process, which is the user's own blocklist entry — `name` for a basename,
+/// the file name of an exe path (the whole path if it has none), the pattern
+/// for a cmdline match. Deliberately never the process's own `/proc` text:
+/// that is what goes on every status frame and into a notification, and the
+/// user wrote this one.
+fn kill_label(m: &AppMatcher) -> String {
+    match m {
+        AppMatcher::ExePath { path } => Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path)
+            .to_string(),
+        AppMatcher::Basename { .. } | AppMatcher::Cmdline { .. } => matcher_text(m).to_string(),
     }
 }
 
@@ -112,25 +148,25 @@ fn is_protected(pid: i32, uid: u32, kthread: bool, self_pid: i32) -> bool {
     pid <= 1 || pid == self_pid || kthread || uid == 0
 }
 
-/// Number of PIDs in `killed` that were NOT killed on the previous tick.
+/// The kills in `killed` whose PID was NOT killed on the previous tick.
 /// Pure, so the per-PID dedup is unit-testable without a live `/proc`.
-fn count_new_kills(killed: &HashSet<i32>, recently_killed: &HashSet<i32>) -> usize {
+fn new_kills<'a>(killed: &'a [Kill], recently_killed: &HashSet<i32>) -> Vec<&'a Kill> {
     killed
         .iter()
-        .filter(|p| !recently_killed.contains(p))
-        .count()
+        .filter(|k| !recently_killed.contains(&k.pid))
+        .collect()
 }
 
 /// Scan `/proc`, SIGKILL every unprotected process matching any group's
-/// matchers, and return the set of PIDs actually killed this tick (used both
-/// for dedup and the kill count). ESRCH (already gone) is not counted —
-/// nothing was killed.
+/// matchers, and return the processes actually killed this tick (used for
+/// dedup, the kill count and the event log). ESRCH (already gone) is not
+/// counted — nothing was killed.
 ///
 /// The guard runs before the process is identified, so `exe`/`cmdline` are
 /// never read for a protected one. A process that vanished between the
 /// listing and any read here is skipped: it is gone either way.
-fn sweep(groups: &[(u64, Vec<AppMatcher>)], self_pid: i32) -> HashSet<i32> {
-    let mut killed = HashSet::new();
+fn sweep(groups: &[(u64, Vec<AppMatcher>)], self_pid: i32) -> Vec<Kill> {
+    let mut killed = Vec::new();
     let procs = match all_processes() {
         Ok(p) => p,
         Err(e) => {
@@ -158,18 +194,21 @@ fn sweep(groups: &[(u64, Vec<AppMatcher>)], self_pid: i32) -> HashSet<i32> {
         }
         let exe = proc.exe().ok();
         let cmdline = proc.cmdline().ok();
-        // First matching group attributes the kill; one SIGKILL is enough.
-        let Some((block_id, _)) = groups
-            .iter()
-            .find(|(_, m)| proc_matches(exe.as_deref(), cmdline.as_deref(), Some(&stat.comm), m))
-        else {
+        // First matching group attributes the kill, and its first matching
+        // entry names it; one SIGKILL is enough.
+        let Some((block_id, matcher)) = groups.iter().find_map(|(block_id, m)| {
+            matching_entry(exe.as_deref(), cmdline.as_deref(), Some(&stat.comm), m)
+                .map(|matcher| (*block_id, matcher))
+        }) else {
             continue;
         };
         debug!(pid, block_id, "killing process");
         match kill(Pid::from_raw(pid), Signal::SIGKILL) {
-            Ok(()) => {
-                killed.insert(pid);
-            }
+            Ok(()) => killed.push(Kill {
+                pid,
+                block_id,
+                label: kill_label(matcher),
+            }),
             Err(nix::errno::Errno::ESRCH) => {} // already gone; nothing killed
             Err(e) => warn!(?e, pid, "SIGKILL failed"),
         }
@@ -177,49 +216,44 @@ fn sweep(groups: &[(u64, Vec<AppMatcher>)], self_pid: i32) -> HashSet<i32> {
     killed
 }
 
-/// Pure matcher over a process's identity fields, split out so it can be tested
-/// without a live `/proc`. `exe` is the resolved `/proc/<pid>/exe`, `cmdline`
-/// its argv, `comm` the kernel `comm` name.
-fn proc_matches(
+/// Pure matcher over a process's identity fields, split out so it can be
+/// tested without a live `/proc`: the first entry in `matchers` that matches,
+/// so a kill can be named after the entry that claimed it. `exe` is the
+/// resolved `/proc/<pid>/exe`, `cmdline` its argv, `comm` the kernel `comm`
+/// name.
+fn matching_entry<'a>(
     exe: Option<&Path>,
     cmdline: Option<&[String]>,
     comm: Option<&str>,
-    matchers: &[AppMatcher],
-) -> bool {
-    for m in matchers {
-        match m {
-            AppMatcher::ExePath { path } => {
-                if exe == Some(Path::new(path)) {
-                    return true;
-                }
-            }
-            AppMatcher::Basename { name } => {
-                if let Some(p) = exe {
-                    if p.file_name().and_then(|n| n.to_str()) == Some(name.as_str()) {
-                        return true;
-                    }
-                }
+    matchers: &'a [AppMatcher],
+) -> Option<&'a AppMatcher> {
+    matchers.iter().find(|m| match m {
+        AppMatcher::ExePath { path } => exe == Some(Path::new(path)),
+        AppMatcher::Basename { name } => {
+            exe.is_some_and(|p| p.file_name().and_then(|n| n.to_str()) == Some(name.as_str()))
                 // Fallback to the kernel comm name (e.g. for kernel-truncated
                 // or wrapper processes whose exe basename differs).
-                if comm == Some(name.as_str()) {
-                    return true;
-                }
-            }
-            AppMatcher::Cmdline { contains } => {
-                if let Some(parts) = cmdline {
-                    if parts.join(" ").contains(contains.as_str()) {
-                        return true;
-                    }
-                }
-            }
+                || comm == Some(name.as_str())
         }
-    }
-    false
+        AppMatcher::Cmdline { contains } => {
+            cmdline.is_some_and(|parts| parts.join(" ").contains(contains.as_str()))
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether any entry matches — the yes/no the matcher tests below ask.
+    fn proc_matches(
+        exe: Option<&Path>,
+        cmdline: Option<&[String]>,
+        comm: Option<&str>,
+        matchers: &[AppMatcher],
+    ) -> bool {
+        matching_entry(exe, cmdline, comm, matchers).is_some()
+    }
 
     #[test]
     fn exe_path_matches_exactly() {
@@ -446,34 +480,104 @@ mod tests {
         assert!(!is_protected(2, 999, false, SELF));
     }
 
-    // ── count_new_kills(): per-PID dedup across ticks ───────────────────────
+    // ── new_kills(): per-PID dedup across ticks ─────────────────────────────
+
+    /// The loop's own rebuild of `recently_killed` from a tick's kills.
+    fn pids(killed: &[Kill]) -> HashSet<i32> {
+        killed.iter().map(|k| k.pid).collect()
+    }
+
+    fn kills(pids: &[i32]) -> Vec<Kill> {
+        pids.iter()
+            .map(|&pid| Kill {
+                pid,
+                block_id: 1,
+                label: "steam".into(),
+            })
+            .collect()
+    }
 
     #[test]
     fn same_pid_counts_once_new_pid_counts_again() {
-        let set = |pids: &[i32]| pids.iter().copied().collect::<HashSet<i32>>();
+        let new_pids = |killed: &[Kill], recently: &HashSet<i32>| {
+            new_kills(killed, recently)
+                .iter()
+                .map(|k| k.pid)
+                .collect::<Vec<i32>>()
+        };
 
         // Tick 1: two fresh kills, nothing seen before → both count.
         let mut recently = HashSet::new();
-        let killed = set(&[10, 20]);
-        assert_eq!(count_new_kills(&killed, &recently), 2);
-        recently = killed;
+        let killed = kills(&[10, 20]);
+        assert_eq!(new_pids(&killed, &recently), vec![10, 20]);
+        recently = pids(&killed);
 
         // Tick 2: the same PIDs still lingering → none count again.
-        let killed = set(&[10, 20]);
-        assert_eq!(count_new_kills(&killed, &recently), 0);
-        recently = killed;
+        let killed = kills(&[10, 20]);
+        assert!(new_pids(&killed, &recently).is_empty());
+        recently = pids(&killed);
 
-        // Tick 3: one lingering, one brand-new PID → only the new one counts.
-        let killed = set(&[10, 30]);
-        assert_eq!(count_new_kills(&killed, &recently), 1);
-        recently = killed;
+        // Tick 3: one lingering, one brand-new PID → only the new one counts,
+        // and it comes back whole (block and label) for the event log.
+        let killed = kills(&[10, 30]);
+        assert_eq!(new_kills(&killed, &recently), vec![&killed[1]]);
+        recently = pids(&killed);
 
         // The PID disappears (empty tick clears it), then a reused PID with
         // the same number reappears → it counts again.
-        let killed = HashSet::new();
-        assert_eq!(count_new_kills(&killed, &recently), 0);
-        recently = killed;
-        let killed = set(&[10]);
-        assert_eq!(count_new_kills(&killed, &recently), 1);
+        let killed = kills(&[]);
+        assert!(new_pids(&killed, &recently).is_empty());
+        recently = pids(&killed);
+        let killed = kills(&[10]);
+        assert_eq!(new_pids(&killed, &recently), vec![10]);
+    }
+
+    // ── kill_label(): what a kill is called on the wire ─────────────────────
+
+    #[test]
+    fn kill_label_per_matcher_kind() {
+        assert_eq!(
+            kill_label(&AppMatcher::Basename {
+                name: "steam".into()
+            }),
+            "steam"
+        );
+        assert_eq!(
+            kill_label(&AppMatcher::ExePath {
+                path: "/usr/bin/discord".into()
+            }),
+            "discord"
+        );
+        // A path with no file name falls back to the path itself rather than
+        // an empty label.
+        assert_eq!(kill_label(&AppMatcher::ExePath { path: "/".into() }), "/");
+        assert_eq!(
+            kill_label(&AppMatcher::Cmdline {
+                contains: "com.discordapp.Discord".into()
+            }),
+            "com.discordapp.Discord"
+        );
+    }
+
+    /// The entry that names a kill is the first one that matches, in the
+    /// block's own order — so the label is the user's text, and predictable.
+    #[test]
+    fn matching_entry_is_the_first_hit_in_order() {
+        let m = [
+            AppMatcher::Cmdline {
+                contains: "nomatch".into(),
+            },
+            AppMatcher::Basename {
+                name: "steam".into(),
+            },
+            AppMatcher::ExePath {
+                path: "/usr/games/steam".into(),
+            },
+        ];
+        assert_eq!(
+            matching_entry(Some(Path::new("/usr/games/steam")), None, None, &m),
+            Some(&m[1])
+        );
+        assert_eq!(matching_entry(None, None, None, &m), None);
     }
 }

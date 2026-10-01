@@ -235,7 +235,10 @@ pub struct ActiveBlock {
     /// Refused connections attributed to this block since it was activated
     /// — the live per-run counter behind the status card's "blocked N
     /// times". Reset by construction: every activation site writes `0`.
-    /// Persists with the record across a daemon restart; `0` on records
+    /// Persists with the record across a daemon restart: the scheduler saves
+    /// within a minute of a credit (`scheduler::attempt_save_due`) and the
+    /// daemon saves once more on a graceful stop (SIGTERM/SIGINT), so a
+    /// crash or SIGKILL loses at most a minute of counts. `0` on records
     /// written before this field existed.
     #[serde(default)]
     pub attempts: u32,

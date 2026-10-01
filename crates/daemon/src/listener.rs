@@ -218,19 +218,34 @@ const PORTS: [(u16, Probe); 2] = [(HTTP_PORT, Probe::Http), (HTTPS_PORT, Probe::
 /// Decides, per connection, whether a parsed hostname may be forwarded to the
 /// real server (`true`) or must be refused (`false`).
 ///
-/// This is the security boundary of the forwarding path. `enforce::sync`
-/// supplies a closure that answers `true` ONLY for a domain on a break right
-/// now that is not otherwise enforced — the domains the user blocked and is on
-/// a break from. A process with access to the IPC socket (mode `0o660`, and
-/// unlocked by default) could add a block of its own to widen the set, but that
-/// buys nothing: [`forward`] dials the domain's *real resolved IP* and pipes
-/// raw bytes, so the caller only ever reaches a host it could already reach
-/// directly. The proxy is never a relay to a target otherwise unreachable, and
-/// never a general forwarder of arbitrary destinations.
+/// This is the security boundary of the forwarding path.
+/// `enforce::ensure_detection` supplies a closure that answers `true` ONLY for
+/// a domain on a break right now that is not otherwise enforced — the domains
+/// the user blocked and is on a break from. A process with access to the IPC
+/// socket (mode `0o660`, and unlocked by default) could add a block of its own
+/// to widen the set, but that buys nothing: [`forward`] dials the domain's
+/// *real resolved IP* and pipes raw bytes, so the caller only ever reaches a
+/// host it could already reach directly. The proxy is never a relay to a
+/// target otherwise unreachable, and never a general forwarder of arbitrary
+/// destinations.
 ///
 /// Called on the accept path, so it must not block or take a tokio lock — the
 /// supplied closure reads a leaf `std::sync::Mutex` and returns at once.
 pub type Decide = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Called with the parsed hostname of every connection that was REFUSED —
+/// [`Decide`] said no — once per connection, on either port. A forwarded
+/// (on-break) connection and one with no parseable hostname report nothing.
+///
+/// Accept-path rules as for [`Decide`]: never blocks, never takes a tokio
+/// lock. `enforce::ensure_detection` supplies a closure that folds the
+/// hostname to the blocklist entry it belongs to (or discards it) and records
+/// it in a leaf `std::sync::Mutex` buffer that the scheduler drains.
+///
+/// The hostname is the peer's, so it is logged only at `debug!` — the one
+/// line in [`handle`] — and never above: journal lines at `info!` and up carry
+/// counts, not hosts.
+pub type Observe = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// The pair of loopback sockets, and their lifetime.
 ///
@@ -263,7 +278,7 @@ impl ProxyListener {
     ///
     /// All-or-nothing: unless every port bound, this holds no socket at all and
     /// no accept task exists to hold one.
-    pub async fn start(decide: Decide) -> Self {
+    pub async fn start(decide: Decide, observe: Observe) -> Self {
         let Some(bound) = bind_all(&PORTS).await else {
             return Self {
                 tasks: Vec::new(),
@@ -271,18 +286,26 @@ impl ProxyListener {
             };
         };
         info!("loopback proxy listening on 127.0.0.1:80 and :443");
-        Self::serve(bound, decide)
+        Self::serve(bound, decide, observe)
     }
 
     /// Start one accept task per already-bound listener, all drawing on one
     /// shared connection budget so the cap is on the daemon and not on each
     /// port in turn.
-    fn serve(listeners: Vec<(TcpListener, Probe)>, decide: Decide) -> Self {
+    fn serve(listeners: Vec<(TcpListener, Probe)>, decide: Decide, observe: Observe) -> Self {
         let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let fully_bound = listeners.len() == PORTS.len();
         let tasks = listeners
             .into_iter()
-            .map(|(listener, probe)| spawn_accept(listener, probe, permits.clone(), decide.clone()))
+            .map(|(listener, probe)| {
+                spawn_accept(
+                    listener,
+                    probe,
+                    permits.clone(),
+                    decide.clone(),
+                    observe.clone(),
+                )
+            })
             .collect();
         Self { tasks, fully_bound }
     }
@@ -434,6 +457,7 @@ fn spawn_accept(
     probe: Probe,
     permits: Arc<Semaphore>,
     decide: Decide,
+    observe: Observe,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut refusals = Throttle::new();
@@ -455,8 +479,9 @@ fn spawn_accept(
                         continue;
                     };
                     let decide = decide.clone();
+                    let observe = observe.clone();
                     tokio::spawn(async move {
-                        handle(stream, probe, &decide).await;
+                        handle(stream, probe, &decide, &observe).await;
                         // Held for exactly the life of the connection, however
                         // `handle` returned.
                         drop(permit);
@@ -488,12 +513,16 @@ fn spawn_accept(
 /// Everything that can go wrong here — a timeout, a reset, bytes that parse to
 /// nothing — ends the same way: drop the connection silently. There is nothing
 /// a caller could do about it and nothing worth logging per connection.
-async fn handle(mut stream: TcpStream, probe: Probe, decide: &Decide) {
+///
+/// A refusal is reported to `observe` before anything is written back, so by
+/// the time the peer sees the close the attempt is already recorded.
+async fn handle(mut stream: TcpStream, probe: Probe, decide: &Decide, observe: &Observe) {
     let (host, head) =
         match tokio::time::timeout(READ_TIMEOUT, read_hostname(&mut stream, probe)).await {
             Ok(Some(pair)) => pair,
             // Timed out, hung up, or said something we could not read a hostname
-            // out of. Refused all the same, by closing.
+            // out of. Refused all the same, by closing — and not observed: there
+            // is no host to attribute it to.
             _ => return,
         };
     if decide(&host) {
@@ -501,6 +530,7 @@ async fn handle(mut stream: TcpStream, probe: Probe, decide: &Decide) {
         forward(stream, probe, &host, &head).await;
         return;
     }
+    observe(&host);
     debug!(%host, ?probe, "loopback proxy refusing a blocked connection");
     if probe == Probe::Http {
         // One fixed byte string. On :443 this branch is not taken at all: no
@@ -1517,13 +1547,24 @@ mod tests {
     /// the refusal path can be reached without opening [`MAX_CONNECTIONS`]
     /// sockets.
     async fn ephemeral_with_budget(probe: Probe, budget: usize) -> (SocketAddr, JoinHandle<()>) {
+        ephemeral_with(probe, budget, no_forward(), unobserved()).await
+    }
+
+    /// The general form: every hook and the budget under the test's control.
+    async fn ephemeral_with(
+        probe: Probe,
+        budget: usize,
+        decide: Decide,
+        observe: Observe,
+    ) -> (SocketAddr, JoinHandle<()>) {
         let listener = ephemeral_listener().await;
         let addr = listener.local_addr().unwrap();
         let task = spawn_accept(
             listener,
             probe,
             Arc::new(Semaphore::new(budget)),
-            no_forward(),
+            decide,
+            observe,
         );
         (addr, task)
     }
@@ -1533,6 +1574,21 @@ mod tests {
     /// real upstream; the forward path is tested separately.
     fn no_forward() -> Decide {
         Arc::new(|_| false)
+    }
+
+    /// An observe hook that records nothing, for the tests that are not about
+    /// observation.
+    fn unobserved() -> Observe {
+        Arc::new(|_| {})
+    }
+
+    /// An observe hook that pushes every hostname it is given, and the list it
+    /// pushes into.
+    fn recording() -> (Observe, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let hook: Observe = Arc::new(move |host: &str| sink.lock().unwrap().push(host.to_string()));
+        (hook, seen)
     }
 
     /// A listener on an ephemeral loopback port — port 0, never 80 or 443.
@@ -1586,6 +1642,87 @@ mod tests {
         let mut got = Vec::new();
         client.read_to_end(&mut got).await.unwrap();
         assert!(got.is_empty(), "expected no response, got {got:?}");
+        task.abort();
+    }
+
+    // ── the observe hook ────────────────────────────────────────────────────
+    //
+    // Each test reads the client side to EOF first: `handle` observes before
+    // it writes or closes, so once the peer sees the close the record is in.
+
+    // One refused HTTP connection is one observation, carrying the hostname
+    // in the parser's canonical (lowercase) form, whatever case the peer used.
+    #[tokio::test]
+    async fn a_refused_http_connection_is_observed_once() {
+        let (observe, seen) = recording();
+        let (addr, task) =
+            ephemeral_with(Probe::Http, MAX_CONNECTIONS, no_forward(), observe).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&req("Host: Reddit.COM\r\n"))
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, BLOCK_RESPONSE, "still refused the ordinary way");
+        assert_eq!(*seen.lock().unwrap(), vec!["reddit.com".to_string()]);
+        task.abort();
+    }
+
+    // Same on the TLS port, off the SNI.
+    #[tokio::test]
+    async fn a_refused_tls_connection_is_observed_once() {
+        let (observe, seen) = recording();
+        let (addr, task) = ephemeral_with(Probe::Tls, MAX_CONNECTIONS, no_forward(), observe).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&hello_for("Reddit.COM")).await.unwrap();
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).await.unwrap();
+        assert!(got.is_empty(), "still refused with nothing sent");
+        assert_eq!(*seen.lock().unwrap(), vec!["reddit.com".to_string()]);
+        task.abort();
+    }
+
+    // No parseable hostname means nothing to attribute: a port scan or a
+    // garbage head is refused but never counted against any site.
+    #[tokio::test]
+    async fn a_connection_with_no_hostname_is_not_observed() {
+        let (observe, seen) = recording();
+        let (addr, task) = ephemeral_with(Probe::Tls, MAX_CONNECTIONS, no_forward(), observe).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"hello?").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).await.unwrap();
+        assert!(got.is_empty());
+        assert!(seen.lock().unwrap().is_empty(), "nothing to observe");
+        task.abort();
+    }
+
+    // A forwarded (on-break) connection is not a refusal, so it is never
+    // observed — even when the forward itself fails. `.invalid` is reserved
+    // never to resolve, so `forward` closes silently without any upstream.
+    #[tokio::test]
+    async fn a_forwarded_connection_is_not_observed() {
+        let (observe, seen) = recording();
+        let on_break: Decide = Arc::new(|_| true);
+        let (addr, task) = ephemeral_with(Probe::Http, MAX_CONNECTIONS, on_break, observe).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(&req("Host: nonexistent.invalid\r\n"))
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        let closed = tokio::time::timeout(PATIENCE, client.read_to_end(&mut got)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0))),
+            "closed silently, got {closed:?}"
+        );
+        assert!(got.is_empty(), "no 403 on the forward path");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a forward is not a refusal"
+        );
         task.abort();
     }
 
@@ -1725,8 +1862,11 @@ mod tests {
         let tls = ephemeral_listener().await;
         let addrs = [http.local_addr().unwrap(), tls.local_addr().unwrap()];
 
-        let running =
-            ProxyListener::serve(vec![(http, Probe::Http), (tls, Probe::Tls)], no_forward());
+        let running = ProxyListener::serve(
+            vec![(http, Probe::Http), (tls, Probe::Tls)],
+            no_forward(),
+            unobserved(),
+        );
         assert!(running.fully_bound(), "both ports were handed over");
         running.release().await;
 
@@ -1746,7 +1886,8 @@ mod tests {
     async fn dropping_a_listener_frees_its_port() {
         let listener = ephemeral_listener().await;
         let addr = listener.local_addr().unwrap();
-        let running = ProxyListener::serve(vec![(listener, Probe::Http)], no_forward());
+        let running =
+            ProxyListener::serve(vec![(listener, Probe::Http)], no_forward(), unobserved());
         assert!(
             !running.fully_bound(),
             "one listener out of two is not fully bound"

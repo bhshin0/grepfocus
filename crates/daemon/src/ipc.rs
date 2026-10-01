@@ -233,8 +233,9 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 settings: st.settings.clone(),
                 instant_breaks_degraded,
                 health: Box::new(health),
-                // Empty until the daemon keeps an event log.
-                recent_events: Vec::new(),
+                // A leaf lock, taken with `state` held — the documented
+                // exception, as for `health` just above.
+                recent_events: daemon.events().snapshot(),
             }
         }
 
@@ -1401,10 +1402,15 @@ mod tests {
             forwardable: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            enforced: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            attempts: std::sync::Arc::new(
+                std::sync::Mutex::new(crate::attempts::Buffer::default()),
+            ),
             license: tokio::sync::Mutex::new(None),
             break_challenges: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             app_kills_pending: std::sync::atomic::AtomicU64::new(0),
             health: std::sync::Mutex::new(crate::health::HealthState::default()),
+            events: std::sync::Mutex::new(crate::events::Log::default()),
         })
     }
 
@@ -1455,6 +1461,48 @@ mod tests {
             } => {
                 assert!(!instant_breaks_degraded);
                 assert_eq!(health.proxy, ProxyStatus::Holding);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    // `recent_events` rides on every Status frame straight from the daemon's
+    // event log — empty on a fresh daemon, then whatever the scheduler and
+    // procwatch pushed, oldest first, with the sequence a client dedups on.
+    #[tokio::test]
+    async fn get_status_carries_recent_events() {
+        use grepfocus_core::{EventKind, RecentEvent};
+        let daemon = test_daemon();
+        match dispatch(Request::GetStatus {}, &daemon).await {
+            Response::Status { recent_events, .. } => assert!(recent_events.is_empty()),
+            other => panic!("expected Status, got {other:?}"),
+        }
+
+        daemon
+            .events()
+            .push(EventKind::Attempt, 7, "reddit.com", 1_000);
+        daemon.events().push(EventKind::AppKill, 8, "steam", 1_001);
+        match dispatch(Request::GetStatus {}, &daemon).await {
+            Response::Status { recent_events, .. } => {
+                assert_eq!(
+                    recent_events,
+                    vec![
+                        RecentEvent {
+                            seq: 1,
+                            unix: 1_000,
+                            kind: EventKind::Attempt,
+                            block_id: 7,
+                            detail: "reddit.com".into(),
+                        },
+                        RecentEvent {
+                            seq: 2,
+                            unix: 1_001,
+                            kind: EventKind::AppKill,
+                            block_id: 8,
+                            detail: "steam".into(),
+                        },
+                    ]
+                );
             }
             other => panic!("expected Status, got {other:?}"),
         }

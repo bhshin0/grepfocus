@@ -15,11 +15,13 @@ use anyhow::Context;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
+mod attempts;
 mod auth;
 mod browser_policy;
 mod cleanup;
 mod dns;
 mod enforce;
+mod events;
 mod health;
 mod hosts;
 mod ipc;
@@ -64,6 +66,23 @@ pub struct Daemon {
     /// it is a leaf lock held for microseconds and NEVER across an await, so the
     /// accept path takes no tokio lock and cannot deadlock against the daemon.
     pub forwardable: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Domains the daemon is enforcing RIGHT NOW — the canonical union
+    /// `enforce::sync` last wrote to `/etc/hosts` (see `enforce::union_domains`).
+    /// Rewritten each tick next to `forwardable`, read by the proxy's
+    /// per-connection observe hook: only a refused hostname that folds to one
+    /// of these counts as an attempt, so a developer's own `127.0.0.1
+    /// myapp.test` hosts line — which lands on our `:80` and is refused too —
+    /// never becomes one. Same leaf-lock discipline as `forwardable`.
+    pub enforced: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Refused-connection attempts the proxy has observed and the scheduler
+    /// has not yet credited (see `attempts`). Written from the accept path by
+    /// the observe hook, drained once per scheduler tick under the state lock
+    /// — the `app_kills_pending` pattern with a dedup window in front. A leaf
+    /// `std::sync::Mutex` for the same reason as `forwardable`; `Arc` because
+    /// the hook closure captures a clone. The scheduler goes through
+    /// `Daemon::attempts()`; the hook has only its captured clone and locks
+    /// that directly, with the same poison recovery (`into_inner`).
+    pub attempts: Arc<std::sync::Mutex<attempts::Buffer>>,
     /// Claims from the verified `state.license_token`, or `None` when
     /// unlicensed or the stored token failed verification. Derived and
     /// in-memory only — rebuilt at startup and on `SetLicense`.
@@ -87,6 +106,13 @@ pub struct Daemon {
     /// microseconds and never across an await, so it can be taken with
     /// `applied` or `state` already held. Go through `Daemon::health()`.
     pub health: std::sync::Mutex<health::HealthState>,
+    /// Recent enforcement events — attempts credited by the scheduler, kills
+    /// by procwatch — reported on `GetStatus.recent_events` (see `events`).
+    /// In-memory only, bounded and sequence-numbered. A leaf
+    /// `std::sync::Mutex` like `health`, so the scheduler can push while it
+    /// holds `state` and procwatch while it holds nothing. Go through
+    /// `Daemon::events()`.
+    pub events: std::sync::Mutex<events::Log>,
 }
 
 impl Daemon {
@@ -94,6 +120,16 @@ impl Daemon {
     /// panicked prior holder must not wedge status reporting or enforcement.
     pub fn health(&self) -> std::sync::MutexGuard<'_, health::HealthState> {
         self.health.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The attempt-buffer leaf lock, poison recovered as for `health`.
+    pub fn attempts(&self) -> std::sync::MutexGuard<'_, attempts::Buffer> {
+        self.attempts.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The event-log leaf lock, poison recovered as for `health`.
+    pub fn events(&self) -> std::sync::MutexGuard<'_, events::Log> {
+        self.events.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -292,11 +328,22 @@ async fn run_daemon() -> anyhow::Result<()> {
         applied: Mutex::new(None),
         listener: Mutex::new(None),
         forwardable: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        enforced: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        attempts: Arc::new(std::sync::Mutex::new(attempts::Buffer::default())),
         license: Mutex::new(license),
         break_challenges: Mutex::new(std::collections::HashMap::new()),
         app_kills_pending: std::sync::atomic::AtomicU64::new(0),
         health: std::sync::Mutex::new(health::HealthState::new(daemon_exe, install_kind, notes)),
+        events: std::sync::Mutex::new(events::Log::default()),
     });
+
+    // Catch SIGTERM — what systemd sends on `stop` and on an upgrade — from
+    // here on, so the shutdown below runs for it exactly as for a terminal's
+    // ^C. Needs the runtime's signal driver, hence not at the top of `main`;
+    // until this line the default disposition (terminate) applies, and there
+    // is nothing to save before it.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the SIGTERM handler")?;
 
     // Re-apply the union of all still-active blocks before accepting clients.
     if let Err(e) = enforce::sync(&daemon).await {
@@ -315,6 +362,22 @@ async fn run_daemon() -> anyhow::Result<()> {
         r = sched_handle => { error!(?r, "scheduler task exited"); }
         r = policy_handle => { error!(?r, "browser policy task exited"); }
         _ = tokio::signal::ctrl_c() => { info!("received SIGINT, shutting down"); }
+        _ = sigterm.recv() => { info!("received SIGTERM, shutting down"); }
+    }
+
+    // Persist once on the way out, whatever ended the select. The scheduler
+    // saves credits (attempts, app kills) at most once a minute, so without
+    // this a `systemctl stop` or an upgrade could drop up to a minute of
+    // counts; what is still undrained in `attempts`/`app_kills_pending` is at
+    // most one tick's worth and is accepted. The lock is free to take: a task
+    // that exited through a panic dropped its guard on the way out (a tokio
+    // mutex does not poison), and whatever enforcement it left behind is
+    // re-applied from this very state at the next start.
+    {
+        let st = daemon.state.lock().await;
+        if let Err(e) = state::save(&st, &daemon.key) {
+            error!(?e, "final state save failed");
+        }
     }
 
     Ok(())
