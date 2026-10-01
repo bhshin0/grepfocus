@@ -12,7 +12,7 @@
 %global debug_package %{nil}
 
 Name:           grepfocus
-Version:        0.5.1
+Version:        0.6.0
 Release:        1%{?dist}
 Summary:        Website and app blocker for Linux
 
@@ -125,13 +125,49 @@ fi
 %dir %attr(0700,root,root) %{_sharedstatedir}/grepfocus
 
 %changelog
-* Mon Aug 18 2026 Bryan <bhshin@gmail.com> - 0.5.1-1
-- Block Mullvad and Mozilla DoH resolver endpoints (closes the Mullvad
-  Browser bypass of active blocks)
-
-* Mon Aug 03 2026 Bryan <bhshin@gmail.com> - 0.5.0-1
-- Each block's schedule card now shows a compact weekly grid of its windows
-- New schedules prefill their name from the block they belong to
+* Wed Sep 30 2026 Bryan <bhshin@gmail.com> - 0.6.0-1
+- Each block's schedule card shows a compact weekly grid of its windows,
+  and a new schedule takes its name from the block it belongs to.
+- New ways to install: an AUR package for Arch Linux, and an AppImage
+  that sets up its background service itself the first time it runs.
+- Blocks now also hold in browsers that use DNS-over-HTTPS: GrepFocus
+  switches it off in Firefox, Mullvad Browser, Chromium, Chrome and
+  Brave through their standard policy files, and the DoH servers it
+  blocks during a block now include Mullvad's and Mozilla's. Those
+  browsers show a "managed by your organization" notice and need one
+  restart; DoH stays off for as long as GrepFocus is installed (Mullvad
+  Browser then uses the system resolver), and uninstalling puts the
+  files back. Before downgrading to an older version, remove the files
+  first (README, Recovery).
+- The Status tab reports blocking problems (a change to /etc/hosts that
+  could not be applied, failed DoH protection, tamper protection that is
+  off, a browser policy that could not be written, the instant-break
+  proxy) and a desktop notification tells you when a new one appears.
+  Settings shows the app and service versions with a diagnostics line;
+  "grepfocusd --version" and "grepfocus-gui --version" print them.
+- Blocks are checked when they are saved: a website must be a host name
+  (a pasted address is trimmed to it; IP addresses, wildcards and single
+  words are refused), an app entry must be well formed and cannot target
+  GrepFocus itself, and a block needs at least one website or app.
+  Entries saved by older versions are tidied at startup, and ones that
+  cannot be used are dropped with a warning in the system journal.
+- App blocking never stops programs running as root (system services,
+  apps started with sudo or pkexec) or GrepFocus itself.
+- AppImage: the Status tab offers "Update system service" when the app
+  is newer than the installed service, and Settings gains "Remove system
+  service" (refused while a block is running; saved data is kept; if the
+  service's cleanup fails nothing is removed and the app says why), so
+  the service no longer outlives a deleted AppImage. The installer now
+  works on Debian and Ubuntu and where /tmp does not allow running
+  programs, and refuses to replace a package install or a newer service.
+- The app checks grepfocus.com once a day for a newer release: only the
+  version number is fetched, you are told the first time, and it can be
+  turned off in Settings.
+- If the system tray restarts (for example the AppIndicator extension is
+  re-enabled or updated), the GrepFocus icon and its menu are set up
+  again within about 10 seconds.
+- Locking the screen no longer brings a window that was hidden in the
+  tray back on screen.
 
 * Tue Jul 28 2026 Bryan <bhshin@gmail.com> - 0.4.0-1
 - Instant breaks: a blocked site becomes reachable the moment a break starts,

@@ -9,7 +9,7 @@
 # tmpfiles layout, relocated from the dev /usr/local/bin to /usr/bin.
 
 pkgname=grepfocus
-pkgver=0.5.1
+pkgver=0.6.0
 pkgrel=1
 pkgdesc="Website and app blocker for Linux"
 arch=('x86_64')
@@ -24,8 +24,8 @@ makedepends=('rust' 'nodejs' 'pnpm')
 optdepends=('xdg-utils: open grepfocus.com links from the app')
 install="$pkgname.install"
 source=("$pkgname-$pkgver.tar.gz::https://github.com/bhshin0/grepfocus/archive/refs/tags/v$pkgver.tar.gz")
-# TODO: set after tagging v0.5.1 (see README.md):
-#   curl -fsSL https://github.com/bhshin0/grepfocus/archive/refs/tags/v0.5.1.tar.gz | sha256sum
+# TODO: after tagging v0.6.0, run scripts/bump-version.sh --aur-sha to record the
+#   sha256 of https://github.com/bhshin0/grepfocus/archive/refs/tags/v0.6.0.tar.gz
 sha256sums=('SKIP')
 
 build() {
