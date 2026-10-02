@@ -199,6 +199,11 @@ but drops what lives only in memory: the settings unlock (the daemon
 relocks), a pending break challenge, and app-kill counts not yet flushed to
 the usage stats.
 
+Downgrading below 0.7.0 with a schedule saved that crosses midnight: the
+older daemon loads it but enforces only the part of the window before
+midnight, and refuses to save that schedule again until its window ends by
+24:00 (shorten it, or split it in two).
+
 The app also looks for a newer release once a day — see
 [Update notifications](#update-notifications). To exercise that check in
 dev mode against a local stub instead of the site:
@@ -599,10 +604,17 @@ that Cold Turkey beats either.
   an upcoming scheduled window, or open it with only its remaining length
   (by design — schedules fire by wall time). Changing the clock across a
   reboot is root with physical access, out of the threat model.
-- **Schedules.** Editing, disabling or deleting a schedule takes effect
-  from its next window — a block the schedule already started keeps the
-  end it was given when it fired. Stretching the running window makes it
-  fire again at the old end (two sessions in the usage stats).
+- **Schedules.** A window may cross midnight and lasts up to 24 h. On DST
+  nights a block never runs shorter than configured: a window ending in or
+  straddling the skipped hour keeps its real length (so a daily 00:00 for
+  24 h ends at 01:00 the day after the clocks go forward), one ending in
+  the repeated hour ends at the later of its two instants, and one that
+  starts inside the skipped hour starts when the clock reaches it and still
+  runs at least its full length from there. Editing, disabling or deleting
+  a schedule takes effect from its next window — a block the schedule
+  already started keeps the end it was given when it fired. Stretching the
+  running window makes it fire again at the old end (two sessions in the
+  usage stats).
 - **The update check fails behind a TLS-intercepting proxy.** It trusts the
   Mozilla root store bundled with the app (webpki-roots), not the system
   trust store, so a proxy that re-signs traffic with a private CA makes the

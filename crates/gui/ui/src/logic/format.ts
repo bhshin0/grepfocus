@@ -9,6 +9,15 @@ export function fmtMinute(m: number): string {
   return `${String(h).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 }
 
+/// A schedule window as "HH:MM–HH:MM", flagging one that runs past midnight:
+/// "23:00–01:00 (+1 day)". An end of exactly 1440 is "24:00" (`fmtMinute`),
+/// the end of the same day rather than a spill-over.
+export function fmtWindowRange(start: number, duration: number): string {
+  const end = start + duration;
+  if (end > 1440) return `${fmtMinute(start)}–${fmtMinute(end - 1440)} (+1 day)`;
+  return `${fmtMinute(start)}–${fmtMinute(end)}`;
+}
+
 /// HH:MM:SS countdown, never negative.
 export function fmtRemaining(secs: number): string {
   const s = Math.max(0, Math.floor(secs));
@@ -57,7 +66,11 @@ export function fmtWindow(windowSecs: number): string {
 /// Deliberately not adjusted by main.ts's `activeServerSkew`: that skew exists
 /// to tick countdowns off a client clock that may disagree with the daemon's,
 /// whereas an instant like `next_free_unix` is already absolute and agreed on
-/// by both machines. Skewing it would double-count the correction.
+/// by both machines. Skewing it would double-count the correction. The one
+/// instant that IS moved first is a running block's end, which the daemon
+/// keeps on its block clock: after a clock step mid-block that frame and the
+/// desktop's differ by exactly that skew, so the caller subtracts it before
+/// printing (`renderScheduleRow` in main.ts).
 export function fmtClock(unix: number): string {
   return new Date(unix * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }

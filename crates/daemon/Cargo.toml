@@ -25,3 +25,6 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
+# Named zones for the DST tests of the schedule window functions: `Local` is
+# whatever the test box runs, which may never cross a DST boundary.
+chrono-tz = "0.10"

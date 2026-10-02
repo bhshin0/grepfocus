@@ -365,16 +365,22 @@ Two things to settle at release time:
 
 Status: **in progress** — design and work packages in
 `docs/plans/0.7.0-plan.md`. Landed so far: the core types, the daemon's
-attempt counts and event log, the GUI notification watcher, and the daemon
+attempt counts and event log, the GUI notification watcher, the daemon
 half of schedule integrity (a schedule-started block keeps its snapshotted
-window end). Still to come: midnight-spanning windows, the GUI's
-"running now until" hint, export/import, the plan records.
+window end), the BOOTTIME-anchored block clock, midnight-spanning windows,
+and the GUI's "running now until" hint. Still to come: export/import, the
+plan records.
 
 ### Pending release-note lines (0.7.0)
 
 Drafted as each package lands, in changelog order; the release commit turns
 them into `docs/release-notes-0.7.0.txt` as the 0.6.0 lines were.
 
+- A schedule window may run past midnight (22:00 for 4 h ends at 02:00 the
+  next day) and last up to 24 hours; the Week grid draws the part after
+  midnight in the next day's column. On DST nights a window ending in or
+  straddling the skipped hour keeps its length, one ending in the repeated
+  hour ends at the later instant — never shorter.
 - Editing, disabling or deleting a schedule no longer ends a block it has
   already started: the block runs to the end of the window it fired for,
   and the change applies from the next window.

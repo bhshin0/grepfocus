@@ -15,11 +15,19 @@ import type {
 } from "./types";
 import { attemptRows, blockedTimesText, CAP_HINT_TEXT, NO_ATTEMPTS_TEXT, nudgeToggle, timesText } from "./logic/attempts";
 import { type FirstRunMode, serviceRemovalOffered, serviceRemovalRefusal, unreachableMode } from "./logic/firstrun";
-import { fmtClock, fmtDuration, fmtMinute, fmtPhaseRemaining, fmtRemaining, fmtWindow } from "./logic/format";
-import { CMDLINE_PREFIX, type FormField, blockFormError, blockFromFields } from "./logic/forms";
+import { fmtClock, fmtDuration, fmtMinute, fmtPhaseRemaining, fmtRemaining, fmtWindow, fmtWindowRange } from "./logic/format";
+import {
+  CMDLINE_PREFIX,
+  type FormField,
+  blockFormError,
+  blockFromFields,
+  durationHoursField,
+  scheduleFields,
+} from "./logic/forms";
 import { type HealthNotice, aboutLine, healthNotices, healthSummary } from "./logic/health";
+import { runningHint, runningSchedules, runningSchedulesKey } from "./logic/running";
 import { DOWNLOAD_URL, adviceOffersDownload, releaseNoticeVisible, updateAdviceText } from "./logic/update";
-import { DAY_LABEL, DISPLAY_DAYS, WEEK_PALETTE, layoutDay } from "./logic/week";
+import { DAY_LABEL, DISPLAY_DAYS, WEEK_PALETTE, layoutDay, segmentLabel, segmentTitle } from "./logic/week";
 
 // ─── Tab switching ─────────────────────────────────────────────────────────
 
@@ -152,8 +160,58 @@ newForm.addEventListener("submit", async (ev) => {
 
 const listEl = document.querySelector<HTMLUListElement>("#block-list")!;
 const listMsg = document.querySelector<HTMLParagraphElement>("#list-msg")!;
+const listSection = document.querySelector<HTMLElement>("#list")!;
+
+/// `runningSchedulesKey` of the actives the list was last rendered against.
+/// The status poll compares its own reading with this and re-renders the
+/// list only when a scheduled window has fired or ended since — the one
+/// poll-driven change the list shows (a schedule row's "running now until"
+/// hint, and the card's running-block edit lock).
+let listRunningKey = "";
+
+function listTabVisible(): boolean {
+  return listSection.classList.contains("active");
+}
+
+/// True while rebuilding the list would yank the DOM out from under the
+/// user: they are typing in one of its forms, or a dialog a row opened is
+/// up over it — the schedule dialog (a row's Edit, a card's + Add schedule)
+/// or the unlock and challenge dialogs (a row's Disable or Delete goes
+/// through `ensureUnlocked`). A deferred rebuild is not lost —
+/// `listRunningKey` stays stale, so the next poll tries again.
+function listInteractionBusy(): boolean {
+  // Every dialog the list can open: add a new one here and it holds the
+  // list still too.
+  const dialogs = [schedDialog, unlockDialog, challengeDialog];
+  if (dialogs.some((d) => d.open)) return true;
+  const el = document.activeElement;
+  return (
+    (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) &&
+    listEl.contains(el)
+  );
+}
+
+/// Generation of the latest `refreshList` call. The list is cleared on
+/// entry and filled after an await, so a call overtaken by a newer one
+/// while its reads were in flight — the poll's rebuild landing on a save's,
+/// say — must leave the DOM to the newer one, or both would fill it.
+let listGen = 0;
+
+/// Which of the list's `<details>` disclosures are open, as "blockId:kind"
+/// ("edit" or "sched"), so a rebuild — the poll's, or one after a save —
+/// restores them instead of folding every card the user had expanded.
+function openDisclosures(): Set<string> {
+  const keys = new Set<string>();
+  listEl.querySelectorAll<HTMLDetailsElement>("details[open]").forEach((d) => {
+    const id = d.closest<HTMLElement>("[data-block-id]")?.dataset.blockId;
+    if (id !== undefined) keys.add(`${id}:${d.className}`);
+  });
+  return keys;
+}
 
 async function refreshList() {
+  const gen = ++listGen;
+  const openKeys = openDisclosures();
   listMsg.classList.remove("error", "warn");
   listMsg.textContent = "";
   listEl.innerHTML = "";
@@ -186,12 +244,24 @@ async function refreshList() {
       ),
       invoke<Schedule[]>("list_schedules"),
     ]);
+    // Overtaken while the reads were in flight: the newer call owns the DOM.
+    if (gen !== listGen) return;
     const status = statusRead.status;
     if (status === null) {
       listMsg.classList.add("warn");
       listMsg.textContent = `Live status could not be read (${statusRead.err}) — which blocks are active and their remaining allowance are unknown; cards show saved configuration only.`;
     }
     const active = new Set((status?.active ?? []).map((a) => a.block.id));
+    // Which schedules have their block running, and until when: the rows'
+    // "running now until" hint. Read off THIS status read, like `active`
+    // above, so a row never says "running" on a card not marked active.
+    const running = runningSchedules(status?.active ?? []);
+    listRunningKey = runningSchedulesKey(status?.active ?? []);
+    // `now_unix` is the daemon's block clock, the frame every active's end is
+    // in; the desktop clock can differ from it by a clock step made mid-block.
+    // Their difference, read off THIS status read like `active` above, moves
+    // a block's end into the desktop's frame for printing (`renderScheduleRow`).
+    const skew = status ? status.now_unix - Math.floor(Date.now() / 1000) : 0;
     // Absent on an OLD daemon that predates the field, in which case this map
     // stays empty and every card falls back to its static summary.
     const allowanceByBlock = new Map<number, AllowanceStatus>();
@@ -207,11 +277,21 @@ async function refreshList() {
       else byBlock.set(s.block_id, [s]);
     }
     for (const b of blocks) {
-      listEl.appendChild(
-        renderBlockCard(b, active.has(b.id), byBlock.get(b.id) ?? [], allowanceByBlock.get(b.id)),
+      const card = renderBlockCard(
+        b,
+        active.has(b.id),
+        byBlock.get(b.id) ?? [],
+        running,
+        skew,
+        allowanceByBlock.get(b.id),
       );
+      card.querySelectorAll<HTMLDetailsElement>(":scope > details").forEach((d) => {
+        d.open = openKeys.has(`${b.id}:${d.className}`);
+      });
+      listEl.appendChild(card);
     }
   } catch (e) {
+    if (gen !== listGen) return;
     listMsg.classList.add("error");
     listMsg.textContent = String(e);
   }
@@ -290,10 +370,14 @@ function renderBlockCard(
   b: Block,
   isActive: boolean,
   schedules: Schedule[],
+  running: Map<number, number>,
+  skew: number,
   allowance?: AllowanceStatus,
 ): HTMLLIElement {
   const li = document.createElement("li");
   li.className = "block-card";
+  // Keys the card's open disclosures across a rebuild (`openDisclosures`).
+  li.dataset.blockId = String(b.id);
   li.innerHTML = `
     <h3></h3>
     <div class="meta"></div>
@@ -451,7 +535,7 @@ function renderBlockCard(
     });
     mini.classList.add("week-mini");
     schedList.before(mini);
-    for (const s of schedules) schedList.appendChild(renderScheduleRow(s));
+    for (const s of schedules) schedList.appendChild(renderScheduleRow(s, running.get(s.id), skew));
   }
   li.querySelector<HTMLButtonElement>(".add-sched-btn")!.addEventListener("click", () => {
     openScheduleDialog({ mode: "add", blockId: b.id }, b.name);
@@ -545,6 +629,13 @@ async function refreshStatus() {
     blockActive = s.active.length > 0;
     skewActive = s.update.kind !== "up_to_date";
     activeServerSkew = s.now_unix - Math.floor(Date.now() / 1000);
+    // A scheduled window firing or ending changes what the Block list shows
+    // (see `listRunningKey`); nothing else about it rides this poll, so it
+    // re-renders only then, only while on screen, and never under the
+    // user's hands.
+    if (listTabVisible() && runningSchedulesKey(s.active) !== listRunningKey && !listInteractionBusy()) {
+      void refreshList();
+    }
     // Premium is all-or-nothing: a valid license reveals the Stats tab, an
     // invalid/absent one hides it. This poll is the single place license
     // state is refreshed, so gate here. When the tab is already open, keep it
@@ -1008,16 +1099,24 @@ let schedIntent: SchedIntent | null = null;
 
 /// One schedule inside its block's card. This is the old standalone schedule
 /// card minus the block-name prefix, which nesting makes redundant.
-function renderScheduleRow(s: Schedule): HTMLLIElement {
+/// `activeEndsAt` is the end of the block this schedule started, when it is
+/// running now: the row then says so, and that any change applies from the
+/// next window — the daemon lets the schedule be edited, disabled or deleted
+/// meanwhile, since the running block keeps the end it snapshotted. `skew`
+/// is the daemon's `now_unix` minus the desktop clock, off the same status
+/// read as `activeEndsAt`.
+function renderScheduleRow(s: Schedule, activeEndsAt: number | undefined, skew: number): HTMLLIElement {
   const li = document.createElement("li");
   li.className = `block-card${s.enabled ? "" : " disabled"}`;
   const days: string[] = [];
   for (let d = 0; d < 7; d++) {
     if (s.days & (1 << d)) days.push(DAY_LABEL[d]);
   }
-  const start = `${String(Math.floor(s.start_minute / 60)).padStart(2, "0")}:${String(s.start_minute % 60).padStart(2, "0")}`;
-  const endMin = s.start_minute + s.duration_minutes;
-  const end = `${String(Math.floor(endMin / 60) % 24).padStart(2, "0")}:${String(endMin % 60).padStart(2, "0")}`;
+  // The end is in the daemon's block-clock frame, the one `now_unix` is
+  // reported in; `skew` moves it into the desktop's frame before `fmtClock`
+  // prints it, so a clock set back mid-block does not shift the time the
+  // row names. An instant printed once per render, not a ticking countdown.
+  const running = activeEndsAt != null ? runningHint(activeEndsAt - skew, fmtClock) : "";
   li.innerHTML = `
     <h3></h3>
     <div class="meta"></div>
@@ -1029,7 +1128,7 @@ function renderScheduleRow(s: Schedule): HTMLLIElement {
   `;
   li.querySelector("h3")!.textContent = s.name + (s.enabled ? "" : "  (disabled)");
   li.querySelector(".meta")!.textContent =
-    `${days.join(", ") || "no days"} · ${start}–${end}`;
+    `${days.join(", ") || "no days"} · ${fmtWindowRange(s.start_minute, s.duration_minutes)}${running}`;
   const toggle = li.querySelector<HTMLButtonElement>(".toggle-btn")!;
   toggle.textContent = s.enabled ? "Disable" : "Enable";
   // Row actions report into the block list's message line, not the dialog's:
@@ -1089,8 +1188,8 @@ function openScheduleDialog(intent: SchedIntent, blockName?: string) {
       cb.checked = (s.days & (1 << Number(cb.value))) !== 0;
     });
     schedForm.querySelector<HTMLInputElement>('input[name="start_time"]')!.value = fmtMinute(s.start_minute);
-    schedForm.querySelector<HTMLInputElement>('input[name="duration_hours"]')!.value = String(
-      Math.round((s.duration_minutes / 60) * 100) / 100,
+    schedForm.querySelector<HTMLInputElement>('input[name="duration_hours"]')!.value = durationHoursField(
+      s.duration_minutes,
     );
     schedForm.querySelector<HTMLInputElement>('input[name="enabled"]')!.checked = s.enabled;
   } else {
@@ -1129,14 +1228,12 @@ schedForm.addEventListener("submit", async (ev) => {
   schedMsg.classList.remove("error");
   schedMsg.textContent = "";
   const fd = new FormData(schedForm);
-  let days = 0;
+  // Checkbox values are the day bits, 0 = Sunday … 6 = Saturday.
+  const days: number[] = [];
   schedForm.querySelectorAll<HTMLInputElement>('input[name="day"]:checked').forEach((cb) => {
-    days |= 1 << Number(cb.value);
+    days.push(Number(cb.value));
   });
-  const time = String(fd.get("start_time") ?? "00:00");
-  const [hh, mm] = time.split(":").map((n) => parseInt(n, 10));
-  const start_minute = (hh || 0) * 60 + (mm || 0);
-  const duration_minutes = Math.round(Number(fd.get("duration_hours") ?? 0) * 60);
+  const fields = scheduleFields(days, String(fd.get("start_time") ?? ""), String(fd.get("duration_hours") ?? ""));
   const enabled = schedForm.querySelector<HTMLInputElement>('input[name="enabled"]')!.checked;
   const name = String(fd.get("name") ?? "").trim();
 
@@ -1146,9 +1243,7 @@ schedForm.addEventListener("submit", async (ev) => {
     id: intent.mode === "edit" ? intent.sched.id : 0,
     name,
     block_id: intent.mode === "edit" ? intent.sched.block_id : intent.blockId,
-    days,
-    start_minute,
-    duration_minutes,
+    ...fields,
     enabled,
   };
   if (!(await ensureUnlocked())) return;
@@ -1243,25 +1338,33 @@ function buildWeekGrid(
     const col = document.createElement("div");
     col.className = "week-day";
 
-    // Overlapping windows share the column side by side, one lane each.
+    // Overlapping segments share the column side by side, one lane each. A
+    // window that runs past midnight is two segments: the part before it in
+    // its own column, a continuation from 00:00 in the next day's.
     const { windows, laneCount } = layoutDay(schedules, bit);
 
-    for (const { schedule: s, lane } of windows) {
+    for (const seg of windows) {
+      const { schedule: s, start, end, cont, lane } = seg;
       const win = document.createElement("div");
-      win.className = `week-window${s.enabled ? "" : " disabled"}`;
-      // Top/height from the day fraction; left/width from the lane split.
-      win.style.top = `${(s.start_minute / 1440) * 100}%`;
-      win.style.height = `${(s.duration_minutes / 1440) * 100}%`;
+      win.className = `week-window${cont ? " cont" : ""}${s.enabled ? "" : " disabled"}`;
+      // Top/height from the segment's day fraction; left/width from the
+      // lane split.
+      win.style.top = `${(start / 1440) * 100}%`;
+      win.style.height = `${((end - start) / 1440) * 100}%`;
       win.style.left = `${(lane * 100) / laneCount}%`;
       win.style.width = `${100 / laneCount}%`;
       const pal = WEEK_PALETTE[s.block_id % WEEK_PALETTE.length];
       win.style.background = pal.fill;
       win.style.color = pal.text;
       const name = opts.blockName(s.block_id);
-      const range = `${fmtMinute(s.start_minute)}–${fmtMinute(s.start_minute + s.duration_minutes)}`;
+      // The piece before midnight carries the whole range ("23:00–01:00
+      // (+1 day)" says it continues); the continuation shows only its own
+      // span, arrowed, and its tooltip names the day it came from.
+      const whole = fmtWindowRange(s.start_minute, s.duration_minutes);
+      const range = cont ? `${fmtMinute(start)}–${fmtMinute(end)}` : whole;
       const label = opts.windowLabel ? opts.windowLabel(s, name, range) : `${name} ${range}`;
-      win.textContent = `${label}${s.enabled ? "" : " (off)"}`;
-      win.title = `${name} · ${DAY_LABEL[bit]} · ${range}${s.enabled ? "" : " (disabled)"}`;
+      win.textContent = segmentLabel(seg, label, s.enabled);
+      win.title = segmentTitle(name, bit, seg, whole, s.enabled);
       // Reuse the exact edit entry point the block-card rows use — no new dialog.
       win.addEventListener("click", () => {
         openScheduleDialog({ mode: "edit", sched: s }, name);

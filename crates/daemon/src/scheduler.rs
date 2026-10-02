@@ -24,7 +24,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
+use chrono::{
+    DateTime, Datelike, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Timelike,
+};
 use grepfocus_core::license::features;
 use grepfocus_core::validate::normalize_domain;
 use grepfocus_core::{
@@ -387,9 +389,15 @@ fn reconcile(
     let wall_now = now_local.timestamp().max(0) as u64;
     skipped_fires.retain(|&(_, window_end)| window_end > wall_now);
     for s in &schedules {
-        if !s.enabled || !schedule_active_at(s, now_local) {
+        if !s.enabled {
             continue;
         }
+        // The window's end on the wall clock, None while the schedule is in
+        // none of its windows. One evaluation keys the skip marker and sizes
+        // the new active below.
+        let Some(window_end) = window_end_unix_at(s, now_local) else {
+            continue;
+        };
         // One ActiveBlock per block, no matter who started it: a manual
         // run or another schedule already enforcing this block means
         // there is nothing to add. (Two entries for one block would let
@@ -404,7 +412,7 @@ fn reconcile(
             // were already retained above untouched — an in-flight window
             // runs to completion; only new fires stop. Log once per window
             // occurrence (first tick the skip is seen), not once per tick.
-            if skipped_fires.insert((s.id, compute_window_end_unix(s, now_local))) {
+            if skipped_fires.insert((s.id, window_end)) {
                 info!(
                     schedule_id = s.id,
                     block_id = s.block_id,
@@ -427,10 +435,10 @@ fn reconcile(
         };
         // The window's remaining length by the wall clock, applied to the
         // block clock: see the doc comment's step 2 for why not the wall
-        // instant itself. Zero cannot happen while `schedule_active_at`
-        // holds (the minute-of-day check leaves at least a second), but a
-        // zero-length active would be born expired, so never push one.
-        let remaining = compute_window_end_unix(s, now_local).saturating_sub(wall_now);
+        // instant itself. Zero cannot happen while the window is open (the
+        // minute-of-day check leaves at least a second), but a zero-length
+        // active would be born expired, so never push one.
+        let remaining = window_end.saturating_sub(wall_now);
         if remaining == 0 {
             continue;
         }
@@ -623,40 +631,111 @@ pub fn local_day() -> i64 {
     Local::now().date_naive().num_days_from_ce() as i64
 }
 
-/// True if `t` falls inside today's scheduled window.
-fn schedule_active_at(s: &Schedule, t: &DateTime<Local>) -> bool {
+/// The start DATE of the window instance of `s` that contains `t`, if any.
+///
+/// A window belongs to the weekday it STARTS on. Its same-day part,
+/// `[start, min(end, 1440))`, is live on a selected weekday; a window with
+/// `end > 1440` spills into `[0, end - 1440)` of the NEXT day, live there
+/// when the PREVIOUS weekday is selected — "Mon 23:00 for 2 h" is in
+/// progress at 00:30 on Tuesday iff Monday is selected. Validation caps the
+/// length at 1440, so `end - 1440 <= start` and one schedule's two parts
+/// never overlap (half-open): at most one instance is live per schedule.
+/// Generic over the zone so the DST cases are testable without the test
+/// box's local zone.
+fn window_start_date_at<Tz: TimeZone>(s: &Schedule, t: &DateTime<Tz>) -> Option<NaiveDate> {
     let weekday = t.weekday().num_days_from_sunday() as u8; // 0=Sun..6=Sat
-    if !day_set(s.days, weekday) {
-        return false;
-    }
-    let minute_of_day = t.hour() * 60 + t.minute();
+    let minute = t.hour() * 60 + t.minute();
     let start = s.start_minute as u32;
     let end = start + s.duration_minutes as u32;
-    (start..end).contains(&minute_of_day)
+    let today = t.date_naive();
+    if day_set(s.days, weekday) && start <= minute && minute < end.min(1440) {
+        return Some(today);
+    }
+    if end > 1440 && day_set(s.days, (weekday + 6) % 7) && minute < end - 1440 {
+        return Some(today - chrono::Duration::days(1));
+    }
+    None
 }
 
-/// The unix-time end of the schedule's current window. Assumes
-/// `schedule_active_at(s, now)` is true (caller checks).
-fn compute_window_end_unix(s: &Schedule, now: &DateTime<Local>) -> u64 {
-    let end_minute = s.start_minute as u32 + s.duration_minutes as u32;
-    let (date, h, m): (NaiveDate, u32, u32) = if end_minute >= 1440 {
-        // End at midnight: that's 00:00 tomorrow.
-        (now.date_naive() + chrono::Duration::days(1), 0, 0)
-    } else {
-        (now.date_naive(), end_minute / 60, end_minute % 60)
-    };
-    let naive = date.and_hms_opt(h, m, 0).expect("validated h/m");
-    let end_local = Local
-        .from_local_datetime(&naive)
-        .single()
-        .unwrap_or_else(|| *now + chrono::Duration::minutes(s.duration_minutes as i64));
-    end_local.timestamp().max(0) as u64
+/// True if `t` falls inside one of the schedule's windows.
+#[cfg(test)]
+fn schedule_active_at<Tz: TimeZone>(s: &Schedule, t: &DateTime<Tz>) -> bool {
+    window_end_unix_at(s, t).is_some()
+}
+
+/// The unix-time end of the window instance of `s` containing `t`, or None
+/// when `t` is in none of its windows. Keyed off the instance's start DATE,
+/// so a spanning window reports the same instant before and after midnight
+/// — the `skipped_fires` marker and a fired block's remaining length agree
+/// across the boundary.
+///
+/// The end is the LATER of two readings, so a block never runs shorter than
+/// configured on either DST night: the window's wall-clock end, and its
+/// wall-clock start plus its length, each resolved by
+/// `local_instant_at_or_after`. On a fall-back night the wall end wins: a
+/// window ending in the repeated hour ends at the later of its two
+/// instants, an hour longer. On a spring-forward night start-plus-length
+/// wins whenever the skipped hour is inside the window — whether the window
+/// ENDS in it (the wall end resolves an hour on, and the two readings
+/// agree) or straddles it (the wall end exists, but comes an hour early in
+/// real time) — and the window keeps its real length. One side effect:
+/// "00:00 for 24 h" opened on the spring-forward day ends at 01:00 the next
+/// day, an hour into its next instance, which fires when it ends
+/// (`reconcile` keeps one active per block). A window that STARTS in the
+/// skipped hour fires when the clock reaches it, at the end of the gap; its
+/// start resolves an hour on like an end would, so from that late fire it
+/// runs its full length and up to an hour more.
+fn window_end_unix_at<Tz: TimeZone>(s: &Schedule, t: &DateTime<Tz>) -> Option<u64> {
+    let start_date = window_start_date_at(s, t)?;
+    let tz = t.timezone();
+    let start = s.start_minute as u32;
+    let end = start + s.duration_minutes as u32;
+    let start_naive = start_date
+        .and_hms_opt(start / 60, start % 60, 0)
+        .expect("validated h/m");
+    // `end / 1440` is 0 while the window ends within its start day and 1
+    // once it ends at or past the following midnight — an end of exactly
+    // 1440 is 00:00 of the next day, not 24:00 of this one.
+    let end_date = start_date + chrono::Duration::days((end / 1440) as i64);
+    let end_naive = end_date
+        .and_hms_opt((end % 1440) / 60, end % 60, 0)
+        .expect("validated h/m");
+    let by_wall = local_instant_at_or_after(&tz, end_naive).timestamp();
+    let by_length = local_instant_at_or_after(&tz, start_naive).timestamp()
+        + i64::from(s.duration_minutes) * 60;
+    Some(by_wall.max(by_length).max(0) as u64)
+}
+
+/// The instant at which `tz` reads `naive` on its wall clock, resolved for
+/// the two nights a year it is not one-to-one. On a fall-back night the
+/// wall time happens twice: the LATER instant, so a window ending in the
+/// repeated hour runs longer rather than shorter. On a spring-forward night
+/// the wall time never happens: step an hour at a time until one does, so
+/// a window ending in the skipped hour keeps its configured real length
+/// instead of losing the hour. DST gaps are one hour; a zone's one-off
+/// offset change can be wider, up to the whole day a move across the date
+/// line skips, so the steps go on for 25 hours. No real zone skips more
+/// than that, which makes the fallback after them — the wall time read as
+/// UTC, off by the zone's offset — unreachable in practice; it is there so
+/// the tick can neither loop unbounded nor panic should zone data say
+/// otherwise.
+fn local_instant_at_or_after<Tz: TimeZone>(tz: &Tz, naive: NaiveDateTime) -> DateTime<Tz> {
+    for hours in 0..=25 {
+        match tz.from_local_datetime(&(naive + chrono::Duration::hours(hours))) {
+            LocalResult::Single(t) => return t,
+            LocalResult::Ambiguous(_, later) => return later,
+            LocalResult::None => continue,
+        }
+    }
+    tz.from_utc_datetime(&naive)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grepfocus_core::{AllowancePolicy, Block, BreakRecord, LockMode, DAY_MON};
+    use grepfocus_core::{
+        AllowancePolicy, Block, BreakRecord, LockMode, DAYS_ALL, DAY_MON, DAY_SAT, DAY_TUE,
+    };
 
     fn s(start: u16, dur: u16, days: u8) -> Schedule {
         Schedule {
@@ -696,6 +775,189 @@ mod tests {
     fn wrong_weekday() {
         let sch = s(540, 60, DAY_MON);
         assert!(!schedule_active_at(&sch, &t(9, 30, chrono::Weekday::Tue)));
+    }
+
+    // ── windows past midnight ───────────────────────────────────────────────
+
+    #[test]
+    fn wrap_active_before_midnight_on_start_day() {
+        let sch = s(23 * 60, 120, DAY_MON); // Mon 23:00 → Tue 01:00
+        let mon = t(23, 30, chrono::Weekday::Mon);
+        assert!(schedule_active_at(&sch, &mon));
+        assert_eq!(window_start_date_at(&sch, &mon), Some(mon.date_naive()));
+        assert!(!schedule_active_at(&sch, &t(22, 59, chrono::Weekday::Mon)));
+        // Tuesday night is no instance of a Monday window.
+        assert!(!schedule_active_at(&sch, &t(23, 30, chrono::Weekday::Tue)));
+    }
+
+    #[test]
+    fn wrap_active_after_midnight_only_if_start_day_selected() {
+        let sch = s(23 * 60, 120, DAY_MON);
+        let tue = t(0, 30, chrono::Weekday::Tue);
+        assert!(schedule_active_at(&sch, &tue));
+        // The instance belongs to the day it started on.
+        assert_eq!(
+            window_start_date_at(&sch, &tue),
+            Some(t(0, 0, chrono::Weekday::Mon).date_naive())
+        );
+        // Half-open: 01:00 is out.
+        assert!(!schedule_active_at(&sch, &t(1, 0, chrono::Weekday::Tue)));
+        // Monday 00:30 would be the tail of a SUNDAY window, not selected.
+        assert!(!schedule_active_at(&sch, &t(0, 30, chrono::Weekday::Mon)));
+        // Selecting Tuesday instead moves the whole window: Tue 00:30 is
+        // then nobody's tail, Wed 00:30 is.
+        let tue_only = s(23 * 60, 120, DAY_TUE);
+        assert!(!schedule_active_at(&tue_only, &tue));
+        assert!(schedule_active_at(
+            &tue_only,
+            &t(0, 30, chrono::Weekday::Wed)
+        ));
+    }
+
+    #[test]
+    fn wrap_end_is_same_instant_before_and_after_midnight() {
+        let sch = s(23 * 60, 120, DAY_MON);
+        let end = unix(&t(1, 0, chrono::Weekday::Tue));
+        assert_eq!(
+            window_end_unix_at(&sch, &t(23, 30, chrono::Weekday::Mon)),
+            Some(end)
+        );
+        assert_eq!(
+            window_end_unix_at(&sch, &t(0, 30, chrono::Weekday::Tue)),
+            Some(end)
+        );
+    }
+
+    #[test]
+    fn full_day_window_boundary_is_half_open() {
+        // 09:00 for 24 h, daily: Tuesday 08:59 is the tail of Monday's
+        // instance, Tuesday 09:00 the head of Tuesday's — never both, so one
+        // block runs continuously, re-fired once a day at the seam.
+        let sch = s(540, 1440, DAYS_ALL);
+        let mon = t(0, 0, chrono::Weekday::Mon).date_naive();
+        let tue = t(0, 0, chrono::Weekday::Tue).date_naive();
+        assert_eq!(
+            window_start_date_at(&sch, &t(9, 0, chrono::Weekday::Mon)),
+            Some(mon)
+        );
+        assert_eq!(
+            window_start_date_at(&sch, &t(23, 59, chrono::Weekday::Mon)),
+            Some(mon)
+        );
+        assert_eq!(
+            window_start_date_at(&sch, &t(0, 0, chrono::Weekday::Tue)),
+            Some(mon)
+        );
+        assert_eq!(
+            window_start_date_at(&sch, &t(8, 59, chrono::Weekday::Tue)),
+            Some(mon)
+        );
+        assert_eq!(
+            window_start_date_at(&sch, &t(9, 0, chrono::Weekday::Tue)),
+            Some(tue)
+        );
+        // The end follows the instance: Monday's ends as Tuesday's begins.
+        let seam = unix(&t(9, 0, chrono::Weekday::Tue));
+        assert_eq!(
+            window_end_unix_at(&sch, &t(8, 59, chrono::Weekday::Tue)),
+            Some(seam)
+        );
+        assert_eq!(
+            window_end_unix_at(&sch, &t(9, 0, chrono::Weekday::Tue)),
+            Some(unix(&t(9, 0, chrono::Weekday::Wed)))
+        );
+        // Monday only: Tuesday 08:59 is still in, 09:00 out.
+        let mon_only = s(540, 1440, DAY_MON);
+        assert!(schedule_active_at(
+            &mon_only,
+            &t(8, 59, chrono::Weekday::Tue)
+        ));
+        assert!(!schedule_active_at(
+            &mon_only,
+            &t(9, 0, chrono::Weekday::Tue)
+        ));
+    }
+
+    #[test]
+    fn end_at_1440_is_next_day_midnight() {
+        // A window ending exactly at 24:00 does not spill over: 00:00 on
+        // Tuesday is outside it, and its end instant is that midnight.
+        let sch = s(23 * 60, 60, DAY_MON);
+        let midnight = unix(&t(0, 0, chrono::Weekday::Tue));
+        assert_eq!(
+            window_end_unix_at(&sch, &t(23, 30, chrono::Weekday::Mon)),
+            Some(midnight)
+        );
+        assert_eq!(
+            window_end_unix_at(&sch, &t(0, 0, chrono::Weekday::Tue)),
+            None
+        );
+        assert_eq!(
+            window_start_date_at(&sch, &t(0, 0, chrono::Weekday::Tue)),
+            None
+        );
+    }
+
+    /// A wall-clock instant in Europe/Amsterdam, which springs forward on
+    /// 2026-03-29 (02:00 → 03:00) and falls back on 2026-10-25 (03:00 →
+    /// 02:00), both Sundays — the two nights the DST tests use. Takes an
+    /// existing, unambiguous wall time.
+    fn ams(y: i32, mo: u32, d: u32, h: u32, m: u32) -> DateTime<chrono_tz::Tz> {
+        chrono_tz::Europe::Amsterdam
+            .with_ymd_and_hms(y, mo, d, h, m, 0)
+            .single()
+            .expect("an existing, unambiguous wall time")
+    }
+
+    #[test]
+    fn dst_gap_end_keeps_real_duration() {
+        // Saturday 23:00 for 3.5 h would end at 02:30 on Sunday 2026-03-29,
+        // a wall time Amsterdam skips. The window keeps its real length —
+        // 3.5 h after it opened is 03:30 CEST — instead of losing the hour.
+        let sch = s(23 * 60, 210, DAY_SAT);
+        let opened = ams(2026, 3, 28, 23, 0);
+        let now = ams(2026, 3, 28, 23, 30);
+        let end = window_end_unix_at(&sch, &now).expect("in window");
+        assert_eq!(end, opened.timestamp() as u64 + 210 * 60);
+        assert_eq!(end, ams(2026, 3, 29, 3, 30).timestamp() as u64);
+        // The same instant from the far side of midnight, before the jump.
+        let later = ams(2026, 3, 29, 1, 59);
+        assert_eq!(window_end_unix_at(&sch, &later), Some(end));
+    }
+
+    #[test]
+    fn dst_gap_straddling_window_keeps_real_duration() {
+        // Saturday 23:00 for 4 h ends at 03:00 on Sunday 2026-03-29 — a
+        // wall time that EXISTS, the first after the jump, so the wall end
+        // alone would come an hour short in real time: the skipped hour is
+        // inside the window rather than at its end. The window still keeps
+        // its real length — 4 h after it opened is 04:00 CEST.
+        let sch = s(23 * 60, 240, DAY_SAT);
+        let opened = ams(2026, 3, 28, 23, 0);
+        let now = ams(2026, 3, 28, 23, 30);
+        let end = window_end_unix_at(&sch, &now).expect("in window");
+        assert_eq!(end, opened.timestamp() as u64 + 240 * 60);
+        assert_eq!(end, ams(2026, 3, 29, 4, 0).timestamp() as u64);
+        // The same instant from the far side of midnight, before the jump.
+        let later = ams(2026, 3, 29, 1, 59);
+        assert_eq!(window_end_unix_at(&sch, &later), Some(end));
+    }
+
+    #[test]
+    fn dst_overlap_end_prefers_later_instant() {
+        // Saturday 23:00 for 3.5 h ends at 02:30 on Sunday 2026-10-25, a
+        // wall time Amsterdam shows twice. The later reading wins: the block
+        // runs 4.5 real hours, never shorter than configured.
+        let sch = s(23 * 60, 210, DAY_SAT);
+        let opened = ams(2026, 10, 24, 23, 0);
+        let now = ams(2026, 10, 24, 23, 30);
+        let end = window_end_unix_at(&sch, &now).expect("in window");
+        let later = chrono_tz::Europe::Amsterdam
+            .with_ymd_and_hms(2026, 10, 25, 2, 30, 0)
+            .latest()
+            .unwrap();
+        assert_eq!(end, later.timestamp() as u64);
+        assert_eq!(end, opened.timestamp() as u64 + 270 * 60);
     }
 
     // ── reconcile() ─────────────────────────────────────────────────────────
@@ -1646,6 +1908,86 @@ mod tests {
         assert!(st.active.is_empty());
         assert_eq!(st.stats.sessions.len(), 1);
         assert_eq!(st.stats.sessions[0].duration_secs, 1_800);
+    }
+
+    #[test]
+    fn wrap_window_fires_and_expires_across_midnight_in_reconcile() {
+        let fire_l = t(23, 30, chrono::Weekday::Mon);
+        let fire = unix(&fire_l);
+        let mut st = State::default();
+        st.blocks.push(block(0));
+        st.schedules.push(s(23 * 60, 120, DAY_MON));
+        let mut skipped = HashSet::new();
+        assert!(reconcile(
+            &mut st,
+            fire,
+            &fire_l,
+            day_of(&fire_l),
+            &all_gates(),
+            &mut skipped
+        ));
+        assert_eq!(st.active.len(), 1);
+        // 90 minutes of the window remain at 23:30: it ends 01:00 Tuesday.
+        assert_eq!(st.active[0].ends_at_unix, fire + 5_400);
+        // Past midnight the same instance is still running: no re-fire, no
+        // expiry, nothing recorded.
+        let later_l = fire_l + chrono::Duration::seconds(3_600);
+        assert!(!reconcile(
+            &mut st,
+            fire + 3_600,
+            &later_l,
+            day_of(&later_l),
+            &all_gates(),
+            &mut skipped
+        ));
+        assert_eq!(st.active.len(), 1);
+        assert_eq!(st.active[0].ends_at_unix, fire + 5_400);
+        assert!(st.stats.sessions.is_empty());
+        // At 01:00 it expires as one session of the window's remaining
+        // length, and the closed (half-open) window does not fire again.
+        let end_l = fire_l + chrono::Duration::seconds(5_400);
+        assert!(reconcile(
+            &mut st,
+            fire + 5_400,
+            &end_l,
+            day_of(&end_l),
+            &all_gates(),
+            &mut skipped
+        ));
+        assert!(st.active.is_empty());
+        assert_eq!(st.stats.sessions.len(), 1);
+        assert_eq!(st.stats.sessions[0].duration_secs, 5_400);
+    }
+
+    #[test]
+    fn wrap_skipped_fire_is_logged_once_across_midnight() {
+        // Unlicensed: the skip marker is keyed by the window's end, which
+        // must read the same on both sides of midnight or the skip would be
+        // logged a second time at 00:00.
+        let mut st = State::default();
+        st.blocks.push(block(0));
+        st.schedules.push(s(23 * 60, 120, DAY_MON));
+        let mut skipped = HashSet::new();
+        for now_l in [
+            t(23, 30, chrono::Weekday::Mon),
+            t(0, 30, chrono::Weekday::Tue),
+        ] {
+            reconcile(
+                &mut st,
+                unix(&now_l),
+                &now_l,
+                day_of(&now_l),
+                &free_gates(),
+                &mut skipped,
+            );
+        }
+        assert!(st.active.is_empty());
+        // Exactly one marker, keyed by the schedule and the one end instant
+        // both ticks computed: Tuesday 01:00.
+        assert_eq!(
+            skipped,
+            HashSet::from([(1, unix(&t(1, 0, chrono::Weekday::Tue)))])
+        );
     }
 
     // ── apply_attempts() ────────────────────────────────────────────────────

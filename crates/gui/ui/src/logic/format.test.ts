@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fmtClock, fmtDuration, fmtMinute, fmtPhaseRemaining, fmtRemaining, fmtWindow } from "./format";
+import { fmtClock, fmtDuration, fmtMinute, fmtPhaseRemaining, fmtRemaining, fmtWindow, fmtWindowRange } from "./format";
 
 describe("fmtMinute", () => {
   it.each([
@@ -9,6 +9,19 @@ describe("fmtMinute", () => {
     [1440, "24:00"],
   ])("%i minutes since midnight is %s", (m, text) => {
     expect(fmtMinute(m)).toBe(text);
+  });
+});
+
+describe("fmtWindowRange", () => {
+  it.each([
+    [540, 60, "09:00–10:00"],
+    [1380, 60, "23:00–24:00"],
+    [0, 1440, "00:00–24:00"],
+    [1380, 120, "23:00–01:00 (+1 day)"],
+    [1439, 2, "23:59–00:01 (+1 day)"],
+    [540, 1440, "09:00–09:00 (+1 day)"],
+  ])("a window at %i for %i min reads as %s", (start, duration, text) => {
+    expect(fmtWindowRange(start, duration)).toBe(text);
   });
 });
 

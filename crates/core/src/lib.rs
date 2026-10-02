@@ -655,8 +655,10 @@ pub struct Schedule {
     pub days: u8,
     /// Minute of the day (local time) when the window opens, 0..1440.
     pub start_minute: u16,
-    /// Window duration in minutes. Must satisfy `start_minute + duration <= 1440`.
-    /// Schedules that would span midnight should be split into two schedules.
+    /// Window duration in minutes, 1..=1440. The window may run past
+    /// midnight (`start_minute + duration > 1440`). A window belongs to the
+    /// weekday of its START: "Monday 23:00 for 2 h" is in progress at 00:30
+    /// on Tuesday when Monday is selected, whatever Tuesday's bit says.
     pub duration_minutes: u16,
     pub enabled: bool,
 }

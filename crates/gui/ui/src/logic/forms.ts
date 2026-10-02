@@ -81,3 +81,29 @@ export function blockFromFields(get: FormField, id: number): Block {
 export function blockFormError(b: Block): string | null {
   return b.name ? null : "name is required";
 }
+
+/// The schedule dialog's fields as the wire wants them: the checked day
+/// values (0 = Sunday … 6 = Saturday) folded into the bitmask, "HH:MM" as
+/// minutes since midnight, and hours — fractional allowed, "0.25" is a
+/// quarter hour — as whole minutes. A field that does not parse reads as 0,
+/// never NaN (which JSON would put on the wire as null); the daemon
+/// validates the rest.
+export function scheduleFields(
+  days: number[],
+  startTime: string,
+  durationHours: string,
+): { days: number; start_minute: number; duration_minutes: number } {
+  const [hh, mm] = startTime.split(":").map((n) => parseInt(n, 10));
+  const hours = Number(durationHours);
+  return {
+    days: days.reduce((mask, d) => mask | (1 << d), 0),
+    start_minute: (hh || 0) * 60 + (mm || 0),
+    duration_minutes: Number.isFinite(hours) ? Math.round(hours * 60) : 0,
+  };
+}
+
+/// `scheduleFields`' inverse for the duration box: minutes → hours, to two
+/// decimals ("1.5", "0.25"), a whole number of hours bare ("24").
+export function durationHoursField(minutes: number): string {
+  return String(Math.round((minutes / 60) * 100) / 100);
+}

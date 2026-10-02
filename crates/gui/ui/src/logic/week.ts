@@ -29,14 +29,49 @@ export const WEEK_PALETTE: { fill: string; text: string }[] = [
   { fill: "#e4f0b8", text: "#35400a" },
 ];
 
-/// A schedule window placed in its day column: the minutes it spans
-/// (`start` inclusive, `end` exclusive) and `lane`, its slot among the
-/// column's overlapping windows, 0-based from the left.
-export interface PlacedWindow {
-  schedule: Schedule;
+/// One piece of a schedule window inside a day column: the minutes of that
+/// day it spans (`start` inclusive, `end` exclusive) and whether it is the
+/// continuation of a window that began the day before (`cont`).
+export interface WindowSegment {
   start: number;
   end: number;
+  cont: boolean;
+}
+
+/// A window segment placed in its day column, with `lane`, its slot among
+/// the column's overlapping segments, 0-based from the left.
+export interface PlacedWindow extends WindowSegment {
+  schedule: Schedule;
   lane: number;
+}
+
+/// The pieces of `s` that fall in weekday `bit`'s column. A window belongs
+/// to the weekday it STARTS on: its same-day part `[start, min(end, 1440))`
+/// shows when `bit` is selected, and the part past midnight `[0, end − 1440)`
+/// shows in the NEXT day's column — here when the PREVIOUS weekday,
+/// `(bit + 6) % 7`, is selected. Mirrors the daemon's `window_start_date_at`.
+/// A window ending exactly at 1440 has no continuation.
+export function windowSegments(s: Schedule, bit: number): WindowSegment[] {
+  const end = s.start_minute + s.duration_minutes;
+  const out: WindowSegment[] = [];
+  if ((s.days & (1 << bit)) !== 0) out.push({ start: s.start_minute, end: Math.min(end, 1440), cont: false });
+  if (end > 1440 && (s.days & (1 << ((bit + 6) % 7))) !== 0) out.push({ start: 0, end: end - 1440, cont: true });
+  return out;
+}
+
+/// A segment's text in the grid: `label` (the block and the range the
+/// caller chose for it), arrowed when the segment continues a window from
+/// the day before, "(off)" when the schedule is disabled.
+export function segmentLabel(seg: WindowSegment, label: string, enabled: boolean): string {
+  return `${seg.cont ? "↳ " : ""}${label}${enabled ? "" : " (off)"}`;
+}
+
+/// A segment's tooltip: the block, the day — named as where it continues
+/// from for a continuation — and the window's whole range ("23:00–01:00
+/// (+1 day)" says it continues), "(disabled)" when the schedule is off.
+export function segmentTitle(name: string, bit: number, seg: WindowSegment, wholeRange: string, enabled: boolean): string {
+  const where = seg.cont ? `continues from ${DAY_LABEL[(bit + 6) % 7]}` : DAY_LABEL[bit];
+  return `${name} · ${where} · ${wholeRange}${enabled ? "" : " (disabled)"}`;
 }
 
 /// One day column's windows, earliest first, and how many lanes split its
@@ -73,16 +108,15 @@ export function assignLanes<T extends { start: number; end: number }>(
   return { lanes, laneCount: Math.max(1, laneEnds.length) };
 }
 
-/// One day column: every schedule firing on weekday `bit` (0 = Sunday … 6 =
-/// Saturday, the wire bitmask) as the window it spans, laned by `assignLanes`.
+/// One day column: every segment (`windowSegments`) of every schedule that
+/// falls on weekday `bit` (0 = Sunday … 6 = Saturday, the wire bitmask),
+/// laned by `assignLanes`. A continuation from the previous day lanes like
+/// any other segment, so it never hides behind an early window of its own
+/// day.
 export function layoutDay(schedules: Schedule[], bit: number): DayLayout {
-  const todays = schedules
-    .filter((s) => (s.days & (1 << bit)) !== 0)
-    .map((schedule) => ({
-      schedule,
-      start: schedule.start_minute,
-      end: schedule.start_minute + schedule.duration_minutes,
-    }));
-  const { lanes, laneCount } = assignLanes(todays);
+  const segments = schedules.flatMap((schedule) =>
+    windowSegments(schedule, bit).map((segment) => ({ schedule, ...segment })),
+  );
+  const { lanes, laneCount } = assignLanes(segments);
   return { windows: lanes, laneCount };
 }

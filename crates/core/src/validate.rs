@@ -396,10 +396,13 @@ pub fn validate_block(block: &mut Block) -> Result<(), String> {
 /// text. Does not check that `block_id` exists — that is the daemon's state
 /// to consult.
 ///
-/// A window must end by 24:00. The scheduler's window functions end every
-/// window at midnight, so letting one run past it (a 24-hour length cap
-/// instead) lands together with those functions in the schedule-integrity
-/// package — never here first.
+/// A window may run past midnight — "23:00 for 2 h" ends at 01:00 the next
+/// day — and lasts at most 24 hours. The cap is what keeps the scheduler
+/// simple: with `duration <= 1440`, `end - 1440 <= start`, so the part of a
+/// window that spills past midnight ends (half-open) no later than the same
+/// schedule's next same-day window begins. At most one instance of a
+/// schedule is ever live, and the scheduler's one-active-per-block check
+/// needs no notion of instances.
 pub fn validate_schedule(s: &Schedule) -> Result<(), String> {
     if s.name.trim().is_empty() {
         return Err("schedule name cannot be empty".into());
@@ -424,8 +427,8 @@ pub fn validate_schedule(s: &Schedule) -> Result<(), String> {
     if s.duration_minutes == 0 {
         return Err("duration_minutes must be >= 1".into());
     }
-    if s.start_minute as u32 + s.duration_minutes as u32 > 1440 {
-        return Err("schedule cannot span midnight; split into two schedules instead".into());
+    if s.duration_minutes > 1440 {
+        return Err("a window can last at most 24 hours".into());
     }
     Ok(())
 }
@@ -940,21 +943,19 @@ mod tests {
         }
     }
 
-    // A window must end by 24:00 — the rule the daemon has always applied,
-    // byte for byte. Ending exactly at midnight is fine; one minute past is
-    // not. Relaxing this to a 24-hour length cap belongs to the
-    // schedule-integrity package, with the scheduler changes that make a
-    // spanning window actually run.
+    // Only the LENGTH is capped, at 24 hours; where a window ends is free,
+    // so crossing midnight is fine and so is a full day from any start. The
+    // refusal is the text the dialog shows, byte for byte.
     #[test]
-    fn validate_schedule_refuses_midnight_span() {
+    fn validate_schedule_accepts_midnight_span_and_caps_at_24h() {
         assert_eq!(validate_schedule(&sched(23 * 60, 60, DAYS_ALL)), Ok(()));
+        assert_eq!(validate_schedule(&sched(23 * 60, 61, DAYS_ALL)), Ok(()));
+        assert_eq!(validate_schedule(&sched(1439, 2, DAYS_ALL)), Ok(()));
         assert_eq!(validate_schedule(&sched(0, 1440, DAYS_ALL)), Ok(()));
-        assert_eq!(validate_schedule(&sched(1439, 1, DAYS_ALL)), Ok(()));
-        let midnight: Result<(), String> =
-            Err("schedule cannot span midnight; split into two schedules instead".into());
-        assert_eq!(validate_schedule(&sched(23 * 60, 61, DAYS_ALL)), midnight);
-        assert_eq!(validate_schedule(&sched(1439, 2, DAYS_ALL)), midnight);
-        assert_eq!(validate_schedule(&sched(0, 1441, DAYS_ALL)), midnight);
+        assert_eq!(validate_schedule(&sched(540, 1440, DAYS_ALL)), Ok(()));
+        let too_long: Result<(), String> = Err("a window can last at most 24 hours".into());
+        assert_eq!(validate_schedule(&sched(0, 1441, DAYS_ALL)), too_long);
+        assert_eq!(validate_schedule(&sched(23 * 60, 1441, DAYS_ALL)), too_long);
     }
 
     #[test]

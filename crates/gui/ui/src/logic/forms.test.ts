@@ -5,9 +5,11 @@ import {
   type FormField,
   blockFormError,
   blockFromFields,
+  durationHoursField,
   parseAppLines,
   parseDomains,
   policyFromFields,
+  scheduleFields,
 } from "./forms";
 
 /// A form holding exactly these controls; any other name reads as absent.
@@ -205,5 +207,35 @@ describe("blockFormError", () => {
 
   it("a named block passes; everything else is the daemon's call", () => {
     expect(blockFormError(blockFromFields(fields({ name: "Games" }), 0))).toBeNull();
+  });
+});
+
+describe("scheduleFields", () => {
+  it("reads HH:MM as minutes since midnight and hours as minutes", () => {
+    expect(scheduleFields([1], "23:00", "2")).toEqual({ days: 1 << 1, start_minute: 1380, duration_minutes: 120 });
+  });
+
+  it("takes fractional hours and the 24 h maximum", () => {
+    expect(scheduleFields([1], "09:00", "0.25").duration_minutes).toBe(15);
+    expect(scheduleFields([1], "09:00", "24").duration_minutes).toBe(1440);
+  });
+
+  it("folds the checked day values into the Sunday-first bitmask", () => {
+    expect(scheduleFields([1, 2, 0], "09:00", "1").days).toBe(0b111);
+    expect(scheduleFields([], "09:00", "1").days).toBe(0);
+  });
+
+  it("a field that does not parse reads as 0, never NaN", () => {
+    expect(scheduleFields([1], "", "")).toEqual({ days: 2, start_minute: 0, duration_minutes: 0 });
+    expect(scheduleFields([1], "x:y", "abc")).toEqual({ days: 2, start_minute: 0, duration_minutes: 0 });
+  });
+});
+
+describe("durationHoursField", () => {
+  it("inverts scheduleFields' minutes: whole hours bare, fractions to two decimals", () => {
+    expect(durationHoursField(1440)).toBe("24");
+    expect(durationHoursField(90)).toBe("1.5");
+    expect(durationHoursField(15)).toBe("0.25");
+    expect(scheduleFields([1], "00:00", durationHoursField(90)).duration_minutes).toBe(90);
   });
 });
