@@ -65,6 +65,9 @@ label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
    label above. Used by the settings preferences toggles. */
 label.checkbox-row { display: flex; align-items: center; gap: 8px; }
 label.checkbox-row > input[type="checkbox"] { width: auto; margin: 0; }
+/* A sub-switch sits indented under its master and fades with it off. */
+label.checkbox-row.sub { padding-left: 24px; }
+label.checkbox-row.disabled { opacity: 0.5; cursor: not-allowed; }
 #prefs { margin: 12px 0 20px; display: grid; gap: 6px; }
 input, textarea, select {
   font-family: inherit;
@@ -483,6 +486,27 @@ button.danger:disabled { opacity: 0.5; cursor: not-allowed; }
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
 }
+
+/* "Most attempted": one compact row per host, the derived "other" row muted. */
+.attempt-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 4px; }
+.attempt-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.attempt-row:last-child { border-bottom: none; }
+.attempt-row.other .attempt-host { color: var(--muted); font-style: italic; }
+.attempt-host { font-size: 14px; overflow-wrap: anywhere; }
+.attempt-count {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.stats-section > .hint { margin: 8px 0 0; }
 
 /* ─── Pomodoro tab ───────────────────────────────────────────────────────── */
 

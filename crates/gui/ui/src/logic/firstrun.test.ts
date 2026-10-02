@@ -24,7 +24,7 @@ function status(over: Partial<Status> = {}): Status {
     license_expires_at: null,
     licensed_features: [],
     pomodoro: null,
-    settings: { notifications: true, instant_breaks: true },
+    settings: { notifications: true, instant_breaks: true, attempt_nudges: false },
     instant_breaks_degraded: false,
     health: {
       daemon_version: "0.6.0",
@@ -40,6 +40,7 @@ function status(over: Partial<Status> = {}): Status {
       last_error: null,
       last_error_unix: null,
     },
+    recent_events: [],
     update: { kind: "up_to_date" },
     ...over,
   };

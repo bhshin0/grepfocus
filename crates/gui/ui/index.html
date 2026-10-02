@@ -134,7 +134,14 @@
         <div id="prefs">
           <label class="checkbox-row">
             <input type="checkbox" id="notifications-toggle" />
-            Desktop notifications (block start and end)
+            Desktop notifications (blocks, breaks, pomodoro, closed apps)
+          </label>
+          <!-- Sub-switch of the master above (daemon Settings.attempt_nudges,
+               off by default). refreshSettings disables the row while the
+               master is off but keeps its stored value showing. -->
+          <label class="checkbox-row sub" id="attempt-nudges-row">
+            <input type="checkbox" id="attempt-nudges-toggle" />
+            Also nudge when a blocked site is attempted (names the site; at most once per site every 15 minutes; needs Instant breaks on)
           </label>
           <label class="checkbox-row">
             <input type="checkbox" id="instant-breaks-toggle" />

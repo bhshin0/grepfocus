@@ -50,9 +50,10 @@ function status(over: Partial<Status> = {}, h: Partial<Health> = {}): Status {
     license_expires_at: null,
     licensed_features: [],
     pomodoro: null,
-    settings: { notifications: true, instant_breaks: true },
+    settings: { notifications: true, instant_breaks: true, attempt_nudges: false },
     instant_breaks_degraded: false,
     health: health(h),
+    recent_events: [],
     update: { kind: "up_to_date" },
     ...over,
   };
@@ -270,7 +271,7 @@ describe("healthNotices", () => {
         text: "Instant breaks unavailable — port 80 or 443 is in use, so breaks may take up to a minute to show in an already-open tab. Blocking is unaffected.",
       },
     ]);
-    const off = status({ settings: { notifications: true, instant_breaks: false } }, { proxy: "degraded" });
+    const off = status({ settings: { notifications: true, instant_breaks: false, attempt_nudges: false } }, { proxy: "degraded" });
     expect(healthNotices(off)).toEqual([]);
   });
 

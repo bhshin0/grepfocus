@@ -13,6 +13,7 @@ import type {
   UpdateInfo,
   UsageStats,
 } from "./types";
+import { attemptRows, blockedTimesText, CAP_HINT_TEXT, NO_ATTEMPTS_TEXT, nudgeToggle, timesText } from "./logic/attempts";
 import { type FirstRunMode, serviceRemovalOffered, serviceRemovalRefusal, unreachableMode } from "./logic/firstrun";
 import { fmtClock, fmtDuration, fmtMinute, fmtPhaseRemaining, fmtRemaining, fmtWindow } from "./logic/format";
 import { CMDLINE_PREFIX, type FormField, blockFormError, blockFromFields } from "./logic/forms";
@@ -671,10 +672,14 @@ function renderActive(s: Status) {
       : a.originator.kind === "schedule"
         ? ` <span class="origin">(scheduled)</span>`
         : "";
+    // "blocked N times" only while the proxy holds ports 80 and 443 — that
+    // is the only time the daemon can count, so a degraded or off proxy shows
+    // nothing rather than a misleading zero (`blockedTimesText`).
+    const blocked = blockedTimesText(a.attempts, s.health.proxy);
     div.innerHTML = `
       <h3>Blocking: <span class="name"></span>${origin}</h3>
       <div class="countdown">--:--:--</div>
-      <div class="meta-line">${a.block.domains.length} domain(s), ${a.block.apps.length} app(s)</div>
+      <div class="meta-line">${a.block.domains.length} domain(s), ${a.block.apps.length} app(s)${blocked ? ` · ${blocked}` : ""}</div>
     `;
     div.querySelector<HTMLSpanElement>(".name")!.textContent = a.block.name;
 
@@ -1347,6 +1352,8 @@ const oldPwLabel = document.querySelector<HTMLLabelElement>("#old-pw-label")!;
 const pwSubmit = document.querySelector<HTMLButtonElement>("#password-submit")!;
 const pwClear = document.querySelector<HTMLButtonElement>("#password-clear")!;
 const notificationsToggle = document.querySelector<HTMLInputElement>("#notifications-toggle")!;
+const attemptNudgesToggle = document.querySelector<HTMLInputElement>("#attempt-nudges-toggle")!;
+const attemptNudgesRow = document.querySelector<HTMLLabelElement>("#attempt-nudges-row")!;
 const instantBreaksToggle = document.querySelector<HTMLInputElement>("#instant-breaks-toggle")!;
 const instantBreaksNote = document.querySelector<HTMLParagraphElement>("#instant-breaks-note")!;
 const prefsMsg = document.querySelector<HTMLParagraphElement>("#prefs-msg")!;
@@ -1433,6 +1440,14 @@ async function refreshSettings() {
     // change event, so this can never re-trigger the write path below.
     notificationsToggle.checked = s.settings.notifications;
     instantBreaksToggle.checked = s.settings.instant_breaks;
+    // The attempt-nudges row follows the notifications master: with it off
+    // the row is disabled but keeps showing the stored value, which
+    // `applySettings` keeps sending, so the preference survives a master
+    // off/on round trip.
+    const nudge = nudgeToggle(s.settings);
+    attemptNudgesToggle.checked = nudge.checked;
+    attemptNudgesToggle.disabled = !nudge.enabled;
+    attemptNudgesRow.classList.toggle("disabled", !nudge.enabled);
     // Only meaningful when the feature is on AND the daemon reports it degraded
     // (a port is taken). Otherwise the row is silent.
     if (s.settings.instant_breaks && s.instant_breaks_degraded) {
@@ -1519,10 +1534,12 @@ pwClear.addEventListener("click", async () => {
 // toggle uses. The daemon gates SetSettings behind the settings lock, so a
 // cancelled unlock (or a refusal) puts the checkbox back to its prior value.
 //
-// `set_settings` replaces the whole Settings object, so every write sends BOTH
-// fields read from the live checkbox states — sending only the toggled one
-// would reset the other to its server-side default. `toggle` is the input that
-// changed, so a refusal reverts exactly that one.
+// `set_settings` replaces the whole Settings object, so every write sends ALL
+// three fields read from the live checkbox states — sending only the toggled
+// one would reset the others to their server-side defaults. `toggle` is the
+// input that changed, so a refusal reverts exactly that one. The attempt-nudges
+// box is read even while disabled (master off): that is the stored value, and
+// sending it is what preserves it.
 async function applySettings(toggle: HTMLInputElement, okMsg: string) {
   prefsMsg.classList.remove("error");
   prefsMsg.textContent = "";
@@ -1536,6 +1553,7 @@ async function applySettings(toggle: HTMLInputElement, okMsg: string) {
       settings: {
         notifications: notificationsToggle.checked,
         instant_breaks: instantBreaksToggle.checked,
+        attempt_nudges: attemptNudgesToggle.checked,
       },
     });
     prefsMsg.textContent = okMsg;
@@ -1550,6 +1568,10 @@ async function applySettings(toggle: HTMLInputElement, okMsg: string) {
 
 notificationsToggle.addEventListener("change", () =>
   applySettings(notificationsToggle, notificationsToggle.checked ? "notifications on" : "notifications off"),
+);
+
+attemptNudgesToggle.addEventListener("change", () =>
+  applySettings(attemptNudgesToggle, attemptNudgesToggle.checked ? "attempt nudges on" : "attempt nudges off"),
 );
 
 instantBreaksToggle.addEventListener("change", () =>
@@ -1764,6 +1786,9 @@ function emptyDiv(text: string): HTMLDivElement {
 
 function renderStats(stats: UsageStats) {
   statsEl.innerHTML = "";
+  // One local date for the whole render: the chart's day labels and the
+  // attempts window must agree on what "today" is.
+  const today = todayFromCe();
 
   // Headline tiles.
   const tiles = document.createElement("div");
@@ -1778,6 +1803,8 @@ function renderStats(stats: UsageStats) {
     statTile("Sessions completed", String(stats.totals.sessions)),
     statTile("Apps blocked", String(stats.totals.app_kills)),
     statTile("Temptations resisted", String(stats.totals.breaks_refused)),
+    // Lifetime refused connections; an old daemon omits the field.
+    statTile("Sites blocked", String(stats.totals.attempts ?? 0)),
   );
   statsEl.appendChild(tiles);
 
@@ -1790,7 +1817,6 @@ function renderStats(stats: UsageStats) {
   if (stats.days.length === 0) {
     chartWrap.appendChild(emptyDiv("No focus sessions recorded yet."));
   } else {
-    const today = todayFromCe();
     const maxSecs = Math.max(...stats.days.map((d) => d.focus_secs), 1);
     const chart = document.createElement("div");
     chart.className = "day-bars";
@@ -1809,6 +1835,44 @@ function renderStats(stats: UsageStats) {
     chartWrap.appendChild(chart);
   }
   statsEl.appendChild(chartWrap);
+
+  // Most attempted hosts over the 30-day detail window, plus the remainder
+  // no host accounts for. The rows, the empty state and the cap hint all
+  // come from logic/attempts.ts, which cuts the window the way the daemon
+  // does — a row older than 30 days keeps only its total, and summing it
+  // here would show up as a phantom "other". This is only the DOM writer.
+  const attWrap = document.createElement("div");
+  attWrap.className = "stats-section";
+  const attHead = document.createElement("h3");
+  attHead.textContent = "Most attempted, last 30 days";
+  attWrap.appendChild(attHead);
+  const { rows, capHint } = attemptRows(stats.days, 10, today);
+  if (rows.length === 0) {
+    attWrap.appendChild(emptyDiv(NO_ATTEMPTS_TEXT));
+  } else {
+    const ul = document.createElement("ul");
+    ul.className = "attempt-list";
+    for (const r of rows) {
+      const li = document.createElement("li");
+      li.className = `attempt-row${r.other ? " other" : ""}`;
+      const h = document.createElement("span");
+      h.className = "attempt-host";
+      h.textContent = r.label;
+      const c = document.createElement("span");
+      c.className = "attempt-count";
+      c.textContent = timesText(r.count);
+      li.append(h, c);
+      ul.appendChild(li);
+    }
+    attWrap.appendChild(ul);
+    if (capHint) {
+      const hint = document.createElement("p");
+      hint.className = "hint";
+      hint.textContent = CAP_HINT_TEXT;
+      attWrap.appendChild(hint);
+    }
+  }
+  statsEl.appendChild(attWrap);
 
   // Recent sessions, newest first (the stored ring is oldest-last).
   const sessWrap = document.createElement("div");

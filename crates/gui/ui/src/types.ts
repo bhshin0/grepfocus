@@ -76,6 +76,11 @@ export interface ActiveBlock {
   /// (editable) saved config. This is the one the daemon enforces, so it is
   /// the one the break UI must branch on.
   lock: LockMode;
+  /// Refused-connection attempts against this block's entries during THIS
+  /// run (reset on activation). Counted only while the instant-breaks proxy
+  /// holds ports 80 and 443, so the card shows it only under
+  /// `health.proxy === "holding"`. Absent from an old daemon.
+  attempts?: number;
 }
 
 /// Mirrors core's `PomodoroPhase` (snake_case on the wire): which half of the
@@ -101,6 +106,13 @@ export interface Settings {
   /// Instant breaks: run the loopback proxy so a break takes effect at once
   /// even in a tab that is already open. Defaults ON server-side.
   instant_breaks: boolean;
+  /// Desktop nudge when a blocked site is attempted — a sub-switch of
+  /// `notifications`. Defaults OFF server-side. The GUI's Rust side
+  /// deserializes `Settings` through core, whose container-level
+  /// `#[serde(default)]` fills a field an old daemon omits, so this always
+  /// arrives as a bool (false for such a daemon); `nudgeToggle` still reads
+  /// it as `=== true` so a bare object cannot tick the box.
+  attempt_nudges: boolean;
 }
 
 // ─── Health (mirrors core's wire types, snake_case on the wire) ─────────────
@@ -218,9 +230,31 @@ export interface Status {
   instant_breaks_degraded: boolean;
   /// Enforcement health and daemon identity — see `Health`.
   health: Health;
+  /// The daemon's recent enforcement events, oldest first; empty from an old
+  /// daemon. The Rust status watcher (src/notify.rs) turns these into desktop
+  /// notifications off its own poll — this side never decides notifications
+  /// from them, it only mirrors the shape.
+  recent_events: RecentEvent[];
   /// GUI/daemon version skew advice, computed by the Rust side on every poll
   /// — see `UpdateAdvice`.
   update: UpdateAdvice;
+}
+
+/// Mirrors core's `EventKind` (snake_case on the wire). A tag this build does
+/// not know folds to `"unknown"` in core; say nothing for it.
+export type EventKind = "attempt" | "app_kill" | "unknown";
+
+/// Mirrors core's `RecentEvent`: one enforcement event on `Status`.
+export interface RecentEvent {
+  /// Monotonic per daemon run, starting at 1; the dedup key. A value below
+  /// the last one seen means the daemon restarted.
+  seq: number;
+  unix: number;
+  kind: EventKind;
+  block_id: number;
+  /// `attempt`: the blocklist entry (canonical hostname). `app_kill`: the
+  /// matched app entry's label. Capped at 64 chars by the daemon.
+  detail: string;
 }
 
 /// Mirrors `version::UpdateAdvice` in src/version.rs: what the GUI/daemon
@@ -285,6 +319,8 @@ export interface LifetimeTotals {
   sessions: number;
   app_kills: number;
   breaks_refused: number;
+  /// Refused-connection attempts, lifetime. Absent from an old daemon.
+  attempts?: number;
 }
 
 /// Mirrors core's `Origin` (snake_case on the wire).
@@ -309,6 +345,15 @@ export interface DayStat {
   break_secs: number;
   breaks_refused: number;
   app_kills: number;
+  /// Refused-connection attempts per blocklist entry. Mirrors core's
+  /// `DayStat.attempts` with its two caveats: at most 50 entries per day,
+  /// FIRST COME (not the top 50 — past the cap a new entry moves only
+  /// `attempts_total`), and the map is cleared on rows more than 30 days
+  /// before today while the total survives. Both are handled in
+  /// logic/attempts.ts; never derive "other" from this directly. Absent from
+  /// an old daemon.
+  attempts?: Record<string, number>;
+  attempts_total?: number;
 }
 
 export interface UsageStats {
