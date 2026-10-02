@@ -1,5 +1,6 @@
-//! Reconciles `state.active` against (a) wall-clock expiry and (b) recurring
-//! `state.schedules`. Runs once per second.
+//! Reconciles `state.active` against (a) expiry on the daemon's trusted
+//! block clock (`clock`) and (b) recurring `state.schedules`. Runs once per
+//! second.
 //!
 //! Three jobs per tick, performed under a single state lock:
 //! 1. Drop any active blocks whose `ends_at_unix <= now`. This is the ONLY
@@ -27,13 +28,12 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike};
 use grepfocus_core::license::features;
 use grepfocus_core::validate::normalize_domain;
 use grepfocus_core::{
-    day_set, now_unix, prune_breaks, ActiveBlock, EventKind, FocusSession, Origin, Originator,
-    PomodoroPhase, PomodoroSession, Schedule, State, UsageStats, BREAKS_CAP,
-    MAX_ALLOWANCE_WINDOW_SECS,
+    day_set, prune_breaks, ActiveBlock, EventKind, FocusSession, Origin, Originator, PomodoroPhase,
+    PomodoroSession, Schedule, State, UsageStats, BREAKS_CAP, MAX_ALLOWANCE_WINDOW_SECS,
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{enforce, events, has_feature, state, Daemon};
+use crate::{clock, enforce, events, has_feature, state, Daemon};
 
 const TICK: Duration = Duration::from_secs(1);
 
@@ -82,22 +82,49 @@ async fn tick(
     skipped_fires: &mut HashSet<(u64, u64)>,
     last_attempt_save_unix: &mut u64,
 ) {
-    let now_unix = now_unix();
+    // Both clocks in one breath, before the lock: the block clock advances
+    // on them below. Schedules fire by LOCAL WALL time by design — stepping
+    // the clock to make a window open is not a bypass, since the block it
+    // starts then runs the window's remaining length on the block clock —
+    // so `now_local` stays the wall clock, as does the high-water mark.
+    let readings = clock::read();
+    let wall_unix = readings.wall_unix;
     let now_local = Local::now();
     let today = now_local.date_naive().num_days_from_ce() as i64;
 
     {
         let mut st = daemon.state.lock().await;
-        // Track the highest time ever observed (clock-rollback guard for
-        // license expiry — see `crate::effective_now`). Deliberately bumped
-        // in-memory only: an fsync every second is unacceptable disk churn,
-        // so the mark persists opportunistically whenever anything else
-        // saves. Accepted trade-off: after a crash the stored mark lags by
-        // however long the state went unsaved, so a rollback attacker gains
-        // at most that window.
-        if now_unix > st.high_water_unix {
-            st.high_water_unix = now_unix;
+        // Track the highest WALL time ever observed (clock-rollback guard
+        // for license expiry — see `crate::effective_now`). Deliberately
+        // bumped in-memory only: an fsync every second is unacceptable disk
+        // churn, so the mark persists opportunistically whenever anything
+        // else saves. Accepted trade-off: after a crash the stored mark lags
+        // by however long the state went unsaved, so a rollback attacker
+        // gains at most that window.
+        if wall_unix > st.high_water_unix {
+            st.high_water_unix = wall_unix;
         }
+        // Advance the trusted block clock and take this tick's `now` from
+        // it: every expiry, break and phase decision below is in that frame
+        // (see `clock`). A step is reported once, on the tick that sees it.
+        // The leaf lock is taken and released in this block with `state`
+        // held — the `health`/`forwardable` exception to the lock order.
+        let now_unix = {
+            let idle = st.active.is_empty() && st.pomodoro.is_none();
+            let mut block_clock = daemon.clock();
+            match block_clock.advance(readings, idle) {
+                clock::Step::Tracked => {}
+                clock::Step::Jumped { secs } if idle => info!(
+                    step_secs = secs,
+                    "clock step detected while idle; block clock resynced to the wall clock"
+                ),
+                clock::Step::Jumped { secs } => warn!(
+                    step_secs = secs,
+                    "clock step of {secs:+} s detected; block timing continues on elapsed time"
+                ),
+            }
+            block_clock.now_at(readings)
+        };
         // Fold any app kills procwatch counted since the last tick into today's
         // rollup. An in-memory bump like the high-water mark above, drained to
         // zero here whether or not we save this tick — but unlike the mark it
@@ -154,6 +181,10 @@ async fn tick(
             advance_pomodoro(pomodoro, active, now_unix)
         };
         let reconciled = reconcile(&mut st, now_unix, &now_local, today, &gates, skipped_fires);
+        // Where the block clock stands, so a restart within this boot resumes
+        // it (`clock::BlockClock::resume`). Updated in memory every tick and
+        // persisted by whichever save comes next, like `high_water_unix`.
+        st.clock_anchor = Some(daemon.clock().anchor(&daemon.boot_id));
         if pomo_changed || reconciled || attempt_save {
             match state::save(&st, &daemon.key) {
                 // The marker moves only on a save that was due for a credit
@@ -275,10 +306,12 @@ fn advance_pomodoro(
     }
 }
 
-/// Bring `st.active` into agreement with wall-clock expiry and the schedule
-/// table, and prune unreachable break history. Pure over its inputs (no
-/// clock, no IO) so it can be unit-tested. Returns whether anything changed and
-/// the state therefore needs persisting.
+/// Bring `st.active` into agreement with expiry and the schedule table, and
+/// prune unreachable break history. `now_unix` is the trusted block clock's
+/// reading for this tick (`clock`), `now_local` the local wall time the
+/// schedule windows are defined in. Pure over its inputs (no clock, no IO)
+/// so it can be unit-tested. Returns whether anything changed and the state
+/// therefore needs persisting.
 ///
 /// Steps, in order:
 /// 1. Drop actives whose `ends_at_unix <= now_unix`. The schedule table is
@@ -291,8 +324,15 @@ fn advance_pomodoro(
 /// 2. Start any enabled schedule currently in-window and not already active —
 ///    unless `gates.schedules` is off, in which case the fire is skipped (and
 ///    logged once per window via `skipped_fires`). New actives snapshot
-///    `gates.app_blocking` into `apps_enforced` and the window end into
-///    `ends_at_unix`.
+///    `gates.app_blocking` into `apps_enforced` and, into `ends_at_unix`,
+///    the window's remaining length added to `now_unix`: the end is in the
+///    block clock's frame like every other end step 1 judges, NOT the wall
+///    instant the window closes at. The frames diverge whenever the block
+///    clock is ahead of a wall clock that was set back (during a running
+///    block, or across a reboot with a persisted active); a wall-instant end
+///    already behind `now_unix` would be born expired, dropped by step 1 on
+///    the next tick as a one-second session, and fired again — a save, a
+///    hosts rewrite and two log lines every second for the whole window.
 /// 3. Clear breaks that have elapsed (enforcement resumes).
 ///
 /// It also prunes break-history records no allowance policy can still see
@@ -321,7 +361,7 @@ fn reconcile(
     // `ActiveBlock` persists in `State` and is still active on reload, so
     // nothing is dropped here.
 
-    // 1. Expire by wall clock.
+    // 1. Expire on the block clock.
     let before = st.active.len();
     let (kept, ended) = partition_active(std::mem::take(&mut st.active), |a| {
         a.ends_at_unix > now_unix
@@ -338,9 +378,14 @@ fn reconcile(
 
     // 2. Auto-start schedules whose window is now open.
     //
-    // Drop skip-log markers for windows that have passed first, so the set
-    // can't grow across weeks of unlicensed uptime.
-    skipped_fires.retain(|&(_, window_end)| window_end > now_unix);
+    // The wall clock, in the frame the windows and the skip markers' ends
+    // are defined in. Drop skip-log markers for windows that have passed
+    // first, so the set can't grow across weeks of unlicensed uptime —
+    // judged in that frame: pruned against `now_unix` instead, a block clock
+    // ahead of the wall clock would drop a live window's marker every tick
+    // and re-log the skip every second.
+    let wall_now = now_local.timestamp().max(0) as u64;
+    skipped_fires.retain(|&(_, window_end)| window_end > wall_now);
     for s in &schedules {
         if !s.enabled || !schedule_active_at(s, now_local) {
             continue;
@@ -380,7 +425,16 @@ fn reconcile(
                 continue;
             }
         };
-        let ends_at_unix = compute_window_end_unix(s, now_local);
+        // The window's remaining length by the wall clock, applied to the
+        // block clock: see the doc comment's step 2 for why not the wall
+        // instant itself. Zero cannot happen while `schedule_active_at`
+        // holds (the minute-of-day check leaves at least a second), but a
+        // zero-length active would be born expired, so never push one.
+        let remaining = compute_window_end_unix(s, now_local).saturating_sub(wall_now);
+        if remaining == 0 {
+            continue;
+        }
+        let ends_at_unix = now_unix + remaining;
         st.active.push(ActiveBlock {
             // Snapshotted at activation from the saved block, like
             // apps_enforced below: a mid-block edit or license change must
@@ -1507,6 +1561,91 @@ mod tests {
             &mut skipped,
         );
         assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn skipped_fire_markers_are_pruned_by_the_wall_clock_not_the_block_clock() {
+        // 09:30 Monday by the wall clock, with the block clock two hours
+        // ahead (a backward step during a running block). A marker for a
+        // window that is still open by the wall clock — 10:00 — must survive
+        // the tick: pruned against the block clock it would be dropped and
+        // the skip re-logged every second. The schedule it names no longer
+        // exists, so nothing could re-insert it.
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let wall = unix(&now_l);
+        let now = wall + 7_200;
+        let mut st = State::default();
+        let window_end = wall + 1_800; // 10:00, still ahead by the wall clock
+        let mut skipped: HashSet<(u64, u64)> = [(7, window_end)].into_iter().collect();
+        reconcile(
+            &mut st,
+            now,
+            &now_l,
+            day_of(&now_l),
+            &free_gates(),
+            &mut skipped,
+        );
+        assert_eq!(skipped.len(), 1);
+    }
+
+    #[test]
+    fn schedule_fire_ends_in_the_block_clock_frame() {
+        // The block clock sits two hours ahead of the wall clock: a backward
+        // `date -s` during a block that is still running, or a clock rolled
+        // back across a reboot with a persisted active. The 09:00–10:00
+        // window opens by wall time; the block it starts must end thirty
+        // minutes of block-clock time later. A wall-instant end (10:00) is
+        // already in the past in the block clock's frame: the active would
+        // be born expired, dropped on the next tick as a one-second session
+        // and fired again, every second until the window closed.
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let wall = unix(&now_l);
+        let now = wall + 7_200;
+        let mut st = State::default();
+        st.blocks.push(block(0));
+        st.schedules.push(s(540, 60, DAY_MON));
+        let mut skipped = HashSet::new();
+        let changed = reconcile(
+            &mut st,
+            now,
+            &now_l,
+            day_of(&now_l),
+            &all_gates(),
+            &mut skipped,
+        );
+        assert!(changed);
+        assert_eq!(st.active.len(), 1);
+        assert_eq!(st.active[0].started_at_unix, now);
+        assert_eq!(st.active[0].ends_at_unix, now + 1_800);
+        // Next tick: the block is still running — nothing expired, nothing
+        // re-fired, no session recorded.
+        let next_l = now_l + chrono::Duration::seconds(1);
+        let changed = reconcile(
+            &mut st,
+            now + 1,
+            &next_l,
+            day_of(&next_l),
+            &all_gates(),
+            &mut skipped,
+        );
+        assert!(!changed);
+        assert_eq!(st.active.len(), 1);
+        assert_eq!(st.active[0].ends_at_unix, now + 1_800);
+        assert!(st.stats.sessions.is_empty());
+        // And it ends when the block clock reaches that end, as one session
+        // of the window's remaining length.
+        let changed = reconcile(
+            &mut st,
+            now + 1_800,
+            &(now_l + chrono::Duration::seconds(1_800)),
+            day_of(&now_l),
+            &all_gates(),
+            &mut skipped,
+        );
+        assert!(changed);
+        assert!(st.active.is_empty());
+        assert_eq!(st.stats.sessions.len(), 1);
+        assert_eq!(st.stats.sessions[0].duration_secs, 1_800);
     }
 
     // ── apply_attempts() ────────────────────────────────────────────────────

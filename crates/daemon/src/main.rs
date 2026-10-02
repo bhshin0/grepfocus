@@ -19,6 +19,7 @@ mod attempts;
 mod auth;
 mod browser_policy;
 mod cleanup;
+mod clock;
 mod dns;
 mod enforce;
 mod events;
@@ -33,7 +34,7 @@ mod scheduler;
 mod state;
 
 use grepfocus_core::license::LicenseClaims;
-use grepfocus_core::{now_unix, State};
+use grepfocus_core::{now_unix, ActiveBlock, State};
 
 /// Runtime context shared across all daemon tasks.
 pub struct Daemon {
@@ -113,6 +114,18 @@ pub struct Daemon {
     /// holds `state` and procwatch while it holds nothing. Go through
     /// `Daemon::events()`.
     pub events: std::sync::Mutex<events::Log>,
+    /// The trusted block clock (see `clock`): the time base for every
+    /// block-timing decision, advanced once per scheduler tick and read
+    /// through `Daemon::now()`. A leaf `std::sync::Mutex` like `health`,
+    /// held for microseconds and never across an await, so the scheduler
+    /// advances it with `state` held and `GetStatus` reads it the same way;
+    /// `Arc` because the proxy's observe hook captures a clone to stamp
+    /// attempts in the same frame. Go through `Daemon::clock()`.
+    pub clock: Arc<std::sync::Mutex<clock::BlockClock>>,
+    /// The kernel's `boot_id`, read once at startup (it cannot change within
+    /// a boot): what `resume` matched the persisted anchor against, and what
+    /// every anchor the scheduler writes carries. Empty when unreadable.
+    pub boot_id: String,
 }
 
 impl Daemon {
@@ -131,6 +144,29 @@ impl Daemon {
     pub fn events(&self) -> std::sync::MutexGuard<'_, events::Log> {
         self.events.lock().unwrap_or_else(|p| p.into_inner())
     }
+
+    /// The block-clock leaf lock, poison recovered as for `health`.
+    pub fn clock(&self) -> std::sync::MutexGuard<'_, clock::BlockClock> {
+        self.clock.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// "Now" on the trusted block clock — what every block-timing decision
+    /// reads instead of the wall clock: block, break and pomodoro ends, the
+    /// settings unlock window, the status frame's `now_unix` (so the GUI's
+    /// countdowns follow this frame too), attempt and kill event stamps.
+    /// License expiry stays on `effective_now` and `browser_policy` on the
+    /// wall clock by design.
+    pub fn now(&self) -> u64 {
+        clock::now_in(&self.clock)
+    }
+}
+
+/// Drop the active blocks whose end has passed on the block clock (`now`),
+/// returning how many. Pure; what `run_daemon` does at startup.
+fn drop_expired_active(active: &mut Vec<ActiveBlock>, now: u64) -> usize {
+    let before = active.len();
+    active.retain(|a| a.ends_at_unix > now);
+    before - active.len()
 }
 
 /// Wall-clock "now" (unix seconds) for license checks, clamped so a rewound
@@ -254,9 +290,9 @@ async fn run_daemon() -> anyhow::Result<()> {
     // Advance the clock-rollback high-water mark once at startup; the
     // scheduler tick keeps it moving from here. If the stored mark is ahead
     // of the system clock (rolled back while we were down), keep the mark.
-    let now = now_unix();
-    if now > initial.high_water_unix {
-        initial.high_water_unix = now;
+    let wall_now = now_unix();
+    if wall_now > initial.high_water_unix {
+        initial.high_water_unix = wall_now;
     }
 
     // Verify any stored license token. Failure is never fatal and never
@@ -289,11 +325,32 @@ async fn run_daemon() -> anyhow::Result<()> {
         warn!(note = %n, "sanitized stored block content");
     }
 
+    // Rebuild the trusted block clock before anything judges expiry by it.
+    // An anchor from this boot resumes the previous run's time base exactly
+    // (a clock stepped while we were down cannot shorten a persisted block);
+    // otherwise the clock seeds from the wall clock, no earlier than the
+    // high-water mark bumped above.
+    let readings = clock::read();
+    let boot_id = clock::boot_id();
+    let (block_clock, restored) = clock::BlockClock::resume(
+        initial.clock_anchor.as_ref(),
+        &boot_id,
+        readings,
+        initial.high_water_unix,
+    );
+    let now = block_clock.now_at(readings);
+    if restored {
+        info!(
+            trusted_unix = now,
+            wall_unix = readings.wall_unix,
+            "clock anchor restored"
+        );
+    }
+
     // Drop any active blocks that have already expired between shutdown and
-    // startup. (They will simply never be re-applied.)
-    let before = initial.active.len();
-    initial.active.retain(|a| a.ends_at_unix > now);
-    let dropped = before - initial.active.len();
+    // startup, judged on the block clock. (They will simply never be
+    // re-applied.)
+    let dropped = drop_expired_active(&mut initial.active, now);
     if dropped > 0 {
         info!(dropped, "discarded expired active blocks on startup");
     }
@@ -335,6 +392,8 @@ async fn run_daemon() -> anyhow::Result<()> {
         app_kills_pending: std::sync::atomic::AtomicU64::new(0),
         health: std::sync::Mutex::new(health::HealthState::new(daemon_exe, install_kind, notes)),
         events: std::sync::Mutex::new(events::Log::default()),
+        clock: Arc::new(std::sync::Mutex::new(block_clock)),
+        boot_id,
     });
 
     // Catch SIGTERM — what systemd sends on `stop` and on an upgrade — from
@@ -469,6 +528,62 @@ mod tests {
         for key in features::ALL {
             assert!(has_feature(Some(&c), &st_at_hw(), key), "key {key}");
         }
+    }
+
+    // ── startup: expired-active retain on the resumed clock ────────────────
+
+    use grepfocus_core::{Block, ClockAnchor, LockMode, Originator};
+
+    fn active_ending(id: u64, ends_at_unix: u64) -> ActiveBlock {
+        ActiveBlock {
+            block: Block {
+                id,
+                name: format!("block-{id}"),
+                domains: vec!["example.com".into()],
+                apps: vec![],
+                allowance_secs_per_day: 0,
+                allowance: None,
+                lock: LockMode::Unlocked,
+            },
+            started_at_unix: 0,
+            ends_at_unix,
+            originator: Originator::Manual,
+            break_until_unix: None,
+            apps_enforced: false,
+            lock: LockMode::Unlocked,
+            allowance: None,
+            attempts: 0,
+        }
+    }
+
+    #[test]
+    fn expired_active_retain_uses_the_resumed_clock() {
+        // The daemon restarts in the same boot after the clock was stepped
+        // back: the wall clock reads 1000, the resumed block clock 5010 (the
+        // anchor's 5000 plus 10 s of BOOTTIME). A block due at 5005 is over;
+        // one due at 5011 is not — judged on the wall clock, both would have
+        // been kept and the first enforced for four thousand seconds more.
+        let anchor = ClockAnchor {
+            trusted_unix: 5_000,
+            boot_secs: 50,
+            boot_id: "this-boot".into(),
+            absorbed_secs: 0,
+        };
+        let readings = clock::Readings {
+            wall_unix: 1_000,
+            boot_secs: 60,
+        };
+        let (c, restored) = clock::BlockClock::resume(Some(&anchor), "this-boot", readings, 0);
+        assert!(restored);
+        let now = c.now_at(readings);
+        assert_eq!(now, 5_010);
+
+        let mut active = vec![active_ending(1, 5_005), active_ending(2, 5_011)];
+        assert_eq!(drop_expired_active(&mut active, now), 1);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].block.id, 2);
+        // Nothing to drop is a clean zero, not an underflow.
+        assert_eq!(drop_expired_active(&mut active, now), 0);
     }
 
     #[test]

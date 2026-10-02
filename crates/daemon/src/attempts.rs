@@ -65,11 +65,13 @@ impl Buffer {
     /// distinct host it is ever given.
     ///
     /// The window is `abs_diff`, not a subtraction, for the same reason as
-    /// `enforce::needs_probe`: `now` is the wall clock, and after a backward
-    /// step the stored stamp sits in the future. A one-sided check would then
-    /// suppress the host for the whole magnitude of the step; a divergence of
-    /// a window in either direction counts again and re-stamps, so a stepped
-    /// clock self-corrects within one window.
+    /// `enforce::needs_probe`: `now` is the daemon's block clock, which never
+    /// runs backward while a block runs but resyncs down to a wall clock that
+    /// was set back once the daemon is idle — a stamp taken before that sits
+    /// in the future. A one-sided check would then suppress the host for the
+    /// whole magnitude of the step; a divergence of a window in either
+    /// direction counts again and re-stamps, so a stepped clock self-corrects
+    /// within one window.
     pub fn record(&mut self, host: String, now: u64) -> bool {
         if self
             .last

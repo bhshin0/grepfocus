@@ -193,7 +193,7 @@ pub enum Originator {
     /// Driven by a pomodoro session (see [`PomodoroSession`]). Behaves like
     /// `Manual` for reconcile — it is not schedule-window-driven, so it is
     /// retained across ticks and ends only by its own `ends_at_unix` (the
-    /// set's wall-clock backstop) or an explicit `stop_pomodoro`.
+    /// set's backstop on the block clock) or an explicit `stop_pomodoro`.
     Pomodoro,
 }
 
@@ -202,10 +202,13 @@ pub enum Originator {
 pub struct ActiveBlock {
     pub block: Block,
     pub started_at_unix: u64,
-    /// When the block ends — the ONLY way it does. For a `Schedule`
-    /// originator this is the end of the window that fired it, snapshotted
-    /// at activation like `lock` and `allowance` below: disabling, editing or
-    /// deleting the schedule afterwards never moves it.
+    /// When the block ends — the ONLY way it does — on the daemon's trusted
+    /// block clock, whatever the originator. For a `Schedule` originator it
+    /// is that clock's reading at the fire plus the window's remaining
+    /// length, snapshotted at activation like `lock` and `allowance` below:
+    /// disabling, editing or deleting the schedule afterwards never moves
+    /// it. It is NOT the wall-clock instant the window ends at: the two
+    /// frames diverge whenever the system clock was stepped during a block.
     pub ends_at_unix: u64,
     #[serde(default = "default_originator")]
     pub originator: Originator,
@@ -1273,6 +1276,9 @@ pub struct RecentEvent {
 ///
 /// `boot_id` is `/proc/sys/kernel/random/boot_id`: after a reboot the anchor
 /// is stale by construction and the daemon seeds from the wall clock again.
+///
+/// Container-level `serde(default)`: an anchor written before a field
+/// existed loads with that field's default, never as a parse error.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClockAnchor {
@@ -1280,6 +1286,12 @@ pub struct ClockAnchor {
     /// `CLOCK_BOOTTIME` seconds at the moment `trusted_unix` was taken.
     pub boot_secs: u64,
     pub boot_id: String,
+    /// The wall-vs-BOOTTIME drift the clock had absorbed into `trusted_unix`
+    /// in its current busy stretch (the daemon clamps it to its tolerance on
+    /// resume). Carried so a same-boot restart cannot hand the budget back:
+    /// without it, "step the clock by the tolerance, save, restart" in a
+    /// loop would gain the tolerance on every lap.
+    pub absorbed_secs: i64,
 }
 
 /// Daemon-side persisted state.
@@ -1608,6 +1620,12 @@ pub enum Response {
     },
     Status {
         active: Vec<ActiveBlock>,
+        /// The daemon's "now" for block timing, unix seconds. This is its
+        /// trusted block clock, not the raw wall clock: while anything runs
+        /// it advances on elapsed time only, so a stepped system clock never
+        /// shortens a block. Every `*_unix` in this frame (block, break and
+        /// phase ends, event stamps) is in the same time base; the GUI
+        /// measures its countdown skew against this field, not its own clock.
         now_unix: u64,
         /// Whether a settings password is configured.
         #[serde(default)]
@@ -3794,6 +3812,7 @@ mod tests {
                 trusted_unix: 1752192000,
                 boot_secs: 3600,
                 boot_id: "0f7e5e9a-2b1c-4d3e-8f90-1a2b3c4d5e6f".into(),
+                absorbed_secs: -2,
             }),
             ..Default::default()
         };
@@ -3804,17 +3823,30 @@ mod tests {
             ),
             "got {json}"
         );
+        assert!(json.contains(r#""absorbed_secs":-2"#), "got {json}");
         let back: State = serde_json::from_str(&json).unwrap();
         assert_eq!(back.clock_anchor, st.clock_anchor);
         // A partial object fills from the default (a later build may add a
-        // field; an older one may omit it) — never a parse error.
+        // field; an older one may omit it) — never a parse error. The
+        // three-field form is exactly what a daemon from before
+        // `absorbed_secs` wrote: it loads with no drift absorbed.
+        let partial: ClockAnchor =
+            serde_json::from_str(r#"{"trusted_unix": 5, "boot_secs": 1, "boot_id": "b"}"#).unwrap();
+        assert_eq!(
+            partial,
+            ClockAnchor {
+                trusted_unix: 5,
+                boot_secs: 1,
+                boot_id: "b".into(),
+                absorbed_secs: 0,
+            }
+        );
         let partial: ClockAnchor = serde_json::from_str(r#"{"trusted_unix": 5}"#).unwrap();
         assert_eq!(
             partial,
             ClockAnchor {
                 trusted_unix: 5,
-                boot_secs: 0,
-                boot_id: String::new()
+                ..Default::default()
             }
         );
         let st: State =

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use grepfocus_core::validate::{matcher_text, normalize_matcher};
-use grepfocus_core::{now_unix, ActiveBlock, AppMatcher, EventKind};
+use grepfocus_core::{ActiveBlock, AppMatcher, EventKind};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use procfs::process::{all_processes, StatFlags};
@@ -47,7 +47,7 @@ pub async fn run(daemon: Arc<Daemon>) {
                 recently_killed.clear();
                 continue;
             }
-            enforced_groups(&st.active, now_unix())
+            enforced_groups(&st.active, daemon.now())
         };
         if groups.is_empty() {
             recently_killed.clear();
@@ -73,7 +73,7 @@ pub async fn run(daemon: Arc<Daemon>) {
             daemon
                 .app_kills_pending
                 .fetch_add(new.len() as u64, Ordering::Relaxed);
-            let now = now_unix();
+            let now = daemon.now();
             let mut events = daemon.events();
             for k in &new {
                 events.push(EventKind::AppKill, k.block_id, &k.label, now);

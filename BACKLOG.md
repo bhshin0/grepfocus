@@ -378,6 +378,10 @@ them into `docs/release-notes-0.7.0.txt` as the 0.6.0 lines were.
 - Editing, disabling or deleting a schedule no longer ends a block it has
   already started: the block runs to the end of the window it fired for,
   and the change applies from the next window.
+- Changing the system clock during a block no longer shortens it: while
+  anything runs, block timing follows elapsed time (sleep included, so a
+  block still ends on time after a suspend), and a service restart keeps
+  that time base until the next reboot.
 
 ## Decisions
 

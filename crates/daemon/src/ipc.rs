@@ -10,7 +10,7 @@ use anyhow::Context;
 use grepfocus_core::license::{self, LicenseClaims};
 use grepfocus_core::validate::{schedules_equivalent, validate_block, validate_schedule};
 use grepfocus_core::{
-    compute_grant, evaluate_allowance, now_unix, validate_policy, ActiveBlock, AllowanceLedger,
+    compute_grant, evaluate_allowance, validate_policy, ActiveBlock, AllowanceLedger,
     AllowancePolicy, AllowanceStatus, AppMatcher, BreakRecord, LockMode, Originator, PomodoroPhase,
     PomodoroSession, PomodoroStatus, ProxyStatus, Request, Response, State,
 };
@@ -124,7 +124,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
 
         Request::GetStatus {} => {
             let st = daemon.state.lock().await;
-            let now = now_unix();
+            let now = daemon.now();
             let password_set = st.password_hash.is_some();
             let unlocked = !password_set || *daemon.unlocked_until.lock().await >= now;
             let today = scheduler::local_day();
@@ -391,7 +391,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                     let lic = daemon.license.lock().await;
                     has_feature(lic.as_ref(), &st, license::features::APP_BLOCKING)
                 };
-                let now = now_unix();
+                let now = daemon.now();
                 st.active.push(ActiveBlock {
                     // Snapshot the lock mode at activation, like
                     // apps_enforced: a mid-block edit or license change must
@@ -442,7 +442,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             secs,
             challenge,
         } => {
-            let now = now_unix();
+            let now = daemon.now();
             let today = scheduler::local_day();
             {
                 let mut st = daemon.state.lock().await;
@@ -712,7 +712,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 Err(e) => return err(format!("verify task failed: {e}")),
             };
             if ok {
-                *daemon.unlocked_until.lock().await = now_unix() + UNLOCK_SECS;
+                *daemon.unlocked_until.lock().await = daemon.now() + UNLOCK_SECS;
                 info!("settings unlocked");
                 Response::Ok {}
             } else {
@@ -725,7 +725,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             // work (verify old + hash new) off the state lock so the scheduler,
             // procwatch, and other IPC clients keep running during the hash.
             let snapshot = daemon.state.lock().await.password_hash.clone();
-            let unlocked = *daemon.unlocked_until.lock().await >= now_unix();
+            let unlocked = *daemon.unlocked_until.lock().await >= daemon.now();
 
             let snap_for_task = snapshot.clone();
             let task = tokio::task::spawn_blocking(move || {
@@ -770,7 +770,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             drop(st);
             // Opening an unlock window after a change lets the user keep editing
             // without an immediate re-prompt; after a clear it is harmless.
-            *daemon.unlocked_until.lock().await = now_unix() + UNLOCK_SECS;
+            *daemon.unlocked_until.lock().await = daemon.now() + UNLOCK_SECS;
             info!(cleared, "settings password updated");
             Response::Ok {}
         }
@@ -871,7 +871,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                     let lic = daemon.license.lock().await;
                     has_feature(lic.as_ref(), &st, license::features::APP_BLOCKING)
                 };
-                let now = now_unix();
+                let now = daemon.now();
                 let cycles_u64 = cycles as u64;
                 // The whole set's wall-clock length: a hard backstop on the
                 // driven block. `cycles >= 1` here (bounds validated), so
@@ -940,7 +940,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
                 // StartBlock/AddBlock).
                 let prev_pomodoro = st.pomodoro.take();
                 let prev_active = st.active.clone();
-                let now = now_unix();
+                let now = daemon.now();
                 for a in st.active.iter_mut().filter(|a| a.block.id == block_id) {
                     a.ends_at_unix = now;
                 }
@@ -984,7 +984,7 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
 /// is currently active — used to gate configuration-changing requests.
 async fn gate_config(daemon: &Arc<Daemon>, st: &State) -> Option<Response> {
     st.password_hash.as_ref()?; // no password set → nothing to gate
-    if *daemon.unlocked_until.lock().await >= now_unix() {
+    if *daemon.unlocked_until.lock().await >= daemon.now() {
         None
     } else {
         Some(err(MSG_SETTINGS_LOCKED))
@@ -1236,6 +1236,7 @@ fn record_break(breaks: &mut Vec<BreakRecord>, block_id: u64, now: u64, today: i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use grepfocus_core::now_unix;
 
     #[test]
     fn record_break_appends_rather_than_pruning() {
@@ -1419,6 +1420,11 @@ mod tests {
             app_kills_pending: std::sync::atomic::AtomicU64::new(0),
             health: std::sync::Mutex::new(crate::health::HealthState::default()),
             events: std::sync::Mutex::new(crate::events::Log::default()),
+            clock: std::sync::Arc::new(std::sync::Mutex::new(crate::clock::BlockClock::seed(
+                crate::clock::read(),
+                0,
+            ))),
+            boot_id: String::new(),
         })
     }
 

@@ -586,6 +586,19 @@ that Cold Turkey beats either.
   long as the lock screen is up, and the window stays hidden until the tray
   is back after the unlock. Launching GrepFocus again always surfaces the
   existing instance.
+- **System clock.** Setting the clock during a block never shortens it:
+  while anything runs, block timing advances on elapsed time only — sleep
+  counts, so a block still ends on time after a suspend — and the GUI's
+  countdown follows the daemon's clock, not the desktop's. A daemon restart
+  within the same boot carries that time base over unchanged, the couple of
+  seconds of clock drift it tolerates included, so restarting the daemon
+  between clock changes does not add up either. Setting the clock forward
+  only makes the block end later in real time; setting it back changes
+  nothing. The guard protects a *running* block: while nothing runs the
+  daemon follows the wall clock, so a clock set forward while idle can skip
+  an upcoming scheduled window, or open it with only its remaining length
+  (by design — schedules fire by wall time). Changing the clock across a
+  reboot is root with physical access, out of the threat model.
 - **Schedules.** Editing, disabling or deleting a schedule takes effect
   from its next window — a block the schedule already started keeps the
   end it was given when it fired. Stretching the running window makes it

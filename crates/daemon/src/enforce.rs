@@ -39,12 +39,12 @@ use std::sync::Arc;
 
 use grepfocus_core::license::features;
 use grepfocus_core::validate::normalize_domain;
-use grepfocus_core::{now_unix, ActiveBlock, HostsLockStatus, NftStatus, ProxyStatus};
+use grepfocus_core::{ActiveBlock, HostsLockStatus, NftStatus, ProxyStatus};
 use tracing::{debug, info, warn};
 
 use crate::health;
 use crate::listener::{Decide, Observe, ProxyListener};
-use crate::{dns, has_feature, hosts, nftables, Daemon};
+use crate::{clock, dns, has_feature, hosts, nftables, Daemon};
 
 /// How long a live-system verification stays fresh. While a domain block is
 /// active, a memo-hit `sync` older than this re-probes the nft table and the
@@ -114,7 +114,7 @@ impl Applied {
 /// `applied` → `listener` and nothing else can reach that mutex at all).
 pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
     let mut applied = daemon.applied.lock().await;
-    let now = now_unix();
+    let now = daemon.now();
     // `tamper_protect` (the premium chattr +i hardening) is read at apply
     // time, alongside the union it will be applied with. It is deliberately
     // NOT part of the memo: a license change alone never forces a rewrite of
@@ -272,12 +272,14 @@ pub async fn sync(daemon: &Daemon) -> anyhow::Result<()> {
 /// probes while nothing is enforced (empty union — there is nothing to
 /// verify) or while the last verification is younger than `REVERIFY_SECS`.
 ///
-/// `verified_at` comes from the wall clock, so the comparison uses
-/// `abs_diff`: a backward step after stamping would leave `verified_at` in
-/// the future, and a one-sided subtraction would suppress probing for the
-/// full magnitude of the step. Instead, any divergence ≥ `REVERIFY_SECS` in
-/// either direction triggers a probe, and the probe re-stamps `verified_at`,
-/// so a stepped clock self-corrects within one interval.
+/// `verified_at` is stamped on the daemon's block clock (`Daemon::now`),
+/// which never runs backward while a block runs but resyncs down to a wall
+/// clock that was set back once the daemon is idle, so the comparison uses
+/// `abs_diff`: a stamp taken before such a resync sits in the future, and a
+/// one-sided subtraction would suppress probing for the full magnitude of
+/// the step. Instead, any divergence ≥ `REVERIFY_SECS` in either direction
+/// triggers a probe, and the probe re-stamps `verified_at`, so a stepped
+/// clock self-corrects within one interval.
 fn needs_probe(domains: &[String], verified_at: u64, now: u64) -> bool {
     !domains.is_empty() && now.abs_diff(verified_at) >= REVERIFY_SECS
 }
@@ -408,14 +410,20 @@ async fn ensure_detection(daemon: &Daemon, want: bool) -> Detection {
         // developer's own hosts line pointed at loopback — records nothing.
         let enforced = daemon.enforced.clone();
         let attempts = daemon.attempts.clone();
+        // Stamped on the block clock, not the wall clock: the GUI judges
+        // these stamps against the status frame's `now_unix`, which is in
+        // that frame. A third leaf lock, taken after `enforced` is released
+        // and before `attempts` is taken — never nested.
+        let clock = daemon.clock.clone();
         let observe: Observe = Arc::new(move |host: &str| {
             let canonical =
                 canonical_attempt(host, &enforced.lock().unwrap_or_else(|p| p.into_inner()));
             if let Some(c) = canonical {
+                let now = clock::now_in(&clock);
                 attempts
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .record(c, now_unix());
+                    .record(c, now);
             }
         });
         let started = ProxyListener::start(decide, observe).await;
