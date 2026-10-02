@@ -21,6 +21,11 @@ When a block is active, GrepFocus:
   are "managed by your organization". Written at daemon start and re-checked
   every minute, not only during blocks; Firefox-based browsers pick it up at
   their next start, Chromium immediately.
+- **Counts and tells.** While a block runs, reaching for a blocked site is
+  counted — on the running block and, per site and per day, in the usage
+  stats — and desktop notifications cover block start and end, breaks,
+  pomodoro phases, closed apps and, if you turn it on, the site you reached
+  for (see *Desktop notifications* and *Known limits*).
 - **Survives tampering** within the bounds of what's possible on Linux (see
   *Known limits* below). The daemon auto-restarts on kill, re-applies blocks
   on reboot, and persists state with an HMAC seal so hand-edits to
@@ -195,9 +200,12 @@ and, when they differ, the Status tab says what to do.
 
 Any daemon restart — package upgrade, the AppImage update, `upgrade.sh` —
 keeps active blocks enforced (they are persisted and re-applied on start)
-but drops what lives only in memory: the settings unlock (the daemon
-relocks), a pending break challenge, and app-kill counts not yet flushed to
-the usage stats.
+and saves the usage stats on the way out, but drops what lives only in
+memory: the settings unlock (the daemon relocks), a pending break challenge,
+and the list of recent events the desktop notifications are read from
+(nothing from before the restart is announced). Only a crash or `kill -9`
+loses counts, and then at most the last minute of blocked attempts and
+closed apps.
 
 Downgrading below 0.7.0 with a schedule saved that crosses midnight: the
 older daemon loads it but enforces only the part of the window before
@@ -304,7 +312,7 @@ own — `Request` in `crates/core/src/lib.rs` is the full list):
 | `delete_block`    | `{ id: u64 }`                         | Rejected if block is currently active        |
 | `start_block`     | `{ id: u64, duration_secs: u64 }`     | Rejected if that block is already active     |
 | `cancel_block`    | —                                     | Always rejected while a block is active      |
-| `get_status`      | —                                     | Active blocks, server time, license, settings, plus `health` (daemon version, install kind, nft/hosts/proxy state, browser DoH policies, drift counters, last error) |
+| `get_status`      | —                                     | Active blocks (each with its `attempts` count for this run), server time, license, settings, `health` (daemon version, install kind, nft/hosts/proxy state, browser DoH policies, drift counters, last error) and `recent_events` (the daemon's last 32 enforcement events — a blocked attempt or a closed app — sequence-numbered per daemon run, restarting at 1 after a restart) |
 | `export_config`   | —                                     | Blocks and schedules as a plain JSON document — `schema`, `exported_at_unix`, `app_version`, `blocks`, `schedules` and nothing else: never the password, license, stats or active blocks |
 | `import_config`   | `{ doc: ConfigDoc, mode: "merge" or "replace" }` | The parsed document, not its text. Behind the settings lock; every record passes the same validation and license checks as saving before any is saved (all or nothing). Ids are reassigned and schedules remapped, a block name already in use becomes `"… (imported)"`, a schedule duplicating one earlier in the file is skipped. `replace` drops every saved block and schedule first and is refused while a block is active. Returns `{ result: "imported", blocks, schedules, renamed, skipped_schedules }` |
 
@@ -471,6 +479,45 @@ the block is not re-applied and the saved block can be edited or deleted
 from the GUI. Root processes are never killed, so the console login itself
 is safe.
 
+## Desktop notifications
+
+The app shows desktop notifications through the desktop's own notification
+service; nothing leaves the machine. They are decided by the app's status
+watcher, which reads the daemon's status every 5 seconds whether the window
+is visible or hidden in the tray, so a notice can lag the event by that
+much. What you get:
+
+- **Block started / Block ended** — a block becoming active or ending, by
+  name.
+- **Break ends in 1 min / Break over** — once per break: when a break has a
+  minute left (a break of a minute or less gets no warning) and when the
+  sites are blocked again (a pomodoro break ends with "Focus time" instead).
+- **Break time / Focus time / Pomodoro complete / Pomodoro stopped** — each
+  phase change of a pomodoro session, the end of the set (in place of
+  "Block ended") and a stop during a break.
+- **App closed** — "GrepFocus closed <entry> (<block>)", naming the app
+  entry you saved, never the process's own text; the same entry is not
+  repeated within 5 minutes, so a launcher that keeps restarting a blocked
+  app does not flood you.
+- **<site> blocked** — the attempt nudge, off by default: "3rd attempt this
+  hour · <block>", at most once per site every 15 minutes. It needs *Instant
+  breaks* on, because attempts are only seen by the instant-break proxy
+  (see *Known limits*).
+- **GrepFocus: blocking problem** — an enforcement problem newly reported on
+  the Status tab.
+
+Two switches in Settings, both daemon settings and so behind the settings
+password when one is set: *Desktop notifications (blocks, breaks, pomodoro,
+closed apps)*, the master (on by default) that covers every kind, and under
+it *Also nudge when a blocked site is attempted* (off by default), greyed
+out while the master is off but keeping its value. Nothing is replayed: an
+app started mid-block says nothing about what happened before it, turning
+the master off and on announces nothing that happened in between, and
+events older than two minutes — the app was asleep — are not shown.
+Attempt counts (which saved entries were reached for, on which day) are
+kept with the usage stats in the root-only, sealed
+`/var/lib/grepfocus/state.json` and deleted by `grepfocusd cleanup --purge`.
+
 ## Update notifications
 
 Once a day the GUI fetches `https://grepfocus.com/downloads/latest.json`
@@ -590,7 +637,7 @@ that Cold Turkey beats either.
   the tray icon needs an extension such as "AppIndicator and
   KStatusNotifierItem Support". Without one, closing the window quits the
   app — enforcement is daemon-side and unaffected; minimize instead of
-  closing to keep getting block start/end notifications. With one, closing
+  closing to keep getting desktop notifications. With one, closing
   hides to the tray; if the tray host vanishes while the window is hidden
   (the extension is turned off), the window reappears within ~10 seconds.
   Locking the screen does not count: GNOME switches extensions off for as
@@ -621,6 +668,16 @@ that Cold Turkey beats either.
   already started keeps the end it was given when it fired. Stretching the
   running window makes it fire again at the old end (two sessions in the
   usage stats).
+- **Attempt counts.** A blocked site counts as attempted only while the
+  instant-break proxy holds ports 80 and 443 (*Instant breaks* on and the
+  Settings diagnostics line saying `proxy: holding`); if another program
+  holds a port, blocking still works but nothing is counted and the running
+  block shows no count. One count per site per 10 seconds, so a page load
+  counts once but a background tab that keeps retrying counts again every
+  10 seconds, and any local program that reaches for a blocked site counts,
+  not only a browser. A `www.` name counts under the entry you saved.
+  Per-site detail covers the first 50 sites attempted each day and the
+  last 30 days; older days keep only their total.
 - **The update check fails behind a TLS-intercepting proxy.** It trusts the
   Mozilla root store bundled with the app (webpki-roots), not the system
   trust store, so a proxy that re-signs traffic with a private CA makes the

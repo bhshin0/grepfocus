@@ -1,6 +1,18 @@
 # Block page + block notifications (design note, not scheduled)
 
-Status: **design note only** — not planned into a milestone, no code.
+Status: **design note** — the notification half is built (see the dated
+note); the block page itself is not scheduled.
+
+> **2026-10-02:** option D below — "GrepFocus closed Steam" — ships in 0.7.0
+> as the "App closed" desktop notification, and the attempt signal option A
+> asked for comes from the instant-breaks proxy (`instant-breaks.md`), which
+> has pointed blocked domains at `127.0.0.1` and read the `Host:` header or
+> SNI since 0.4.0: 0.7.0 counts those attempts and offers an optional,
+> rate-limited nudge. The requirements below — an off switch, aggressive
+> coalescing, never gating enforcement — are honoured as
+> `attempts-and-event-notifications.md` records. Still unbuilt: the block
+> page (the proxy answers a plain-HTTP visit with a fixed 403 and nothing
+> more); B and C stay rejected.
 
 ## The want
 

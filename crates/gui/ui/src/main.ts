@@ -178,14 +178,15 @@ function listTabVisible(): boolean {
 
 /// True while rebuilding the list would yank the DOM out from under the
 /// user: they are typing in one of its forms, or a dialog a row opened is
-/// up over it — the schedule dialog (a row's Edit, a card's + Add schedule)
-/// or the unlock and challenge dialogs (a row's Disable or Delete goes
-/// through `ensureUnlocked`). A deferred rebuild is not lost —
-/// `listRunningKey` stays stale, so the next poll tries again.
+/// up over it — the schedule dialog (a row's Edit, a card's + Add schedule),
+/// the unlock and challenge dialogs (a row's Disable or Delete goes
+/// through `ensureUnlocked`) or the import dialog (the tab's Import…, whose
+/// outcome is written to `listMsg` beside the list). A deferred rebuild is
+/// not lost — `listRunningKey` stays stale, so the next poll tries again.
 function listInteractionBusy(): boolean {
   // Every dialog the list can open: add a new one here and it holds the
   // list still too.
-  const dialogs = [schedDialog, unlockDialog, challengeDialog];
+  const dialogs = [schedDialog, unlockDialog, challengeDialog, importDialog];
   if (dialogs.some((d) => d.open)) return true;
   const el = document.activeElement;
   return (
@@ -693,7 +694,9 @@ let breakRequestInFlight = false;
 /// nothing happen. So while either dialog is open, the list holds still.
 function statusInteractionBusy(): boolean {
   if (breakRequestInFlight) return true;
-  if (unlockDialog.open || challengeDialog.open) return true;
+  // The import dialog is modal too: while any of these is up the user is
+  // mid-interaction, and the status DOM holds still like the list does.
+  if (unlockDialog.open || challengeDialog.open || importDialog.open) return true;
   const el = document.activeElement;
   return el instanceof HTMLInputElement && statusEl.contains(el);
 }

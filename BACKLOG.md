@@ -363,19 +363,33 @@ Two things to settle at release time:
 
 ## 0.7.0 — blocks that tell you, schedules that hold, config you can carry
 
-Status: **in progress** — design and work packages in
-`docs/plans/0.7.0-plan.md`. Landed so far: the core types, the daemon's
-attempt counts and event log, the GUI notification watcher, the daemon
-half of schedule integrity (a schedule-started block keeps its snapshotted
-window end), the BOOTTIME-anchored block clock, midnight-spanning windows,
-and the GUI's "running now until" hint. Still to come: export/import, the
-plan records.
+Status: **implemented — live verification pending** (2026-10-02). Every
+package of `docs/plans/0.7.0-plan.md` landed on `0.7.0-dev`: the vitest
+harness, the core types, the daemon's attempt counts and event log, the GUI
+notification watcher with the Stats and card surfaces and the nudge toggle,
+schedule integrity (a schedule-started block keeps its snapshotted window
+end, the BOOTTIME-anchored block clock, windows past midnight), and
+export/import. The two design records —
+`docs/plans/attempts-and-event-notifications.md` and
+`docs/plans/schedule-integrity-and-config-export.md` — say what shipped,
+where it drifted from the plan, and carry the live checklists still to run
+before the release (`docs/release.md`).
 
 ### Pending release-note lines (0.7.0)
 
 Drafted as each package lands, in changelog order; the release commit turns
 them into `docs/release-notes-0.7.0.txt` as the 0.6.0 lines were.
 
+- GrepFocus now counts how often a blocked site is reached for while a
+  block is running (with Instant breaks on): the Status tab shows the count
+  on the running block, the Stats tab gains a "Sites blocked" total and a
+  "Most attempted" list for the last 30 days, and an optional nudge in
+  Settings — off by default — shows a desktop notification naming the site,
+  at most once per site every 15 minutes.
+- Desktop notifications now also tell you when a break has one minute left
+  and when it is over, when a pomodoro switches between focus and break and
+  when the set is complete or stopped, and when GrepFocus closes a blocked
+  app; the existing on/off switch in Settings covers them all.
 - A schedule window may run past midnight (22:00 for 4 h ends at 02:00 the
   next day) and last up to 24 hours; the Week grid draws the part after
   midnight in the next day's column. On DST nights a window ending in or
@@ -476,7 +490,9 @@ to be redone when the item is picked up.
   and live-verified per `docs/plans/premium-usage-stats.md`. Option A scope:
   focus history, app-block kills (PID-deduped), breaks taken/**refused**, and
   derived streaks — NOT per-domain attempt counts (unobservable without a DNS
-  proxy; rejected as disproportionate for an akrasia-only tool). `UsageStats`
+  proxy; rejected as disproportionate for an akrasia-only tool — superseded
+  2026-10-02: the instant-breaks proxy made them observable and 0.7.0 counts
+  them, `docs/plans/attempts-and-event-notifications.md`). `UsageStats`
   lives in `State` (HMAC-protected, bounded by a 200-session ring + 365-day
   retention). Recording is always on and daemon-side; only the `GetUsageStats`
   read is gated on `usage_stats`. Store copy reworded (grepfocus-web

@@ -2,6 +2,15 @@
 
 Status: **implemented, reviewed, and live-verified** (2026-07-17).
 
+> **2026-10-02:** the scope decision below — per-domain attempts are
+> unobservable — no longer holds. The instant-breaks proxy
+> (`instant-breaks.md`, since 0.4.0) refuses every connection to a blocked
+> domain at a loopback socket and so sees its hostname; 0.7.0 counts those
+> refusals per blocklist entry and per day, next to the counters this
+> milestone shipped (`attempts-and-event-notifications.md`). The store's
+> "Usage stats" row may name most-attempted sites again (grepfocus-web
+> `lib/features.ts`, outside this repo). Everything else here stands.
+
 The second of the three B2 capabilities (`lock_modes` shipped; `pomodoro`
 remains). Usage stats give the user a truthful record of their focus habit —
 what they blocked, how long they stayed focused, and how often the tool
