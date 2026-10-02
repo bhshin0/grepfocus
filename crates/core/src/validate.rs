@@ -16,6 +16,7 @@
 //!   form, no IP literals, no single labels, no wildcards, room for the
 //!   `www.` alias.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use crate::{AppMatcher, Block, Schedule, DAYS_ALL};
@@ -337,6 +338,12 @@ pub(crate) fn excerpt(s: &str) -> String {
 /// matchers in place. `Err` is the exact user-facing text and leaves the block
 /// untouched.
 ///
+/// Duplicates (after normalization) are dropped, the first occurrence kept
+/// in place, through a seen-set: linear in the entry count. A `Vec::contains`
+/// scan per entry made a full block a twelve-million-compare pass, and an
+/// import of a few hundred of them ran for seconds under the daemon's state
+/// lock.
+///
 /// Does not touch the allowance policy — `validate_policy` and `set_policy`
 /// keep their own path in the IPC handler.
 pub fn validate_block(block: &mut Block) -> Result<(), String> {
@@ -358,9 +365,10 @@ pub fn validate_block(block: &mut Block) -> Result<(), String> {
         ));
     }
     let mut domains: Vec<String> = Vec::with_capacity(block.domains.len());
+    let mut seen_domains: HashSet<String> = HashSet::with_capacity(block.domains.len());
     for raw in &block.domains {
         let d = normalize_domain(raw).map_err(|e| format!("domain {:?}: {e}", excerpt(raw)))?;
-        if !domains.contains(&d) {
+        if seen_domains.insert(d.clone()) {
             domains.push(d);
         }
     }
@@ -371,6 +379,7 @@ pub fn validate_block(block: &mut Block) -> Result<(), String> {
         ));
     }
     let mut apps: Vec<AppMatcher> = Vec::with_capacity(block.apps.len());
+    let mut seen_apps: HashSet<AppMatcher> = HashSet::with_capacity(block.apps.len());
     for m in &block.apps {
         let n = normalize_matcher(m).map_err(|e| {
             format!(
@@ -379,7 +388,7 @@ pub fn validate_block(block: &mut Block) -> Result<(), String> {
                 excerpt(matcher_text(m))
             )
         })?;
-        if !apps.contains(&n) {
+        if seen_apps.insert(n.clone()) {
             apps.push(n);
         }
     }
@@ -792,6 +801,81 @@ mod tests {
         assert_eq!(validate_block(&mut b), Ok(()));
         assert_eq!(b.domains, again.domains);
         assert_eq!(b.apps, again.apps);
+    }
+
+    // Dedupe keeps the FIRST occurrence where it was and never reorders:
+    // the hosts file and the kill list are written in the block's order,
+    // which the user sees in the editor.
+    #[test]
+    fn validate_block_dedupe_keeps_first_occurrence_order() {
+        let mut b = block(
+            "x",
+            &[
+                "c.example",
+                "A.example",
+                "b.example",
+                "c.example",
+                "a.example",
+                "d.example",
+                "B.example.",
+                "https://c.example/",
+            ],
+            vec![
+                cmd("zeta-app"),
+                base("alpha"),
+                exe("/usr/bin/beta"),
+                base("Alpha"),
+                cmd(" zeta-app "),
+                base("alpha "),
+                exe("/usr/bin/gamma"),
+                exe("/usr/bin/beta"),
+            ],
+        );
+        assert_eq!(validate_block(&mut b), Ok(()));
+        assert_eq!(
+            b.domains,
+            ["c.example", "a.example", "b.example", "d.example"]
+        );
+        assert_eq!(
+            b.apps,
+            [
+                cmd("zeta-app"),
+                base("alpha"),
+                exe("/usr/bin/beta"),
+                base("Alpha"),
+                exe("/usr/bin/gamma"),
+            ]
+        );
+    }
+
+    // The reviewer's budget for one full block: well under a second in any
+    // profile. Measured ~20 ms in a debug build with the seen-set, so the
+    // bound is a ceiling with a wide margin on a slow or loaded box, not a
+    // discriminator — the old `Vec::contains` dedupe took ~150 ms here and
+    // would pass it too. Linearity rests on the seen-set by construction;
+    // `validate_block_dedupe_keeps_first_occurrence_order` pins what it must
+    // preserve, and config_doc's `plan_import_at_the_entry_caps_fits_the_lock_budget`
+    // bounds the largest import.
+    #[test]
+    fn validate_block_full_block_validates_well_under_a_second() {
+        let mut b = block("x", &[], vec![]);
+        b.domains = (0..MAX_DOMAINS_PER_BLOCK)
+            .map(|i| format!("d{i}.example.com"))
+            .collect();
+        b.apps = (0..MAX_APPS_PER_BLOCK)
+            .map(|i| base(&format!("app{i}")))
+            .collect();
+        let started = std::time::Instant::now();
+        assert_eq!(validate_block(&mut b), Ok(()));
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "a full block took {took:?}"
+        );
+        assert_eq!(b.domains.len(), MAX_DOMAINS_PER_BLOCK);
+        assert_eq!(b.apps.len(), MAX_APPS_PER_BLOCK);
+        assert_eq!(b.domains[0], "d0.example.com");
+        assert_eq!(b.domains[MAX_DOMAINS_PER_BLOCK - 1], "d4999.example.com");
     }
 
     #[test]

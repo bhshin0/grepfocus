@@ -154,8 +154,10 @@ impl Daemon {
     /// reads instead of the wall clock: block, break and pomodoro ends, the
     /// settings unlock window, the status frame's `now_unix` (so the GUI's
     /// countdowns follow this frame too), attempt and kill event stamps.
-    /// License expiry stays on `effective_now` and `browser_policy` on the
-    /// wall clock by design.
+    /// By design NOT on this clock: license expiry (`effective_now`),
+    /// `browser_policy` and the export stamp (`exported_at_unix` is
+    /// provenance compared across machines, so it agrees with the file's
+    /// wall-clock name) — those read the wall clock.
     pub fn now(&self) -> u64 {
         clock::now_in(&self.clock)
     }

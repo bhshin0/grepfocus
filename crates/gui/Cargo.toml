@@ -22,6 +22,9 @@ tauri-plugin-localhost = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
 portpicker = "0.1"
+# Local wall time for the export file name; the daemon's feature set, so
+# this adds a lock edge, not a crate.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Already compiled into the GUI via tauri-utils; this adds a lock edge, not a crate.
 semver = "1"
 # The daily release check: one GET a day over rustls with the bundled Mozilla

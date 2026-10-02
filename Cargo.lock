@@ -1500,6 +1500,7 @@ dependencies = [
 name = "grepfocus-gui"
 version = "0.6.0"
 dependencies = [
+ "chrono",
  "grepfocus-core",
  "portpicker",
  "semver",

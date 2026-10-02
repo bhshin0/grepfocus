@@ -1,76 +1,14 @@
 import { describe, expect, it } from "vitest";
-import type { ActiveBlock, AppEnv, PomodoroStatus, Status } from "../types";
+import type { AppEnv } from "../types";
 import { serviceRemovalOffered, serviceRemovalRefusal, unreachableMode } from "./firstrun";
+import { pomodoro, runningBlock, status } from "./testing/status";
 
 function env(over: Partial<AppEnv> = {}): AppEnv {
   return { appimage: false, gui_version: "0.6.0", packaged_daemon: false, local_daemon: false, ...over };
 }
 
-const NOW = 1_700_000_000;
-
-/// An idle, current daemon; only `active` and `pomodoro` matter here.
-function status(over: Partial<Status> = {}): Status {
-  return {
-    active: [],
-    now_unix: NOW,
-    password_set: false,
-    unlocked: false,
-    allowance: [],
-    allowance_used: [],
-    license_present: false,
-    license_valid: false,
-    license_kind: null,
-    license_email: null,
-    license_expires_at: null,
-    licensed_features: [],
-    pomodoro: null,
-    settings: { notifications: true, instant_breaks: true, attempt_nudges: false },
-    instant_breaks_degraded: false,
-    health: {
-      daemon_version: "0.6.0",
-      daemon_exe: "/usr/local/bin/grepfocusd",
-      install_kind: "local",
-      nft: { kind: "ok" },
-      hosts: { kind: "locked" },
-      hosts_reapplies: 0,
-      nft_reinstalls: 0,
-      proxy: "holding",
-      browser_policies: [],
-      startup_notes: [],
-      last_error: null,
-      last_error_unix: null,
-    },
-    recent_events: [],
-    update: { kind: "up_to_date" },
-    ...over,
-  };
-}
-
-const RUNNING_BLOCK: ActiveBlock = {
-  block: {
-    id: 1,
-    name: "Social",
-    domains: ["reddit.com"],
-    apps: [],
-    allowance_secs_per_day: 0,
-    allowance: null,
-    lock: "normal",
-  },
-  started_at_unix: NOW - 60,
-  ends_at_unix: NOW + 600,
-  originator: { kind: "manual" },
-  break_until_unix: null,
-  allowance: null,
-  lock: "normal",
-};
-
-const RUNNING_POMODORO: PomodoroStatus = {
-  block_id: 1,
-  phase: "focus",
-  phase_ends_unix: NOW + 1500,
-  cycle_index: 0,
-  cycles_total: 4,
-};
+const RUNNING_BLOCK = runningBlock();
+const RUNNING_POMODORO = pomodoro();
 
 // The connect-class messages verbatim from `connect_error_message` in
 // crates/gui/src/client.rs, with the raw-error line `call()` appends.

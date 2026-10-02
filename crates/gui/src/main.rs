@@ -2,14 +2,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod client;
+mod config_io;
 mod notify;
 mod tray;
 mod update;
 mod version;
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use grepfocus_core::config_doc::{self, ImportMode};
 use grepfocus_core::{
     ActiveBlock, AllowanceLedger, AllowanceStatus, Block, DayStat, FocusSession, Health,
     LifetimeTotals, PomodoroStatus, RecentEvent, Request, Response, Schedule, Settings,
@@ -360,6 +363,74 @@ async fn update_schedule(schedule: Schedule) -> Result<(), String> {
 async fn delete_schedule(id: u64) -> Result<(), String> {
     match client::call(Request::DeleteSchedule { id }).await? {
         Response::Ok {} => Ok(()),
+        Response::Error { message } => Err(message),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+/// What an import added, for the Block list's summary line: the daemon's
+/// `Imported` response verbatim (counts of what the file ADDED, `"old → new"`
+/// per renamed block, duplicates skipped). Mirrored by `ImportSummary` in
+/// ui/src/types.ts.
+#[derive(serde::Serialize)]
+struct ImportSummary {
+    blocks: usize,
+    schedules: usize,
+    renamed: Vec<String>,
+    skipped_schedules: usize,
+}
+
+/// Write the daemon's configuration document — blocks and schedules, never
+/// the password, license or stats — to the user's download directory and
+/// return the path, `~`-abbreviated. The write is `create_new`, so a name
+/// collision is an error rather than an overwrite (see `config_io`).
+#[tauri::command]
+async fn export_config() -> Result<String, String> {
+    let doc = match client::call(Request::ExportConfig {}).await? {
+        Response::Config { doc } => doc,
+        Response::Error { message } => return Err(message),
+        other => return Err(format!("unexpected response: {other:?}")),
+    };
+    let json = serde_json::to_string_pretty(&doc).map_err(|e| format!("serialize: {e}"))?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute())
+        .ok_or_else(|| "HOME is not set".to_string())?;
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".config"));
+    let user_dirs = std::fs::read_to_string(config_home.join("user-dirs.dirs")).ok();
+    let dir = config_io::download_dir(&home, user_dirs.as_deref(), |p| p.is_dir());
+    let path = dir.join(config_io::export_file_name(
+        chrono::Local::now().naive_local(),
+    ));
+    config_io::write_new(&path, json.as_bytes())
+        .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    Ok(config_io::display_path(&path, &home))
+}
+
+/// Import a configuration file's text. Parsed here first, as `add_block`
+/// pre-validates, so a bad file gets its error without a round trip and the
+/// daemon receives the typed document rather than raw text (the frame is
+/// never larger than the file). The daemon re-checks the schema and runs
+/// every gate: the settings lock, the Replace-while-active refusal and the
+/// same license checks as saving — a refusal lands here verbatim.
+#[tauri::command]
+async fn import_config(json: String, mode: ImportMode) -> Result<ImportSummary, String> {
+    let doc = config_doc::parse(&json)?;
+    match client::call(Request::ImportConfig { doc, mode }).await? {
+        Response::Imported {
+            blocks,
+            schedules,
+            renamed,
+            skipped_schedules,
+        } => Ok(ImportSummary {
+            blocks,
+            schedules,
+            renamed,
+            skipped_schedules,
+        }),
         Response::Error { message } => Err(message),
         other => Err(format!("unexpected response: {other:?}")),
     }
@@ -1100,6 +1171,8 @@ fn main() {
             add_schedule,
             update_schedule,
             delete_schedule,
+            export_config,
+            import_config,
             set_password,
             set_license,
             set_settings,

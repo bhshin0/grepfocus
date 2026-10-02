@@ -12,6 +12,8 @@ fn main() {
             "add_schedule",
             "update_schedule",
             "delete_schedule",
+            "export_config",
+            "import_config",
             "set_password",
             "set_license",
             "set_settings",

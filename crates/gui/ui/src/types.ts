@@ -366,6 +366,26 @@ export interface UsageStats {
   longest_streak: number;
 }
 
+// ─── Config export / import ──────────────────────────────────────────────────
+
+/// Mirrors core's `config_doc::ImportMode` (snake_case on the wire): how an
+/// import combines with what is already saved. `merge` adds the file's
+/// records next to the saved ones; `replace` drops every saved block and
+/// schedule first (the daemon refuses it while anything runs).
+export type ImportMode = "merge" | "replace";
+
+/// Mirrors `ImportSummary` in src/main.rs — the daemon's `Imported` response:
+/// what the file ADDED, not totals. `renamed` lines are the daemon's
+/// `"old → new"`, one per block whose name was already in use.
+export interface ImportSummary {
+  blocks: number;
+  schedules: number;
+  renamed: string[];
+  /// Schedules dropped as duplicates of one EARLIER IN THE SAME FILE. An
+  /// imported schedule can never duplicate a saved one — its block is new.
+  skipped_schedules: number;
+}
+
 // ─── GUI process environment (`app_env`) ─────────────────────────────────────
 
 export interface AppEnv {

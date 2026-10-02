@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::validate::{
     excerpt, schedules_equivalent, validate_block, validate_schedule, MAX_BLOCK_NAME_CHARS,
 };
+#[cfg(test)]
+use crate::validate::{MAX_APPS_PER_BLOCK, MAX_DOMAINS_PER_BLOCK};
 use crate::{validate_policy, Block, Schedule};
 
 /// Document format version. Readers refuse anything newer than this; bump it
@@ -28,6 +30,14 @@ pub const MAX_DOC_BYTES: usize = 8 << 20;
 pub const MAX_DOC_BLOCKS: usize = 1000;
 /// Most schedules a document may hold; see [`MAX_DOC_BLOCKS`].
 pub const MAX_DOC_SCHEDULES: usize = 2000;
+/// Most domains a document may hold over all its blocks, counted as sent.
+/// The per-block cap alone leaves a thousand full blocks — five million
+/// entries to normalize under the daemon's state lock; this keeps the whole
+/// import at a bounded, sub-second amount of work.
+pub const MAX_DOC_DOMAINS: usize = 50_000;
+/// Most app matchers a document may hold over all its blocks; see
+/// [`MAX_DOC_DOMAINS`].
+pub const MAX_DOC_APPS: usize = 5000;
 
 /// What an export file holds. Unknown top-level keys are tolerated (a newer
 /// build may add some); `blocks`/`schedules` default so a hand-trimmed file
@@ -100,6 +110,16 @@ pub fn parse(json: &str) -> Result<ConfigDoc, String> {
     }
     let doc: ConfigDoc =
         serde_json::from_str(json).map_err(|e| format!("not a GrepFocus export: {e}"))?;
+    check_schema(&doc)?;
+    check_counts(&doc)?;
+    Ok(doc)
+}
+
+/// The schema gate, shared by [`parse`] and the daemon's import handler:
+/// the daemon receives a parsed document (a raw socket client never ran
+/// [`parse`]) and must still refuse one a newer build wrote. `Err` is the
+/// user-facing text.
+pub fn check_schema(doc: &ConfigDoc) -> Result<(), String> {
     if doc.schema == 0 {
         return Err("not a GrepFocus export: missing schema".into());
     }
@@ -109,12 +129,12 @@ pub fn parse(json: &str) -> Result<ConfigDoc, String> {
             doc.schema
         ));
     }
-    check_counts(&doc)?;
-    Ok(doc)
+    Ok(())
 }
 
 /// The record caps, shared by [`parse`] and [`plan_import`] so a document
-/// built in memory gets the same refusal as one read from disk.
+/// built in memory gets the same refusal as one read from disk. Entries are
+/// counted as sent, before validation dedupes them.
 fn check_counts(doc: &ConfigDoc) -> Result<(), String> {
     if doc.blocks.len() > MAX_DOC_BLOCKS {
         return Err(format!("file holds too many blocks (max {MAX_DOC_BLOCKS})"));
@@ -122,6 +142,18 @@ fn check_counts(doc: &ConfigDoc) -> Result<(), String> {
     if doc.schedules.len() > MAX_DOC_SCHEDULES {
         return Err(format!(
             "file holds too many schedules (max {MAX_DOC_SCHEDULES})"
+        ));
+    }
+    let domains: usize = doc.blocks.iter().map(|b| b.domains.len()).sum();
+    if domains > MAX_DOC_DOMAINS {
+        return Err(format!(
+            "file holds too many domains (max {MAX_DOC_DOMAINS})"
+        ));
+    }
+    let apps: usize = doc.blocks.iter().map(|b| b.apps.len()).sum();
+    if apps > MAX_DOC_APPS {
+        return Err(format!(
+            "file holds too many app matchers (max {MAX_DOC_APPS})"
         ));
     }
     Ok(())
@@ -547,6 +579,165 @@ mod tests {
             plan_import(d, &[], &[], 1, 1, ImportMode::Merge).unwrap_err(),
             "file holds too many schedules (max 2000)"
         );
+    }
+
+    /// `n` blocks each holding `per_block` domains, no two alike anywhere in
+    /// the result.
+    fn full_domain_blocks(n: usize, per_block: usize) -> Vec<Block> {
+        (0..n)
+            .map(|i| {
+                let mut b = block(i as u64 + 1, &format!("d{i}"), &[]);
+                b.domains = (0..per_block)
+                    .map(|j| format!("d{j}.b{i}.example.com"))
+                    .collect();
+                b
+            })
+            .collect()
+    }
+
+    /// `n` blocks each holding `per_block` app matchers, no two alike.
+    fn full_app_blocks(n: usize, per_block: usize) -> Vec<Block> {
+        (0..n)
+            .map(|i| {
+                let mut b = block(i as u64 + 1, &format!("a{i}"), &[]);
+                b.apps = (0..per_block)
+                    .map(|j| AppMatcher::Basename {
+                        name: format!("app{j}-{i}"),
+                    })
+                    .collect();
+                b
+            })
+            .collect()
+    }
+
+    fn total_domains(blocks: &[Block]) -> usize {
+        blocks.iter().map(|b| b.domains.len()).sum()
+    }
+
+    fn total_apps(blocks: &[Block]) -> usize {
+        blocks.iter().map(|b| b.apps.len()).sum()
+    }
+
+    // The document-wide entry caps: exactly the cap parses, spread over
+    // full blocks; one more entry, in a block of its own, is refused with
+    // the entry text. The files are far under 8 MiB.
+    #[test]
+    fn parse_rejects_too_many_domains_and_apps() {
+        let at_cap = full_domain_blocks(
+            MAX_DOC_DOMAINS / MAX_DOMAINS_PER_BLOCK,
+            MAX_DOMAINS_PER_BLOCK,
+        );
+        assert_eq!(total_domains(&at_cap), MAX_DOC_DOMAINS);
+        let json = serde_json::to_string(&doc(at_cap.clone(), vec![])).unwrap();
+        assert!(json.len() < MAX_DOC_BYTES);
+        assert_eq!(
+            total_domains(&parse(&json).unwrap().blocks),
+            MAX_DOC_DOMAINS
+        );
+        let mut over = at_cap;
+        over.push(block(999, "one more", &["reddit.com"]));
+        let json = serde_json::to_string(&doc(over, vec![])).unwrap();
+        assert_eq!(
+            parse(&json).unwrap_err(),
+            "file holds too many domains (max 50000)"
+        );
+
+        let at_cap = full_app_blocks(MAX_DOC_APPS / MAX_APPS_PER_BLOCK, MAX_APPS_PER_BLOCK);
+        assert_eq!(total_apps(&at_cap), MAX_DOC_APPS);
+        let json = serde_json::to_string(&doc(at_cap.clone(), vec![])).unwrap();
+        assert_eq!(total_apps(&parse(&json).unwrap().blocks), MAX_DOC_APPS);
+        let mut over = at_cap;
+        let mut extra = block(999, "one more", &[]);
+        extra.apps.push(AppMatcher::Basename {
+            name: "steam".into(),
+        });
+        over.push(extra);
+        let json = serde_json::to_string(&doc(over, vec![])).unwrap();
+        assert_eq!(
+            parse(&json).unwrap_err(),
+            "file holds too many app matchers (max 5000)"
+        );
+    }
+
+    // The same entry caps for a document that never went through `parse`;
+    // at the cap every entry is validated, so this also runs the import's
+    // whole per-entry path at its largest.
+    #[test]
+    fn plan_import_rejects_too_many_domains_and_apps() {
+        let at_cap = full_domain_blocks(
+            MAX_DOC_DOMAINS / MAX_DOMAINS_PER_BLOCK,
+            MAX_DOMAINS_PER_BLOCK,
+        );
+        let p = plan_import(
+            doc(at_cap.clone(), vec![]),
+            &[],
+            &[],
+            1,
+            1,
+            ImportMode::Merge,
+        )
+        .unwrap();
+        assert_eq!(total_domains(&p.blocks), MAX_DOC_DOMAINS);
+        assert_eq!(p.blocks[0].domains[0], "d0.b0.example.com");
+        let mut over = at_cap;
+        over.push(block(999, "one more", &["reddit.com"]));
+        assert_eq!(
+            plan_import(doc(over, vec![]), &[], &[], 1, 1, ImportMode::Merge).unwrap_err(),
+            "file holds too many domains (max 50000)"
+        );
+
+        let at_cap = full_app_blocks(MAX_DOC_APPS / MAX_APPS_PER_BLOCK, MAX_APPS_PER_BLOCK);
+        let p = plan_import(
+            doc(at_cap.clone(), vec![]),
+            &[],
+            &[],
+            1,
+            1,
+            ImportMode::Merge,
+        )
+        .unwrap();
+        assert_eq!(total_apps(&p.blocks), MAX_DOC_APPS);
+        let mut over = at_cap;
+        let mut extra = block(999, "one more", &[]);
+        extra.apps.push(AppMatcher::Basename {
+            name: "steam".into(),
+        });
+        over.push(extra);
+        assert_eq!(
+            plan_import(doc(over, vec![]), &[], &[], 1, 1, ImportMode::Merge).unwrap_err(),
+            "file holds too many app matchers (max 5000)"
+        );
+    }
+
+    // The lock budget: the daemon plans an import under its state lock,
+    // where procwatch sweeps, enforce sync and the scheduler tick wait. The
+    // largest document the entry caps allow — fifty thousand domains and
+    // five thousand matchers, each normalized and deduped — plans in well
+    // under a second in any profile (~0.2 s measured in a debug build; the
+    // bound leaves room for a slow or loaded box). Before the caps and the
+    // seen-set dedupe, a document within every other cap took over ten
+    // seconds here.
+    #[test]
+    fn plan_import_at_the_entry_caps_fits_the_lock_budget() {
+        let mut blocks = full_domain_blocks(
+            MAX_DOC_DOMAINS / MAX_DOMAINS_PER_BLOCK,
+            MAX_DOMAINS_PER_BLOCK,
+        );
+        let offset = blocks.len() as u64;
+        for mut b in full_app_blocks(MAX_DOC_APPS / MAX_APPS_PER_BLOCK, MAX_APPS_PER_BLOCK) {
+            b.id += offset;
+            blocks.push(b);
+        }
+        let d = doc(blocks, vec![]);
+        let started = std::time::Instant::now();
+        let p = plan_import(d, &[], &[], 1, 1, ImportMode::Merge).unwrap();
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "the largest allowed import took {took:?} to plan"
+        );
+        assert_eq!(total_domains(&p.blocks), MAX_DOC_DOMAINS);
+        assert_eq!(total_apps(&p.blocks), MAX_DOC_APPS);
     }
 
     // A name at the cap gains its suffix by losing characters, never by

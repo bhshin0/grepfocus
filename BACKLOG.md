@@ -388,6 +388,14 @@ them into `docs/release-notes-0.7.0.txt` as the 0.6.0 lines were.
   anything runs, block timing follows elapsed time (sleep included, so a
   block still ends on time after a suspend), and a service restart keeps
   that time base until the next reboot.
+- Export and import of blocks and schedules, on the Block list tab: Export
+  writes a plain JSON copy to your Downloads folder (never the password,
+  license or stats); Import merges a file into the saved configuration — a
+  name already in use gets "(imported)" — or replaces it when nothing is
+  running.
+- An import goes through the same checks as saving, license checks
+  included: a file the license does not cover is refused as a whole, and
+  nothing from it is saved.
 
 ## Decisions
 
@@ -611,20 +619,44 @@ to be redone when the item is picked up.
   managers treat a failing removal script is from their documentation, not
   tried here.) README → *Uninstalling* says a failed cleanup does not stop
   a package removal and points at *Recovery*.
-- **Export / import of blocks and schedules** — no way to move a
-  configuration to another machine or keep a copy. Copying
-  `/var/lib/grepfocus` does not work: the state file is sealed with the
-  per-machine HMAC secret in `/etc/grepfocus`, so it reads as tampered
-  elsewhere. Needs a daemon-side pair (`ExportConfig` → plain JSON of
-  blocks and schedules only — never the password hash, the license token,
-  usage stats or active blocks; `ImportConfig` behind the settings lock),
-  with every imported block passed through `validate_block`, ids
-  reassigned and each schedule's `block_id` remapped, and the same license
-  gates as `AddBlock`/`AddSchedule` (saved-block limit, app blocking, lock
-  modes, schedules) so an import cannot grant what a save would refuse.
-  Open: merge versus replace, and what to do with name collisions. GUI: two
-  buttons on the Block list tab and a file dialog (no dialog plugin is
-  bundled today).
+- **[DONE — `wp6-config`, 2026-10-02] Export / import of blocks and
+  schedules** — implemented per `docs/plans/0.7.0-plan.md` D1–D3. The need:
+  no way to move a configuration to another machine or keep a copy, and
+  copying `/var/lib/grepfocus` does not work (the state file is sealed with
+  the per-machine HMAC secret in `/etc/grepfocus`). `ExportConfig` returns a
+  plain JSON document of blocks and schedules only — `config_doc::build`
+  takes nothing else, so the password hash, license token, usage stats,
+  active blocks, pomodoro and settings are excluded by construction.
+  `ImportConfig { doc, mode }` takes the PARSED document (the GUI runs
+  `config_doc::parse` first for a friendly error; the daemon re-checks the
+  schema), behind the settings lock, with every block passed through
+  `validate_block` + policy normalization (errors prefixed with the block's
+  name) and the same license gates as `AddBlock`/`AddSchedule` applied to
+  every record before any is saved — all or nothing, the four touched
+  fields restored if the save fails. Decisions: **merge** (the default)
+  renames a block whose name is in use to `"… (imported)"`, then
+  `"(imported 2)"`… (lossless and visible; names are not keys); **replace**
+  drops every saved block and schedule first and is refused while a block
+  or pomodoro runs (merge is allowed then — adding never touches an
+  active); **ids are never reused** — both counters continue, so usage
+  stats and break history keep pointing at the right blocks; a schedule
+  equivalent to one earlier in the same file is skipped and counted, not
+  refused; a file from a newer schema is refused ("update first"). GUI:
+  Export writes `~/Downloads/grepfocus-config-YYYYMMDD-HHMMSS.json` from
+  the Rust side (`config_io.rs`: XDG download dir honoured, `create_new` so
+  never an overwrite, mode 0600) and says where (no ellipsis: nothing
+  follows the click); Import… is a hidden
+  `<input type="file">` (WebKitGTK's native chooser) plus a Merge/Replace
+  dialog with Replace disabled while anything runs — **no dialog plugin**
+  bundled; `tauri-plugin-dialog` stays the option if a real Save-As is ever
+  wanted. Review fixes: a document is capped at 1000 blocks, 2000
+  schedules, 50 000 domains and 5000 app matchers in all
+  (`config_doc::MAX_DOC_*`, checked by `parse` and `plan_import` alike) and
+  `validate_block` dedupes through a seen-set, so planning the largest
+  allowed import holds the daemon's state lock for well under a second
+  (the per-block cap alone allowed a file that took over ten seconds);
+  `exported_at_unix` is wall time, not the block clock (provenance read on
+  another machine next to the file's wall-clock name).
 - **[FIXED — UX polish] GNOME tray invisibility** — stock GNOME ships no
   StatusNotifier host, so the tray icon never appeared and close-to-tray made
   the app invisible after its first close. The GUI now probes for a host at

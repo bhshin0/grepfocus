@@ -5,6 +5,8 @@ import type {
   AllowanceStatus,
   AppEnv,
   Block,
+  ImportMode,
+  ImportSummary,
   InstallKind,
   LockMode,
   Schedule,
@@ -14,6 +16,7 @@ import type {
   UsageStats,
 } from "./types";
 import { attemptRows, blockedTimesText, CAP_HINT_TEXT, NO_ATTEMPTS_TEXT, nudgeToggle, timesText } from "./logic/attempts";
+import { exportedText, importFileLabel, importFileRefusal, importSummaryText, replaceRefusal } from "./logic/config";
 import { type FirstRunMode, serviceRemovalOffered, serviceRemovalRefusal, unreachableMode } from "./logic/firstrun";
 import { fmtClock, fmtDuration, fmtMinute, fmtPhaseRemaining, fmtRemaining, fmtWindow, fmtWindowRange } from "./logic/format";
 import {
@@ -296,6 +299,123 @@ async function refreshList() {
     listMsg.textContent = String(e);
   }
 }
+
+// ─── Export / import ─────────────────────────────────────────────────────────
+
+const exportBtn = document.querySelector<HTMLButtonElement>("#export-config")!;
+const importBtn = document.querySelector<HTMLButtonElement>("#import-config")!;
+const importFile = document.querySelector<HTMLInputElement>("#import-file")!;
+const importDialog = document.querySelector<HTMLDialogElement>("#import-dialog")!;
+const importForm = document.querySelector<HTMLFormElement>("#import-form")!;
+const importFileLine = document.querySelector<HTMLElement>("#import-file-line")!;
+const importReplace = document.querySelector<HTMLInputElement>("#import-mode-replace")!;
+const importReplaceNote = document.querySelector<HTMLElement>("#import-replace-note")!;
+const importSubmit = document.querySelector<HTMLButtonElement>("#import-submit")!;
+const importCancel = document.querySelector<HTMLButtonElement>("#import-cancel")!;
+const importMsg = document.querySelector<HTMLParagraphElement>("#import-msg")!;
+
+/// The text of the file the open dialog is about; null while it is closed.
+let importText: string | null = null;
+
+function setListMsg(text: string, kind: "" | "error" = "") {
+  listMsg.classList.remove("error", "warn");
+  if (kind) listMsg.classList.add(kind);
+  listMsg.textContent = text;
+}
+
+// Ungated, like the lists it is made of: no unlock prompt. The Rust side
+// writes the file and reports where.
+exportBtn.addEventListener("click", async () => {
+  setListMsg("");
+  exportBtn.disabled = true;
+  try {
+    setListMsg(exportedText(await invoke<string>("export_config")));
+  } catch (e) {
+    setListMsg(String(e), "error");
+  } finally {
+    exportBtn.disabled = false;
+  }
+});
+
+// The hidden file input is the chooser: WebKitGTK shows its native file
+// dialog for it. Its value is cleared first so picking the same file again
+// still fires `change`.
+importBtn.addEventListener("click", () => {
+  importFile.value = "";
+  importFile.click();
+});
+
+importFile.addEventListener("change", async () => {
+  const file = importFile.files?.[0];
+  if (!file) return;
+  setListMsg("");
+  const refusal = importFileRefusal(file.size);
+  if (refusal !== null) {
+    setListMsg(refusal, "error");
+    return;
+  }
+  try {
+    importText = await file.text();
+  } catch (e) {
+    setListMsg(`Could not read ${file.name}: ${String(e)}`, "error");
+    return;
+  }
+  importFileLine.textContent = importFileLabel(file.name, file.size);
+  importForm.reset(); // Merge is the default every time
+  importMsg.classList.remove("error");
+  importMsg.textContent = "";
+  // Replace is offered only when the daemon would accept it. The daemon has
+  // the last word, so a failed status read leaves the radio enabled.
+  let replaceNote: string | null = null;
+  try {
+    replaceNote = replaceRefusal(await invoke<Status>("get_status"));
+  } catch {
+    // The daemon decides.
+  }
+  importReplace.disabled = replaceNote !== null;
+  importReplaceNote.textContent = replaceNote ?? "";
+  importReplaceNote.hidden = replaceNote === null;
+  importDialog.showModal();
+});
+
+function closeImportDialog() {
+  importText = null;
+  if (importDialog.open) importDialog.close();
+}
+
+importCancel.addEventListener("click", closeImportDialog);
+// Esc-dismissal → cancel, same as the schedule dialog.
+importDialog.addEventListener("cancel", (ev) => {
+  ev.preventDefault();
+  closeImportDialog();
+});
+
+importForm.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const json = importText;
+  if (json === null) return;
+  importMsg.classList.remove("error");
+  importMsg.textContent = "";
+  const mode: ImportMode = importReplace.checked ? "replace" : "merge";
+  // An import is a configuration change: same password discipline as a save.
+  if (!(await ensureUnlocked())) return;
+  importSubmit.disabled = true;
+  try {
+    const summary = await invoke<ImportSummary>("import_config", { json, mode });
+    closeImportDialog();
+    // Both places the new records show; refreshList clears #list-msg first
+    // (synchronously, before its round trips), so the summary goes after.
+    refreshSchedulesViews();
+    setListMsg(importSummaryText(summary));
+  } catch (e) {
+    // A bad file, the settings lock, the Replace-while-running refusal and
+    // the premium gates all land here verbatim, with the dialog still open.
+    importMsg.classList.add("error");
+    importMsg.textContent = String(e);
+  } finally {
+    importSubmit.disabled = false;
+  }
+});
 
 /// Lock-mode suffix for a block's one-line summary. Shown whenever the mode is
 /// premium, allowance or not: it is part of the saved config, and a block with

@@ -105,6 +105,18 @@
 
       <section id="list" class="tab">
         <h2>Saved blocks</h2>
+        <!--
+          Export writes the file from the Rust side (export_config) and says
+          where; Import goes through the hidden file input, for which
+          WebKitGTK shows its native file chooser — no dialog plugin either
+          way. The chosen file's mode is picked in #import-dialog below.
+        -->
+        <div class="config-actions">
+          <button type="button" id="export-config" class="ghost">Export</button>
+          <button type="button" id="import-config" class="ghost">Import…</button>
+          <input type="file" id="import-file" accept=".json,application/json" hidden />
+        </div>
+        <p class="hint">Export writes a plain JSON copy of your blocks and schedules to your Downloads folder, to keep or to import on another machine. It never contains your password, license or stats.</p>
         <ul id="block-list"></ul>
         <p id="list-msg" class="msg"></p>
       </section>
@@ -303,6 +315,36 @@
           <button type="button" id="schedule-cancel" class="ghost">Cancel</button>
         </div>
         <p id="schedule-msg" class="msg"></p>
+      </form>
+    </dialog>
+
+    <!--
+      Mode for an import (main.ts, Block list). Opened once a file is chosen;
+      Merge is the default. Replace is disabled while anything runs, mirroring
+      the daemon's refusal, which still has the last word. The settings
+      password is asked for on submit, like any other configuration change.
+    -->
+    <dialog id="import-dialog">
+      <form id="import-form" method="dialog">
+        <h3>Import blocks and schedules</h3>
+        <p class="hint" id="import-file-line"></p>
+        <div class="import-modes">
+          <label>
+            <input type="radio" name="mode" value="merge" id="import-mode-merge" checked />
+            <span><strong>Merge</strong> — add the file's blocks and schedules next to the existing ones. A name already in use gets "(imported)" appended.</span>
+          </label>
+          <label>
+            <input type="radio" name="mode" value="replace" id="import-mode-replace" />
+            <span><strong>Replace</strong> — deletes every saved block and schedule first; refused while a block is running.</span>
+          </label>
+          <p class="hint" id="import-replace-note" hidden></p>
+        </div>
+        <p class="hint">Imported blocks and schedules go through the same checks as saving them, including the license checks.</p>
+        <div class="row">
+          <button type="submit" id="import-submit">Import</button>
+          <button type="button" id="import-cancel" class="ghost">Cancel</button>
+        </div>
+        <p id="import-msg" class="msg"></p>
       </form>
     </dialog>
 

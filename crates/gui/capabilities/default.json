@@ -20,6 +20,8 @@
     "allow-add-schedule",
     "allow-update-schedule",
     "allow-delete-schedule",
+    "allow-export-config",
+    "allow-import-config",
     "allow-set-password",
     "allow-set-license",
     "allow-set-settings",

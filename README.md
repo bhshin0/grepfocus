@@ -269,7 +269,11 @@ GREPFOCUS_UPDATE_URL=http://127.0.0.1:8099/latest.json cargo run -p grepfocus-gu
 
 Package removal and the AppImage button keep your saved blocks, schedules,
 usage stats, license and settings password in `/var/lib/grepfocus` and
-`/etc/grepfocus`, so a reinstall picks up where you left off. Deleting that
+`/etc/grepfocus`, so a reinstall picks up where you left off. Export on the
+Block list tab writes a plain JSON copy of blocks and schedules
+(`~/Downloads/grepfocus-config-….json`) that imports on any machine; it
+never contains the password, license or stats. (Copying `/var/lib/grepfocus`
+instead does not work: the state file is sealed per machine.) Deleting that
 data is a terminal step, never a button. `sudo grepfocusd cleanup --purge`
 deletes both directories; it needs the service stopped and the binary still
 present, so run it before removing a package (or, in the AppImage terminal
@@ -301,6 +305,8 @@ own — `Request` in `crates/core/src/lib.rs` is the full list):
 | `start_block`     | `{ id: u64, duration_secs: u64 }`     | Rejected if that block is already active     |
 | `cancel_block`    | —                                     | Always rejected while a block is active      |
 | `get_status`      | —                                     | Active blocks, server time, license, settings, plus `health` (daemon version, install kind, nft/hosts/proxy state, browser DoH policies, drift counters, last error) |
+| `export_config`   | —                                     | Blocks and schedules as a plain JSON document — `schema`, `exported_at_unix`, `app_version`, `blocks`, `schedules` and nothing else: never the password, license, stats or active blocks |
+| `import_config`   | `{ doc: ConfigDoc, mode: "merge" or "replace" }` | The parsed document, not its text. Behind the settings lock; every record passes the same validation and license checks as saving before any is saved (all or nothing). Ids are reassigned and schedules remapped, a block name already in use becomes `"… (imported)"`, a schedule duplicating one earlier in the file is skipped. `replace` drops every saved block and schedule first and is refused while a block is active. Returns `{ result: "imported", blocks, schedules, renamed, skipped_schedules }` |
 
 `update_schedule` and `delete_schedule` are accepted while the schedule's
 block is running: the block keeps the window end it snapshotted when it
@@ -620,6 +626,10 @@ that Cold Turkey beats either.
   trust store, so a proxy that re-signs traffic with a private CA makes the
   check fail; the Settings row says "secure connection to grepfocus.com
   failed". Blocking is unaffected.
+- **An import is subject to the same license checks as saving.** A file
+  the license does not cover — on the free tier, more than one block in
+  total, app matchers, lock modes or schedules — is refused as a whole with
+  the same message a save would get, and nothing from it is saved.
 
 ## License
 

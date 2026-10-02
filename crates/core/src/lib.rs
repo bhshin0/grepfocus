@@ -170,8 +170,9 @@ pub enum LockMode {
     ChallengeBreaks,
 }
 
-/// How to identify a process to kill.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// How to identify a process to kill. `Hash` so `validate_block` can dedupe
+/// a block's matchers through a set.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AppMatcher {
     /// Match `/proc/<pid>/exe` resolved path exactly.
@@ -1611,6 +1612,23 @@ pub enum Request {
     SetSettings {
         settings: Settings,
     },
+    /// Read the portable configuration document — blocks and schedules,
+    /// nothing else by construction (see [`config_doc::build`]). Ungated,
+    /// like `ListBlocks` and `ListSchedules`, whose data it is.
+    ExportConfig {},
+    /// Import a configuration document. Typed, like `AddBlock { block }`:
+    /// the GUI runs [`config_doc::parse`] first for a friendly error and
+    /// sends the parsed document, so the frame is never larger than the
+    /// file; the daemon re-checks the schema as the authority. `Merge` adds
+    /// the file's records next to the saved ones (a name already in use
+    /// gets " (imported)"); `Replace` drops every saved block and schedule
+    /// first and is refused while anything runs. Behind the settings lock
+    /// and the same license gates as `AddBlock`/`AddSchedule`, applied to
+    /// every record before any is saved — all or nothing.
+    ImportConfig {
+        doc: config_doc::ConfigDoc,
+        mode: config_doc::ImportMode,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1731,6 +1749,20 @@ pub enum Response {
         days: Vec<DayStat>,
         current_streak: u32,
         longest_streak: u32,
+    },
+    /// The configuration document for an `ExportConfig` request.
+    Config {
+        doc: config_doc::ConfigDoc,
+    },
+    /// What an `ImportConfig` request ADDED (not totals): how many blocks
+    /// and schedules from the file are now saved, `"old → new"` for every
+    /// block renamed because its name was already in use, and how many
+    /// schedules were dropped as duplicates of one earlier in the same file.
+    Imported {
+        blocks: usize,
+        schedules: usize,
+        renamed: Vec<String>,
+        skipped_schedules: usize,
     },
     Error {
         message: String,
@@ -2045,6 +2077,46 @@ mod tests {
         })
         .unwrap();
         assert!(json.contains(r#""method":"set_settings""#), "got {json}");
+    }
+
+    // Pin the export/import wire tags: a raw socket client types these, and
+    // the GUI's `ImportMode` strings must match core's.
+    #[test]
+    fn config_wire_tags_round_trip() {
+        let req: Request = serde_json::from_str(
+            r#"{"method":"import_config","doc":{"schema":1,"exported_at_unix":0,"app_version":"x"},"mode":"replace"}"#,
+        )
+        .unwrap();
+        match req {
+            Request::ImportConfig { doc, mode } => {
+                assert_eq!(mode, config_doc::ImportMode::Replace);
+                assert_eq!(doc.schema, 1);
+                assert!(doc.blocks.is_empty() && doc.schedules.is_empty());
+            }
+            other => panic!("expected ImportConfig, got {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_string(&Request::ExportConfig {}).unwrap(),
+            r#"{"method":"export_config"}"#
+        );
+        let json = serde_json::to_string(&Response::Config {
+            doc: config_doc::build(&[], &[], 5, "0.7.0"),
+        })
+        .unwrap();
+        assert!(
+            json.starts_with(r#"{"result":"config","doc":{"schema":1,"exported_at_unix":5"#),
+            "got {json}"
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::Imported {
+                blocks: 1,
+                schedules: 0,
+                renamed: vec!["a → b".into()],
+                skipped_schedules: 2,
+            })
+            .unwrap(),
+            r#"{"result":"imported","blocks":1,"schedules":0,"renamed":["a → b"],"skipped_schedules":2}"#
+        );
     }
 
     // ── lock modes (B2.a) ───────────────────────────────────────────────────

@@ -1,79 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type {
-  ActiveBlock,
-  Block,
   BrowserPolicyFailKind,
   BrowserPolicyState,
   BrowserPolicyStatus,
   Health,
   HostsLockStatus,
   NftStatus,
-  Status,
 } from "../types";
 import { fmtClock } from "./format";
 import { RESTART_HINT_SECS, aboutLine, browserName, healthNotices, healthSummary, joinNames } from "./health";
-
-const NOW = 1_700_000_000;
-
-/// A current daemon with nothing to report — the counterpart of the Rust
-/// tests' `reporting()`.
-function health(over: Partial<Health> = {}): Health {
-  return {
-    daemon_version: "0.6.0",
-    daemon_exe: "/usr/bin/grepfocusd",
-    install_kind: "package",
-    nft: { kind: "ok" },
-    hosts: { kind: "locked" },
-    hosts_reapplies: 0,
-    nft_reinstalls: 0,
-    proxy: "holding",
-    browser_policies: [],
-    startup_notes: [],
-    last_error: null,
-    last_error_unix: null,
-    ...over,
-  };
-}
-
-function status(over: Partial<Status> = {}, h: Partial<Health> = {}): Status {
-  return {
-    active: [],
-    now_unix: NOW,
-    password_set: false,
-    unlocked: false,
-    allowance: [],
-    allowance_used: [],
-    license_present: false,
-    license_valid: false,
-    license_kind: null,
-    license_email: null,
-    license_expires_at: null,
-    licensed_features: [],
-    pomodoro: null,
-    settings: { notifications: true, instant_breaks: true, attempt_nudges: false },
-    instant_breaks_degraded: false,
-    health: health(h),
-    recent_events: [],
-    update: { kind: "up_to_date" },
-    ...over,
-  };
-}
-
-function block(domains: string[]): Block {
-  return { id: 1, name: "Social", domains, apps: [], allowance_secs_per_day: 0, allowance: null, lock: "normal" };
-}
-
-function active(domains: string[]): ActiveBlock {
-  return {
-    block: block(domains),
-    started_at_unix: NOW - 60,
-    ends_at_unix: NOW + 600,
-    originator: { kind: "manual" },
-    break_until_unix: null,
-    allowance: null,
-    lock: "normal",
-  };
-}
+import { NOW, health, runningBlock, status } from "./testing/status";
 
 function policy(browser: string, state: BrowserPolicyState, since = NOW): BrowserPolicyStatus {
   return { browser, path: `/etc/${browser}/policies.json`, state, since_unix: since };
@@ -82,7 +18,7 @@ function policy(browser: string, state: BrowserPolicyState, since = NOW): Browse
 describe("healthNotices", () => {
   it("says nothing for a daemon too old to report, whatever the fields hold", () => {
     const s = status(
-      { active: [active(["reddit.com"])] },
+      { active: [runningBlock(["reddit.com"])] },
       {
         daemon_version: "",
         last_error: "hosts: read-only file system",
@@ -98,7 +34,7 @@ describe("healthNotices", () => {
   });
 
   it("last_error under a domain block is RED and names the enforcement gap", () => {
-    const s = status({ active: [active(["reddit.com"])] }, { last_error: "hosts: read-only file system" });
+    const s = status({ active: [runningBlock(["reddit.com"])] }, { last_error: "hosts: read-only file system" });
     expect(healthNotices(s)).toEqual([
       {
         level: "error",
@@ -118,13 +54,13 @@ describe("healthNotices", () => {
   });
 
   it("an app-only active block is not a domain block", () => {
-    const s = status({ active: [active([])] }, { last_error: "x" });
+    const s = status({ active: [runningBlock([])] }, { last_error: "x" });
     expect(healthNotices(s)[0].text).toMatch(/^The last \/etc\/hosts change/);
   });
 
   it("nft failed is RED only while a domain block is active", () => {
     const failed: Partial<Health> = { nft: { kind: "failed", reason: "nft: command not found" } };
-    expect(healthNotices(status({ active: [active(["reddit.com"])] }, failed))).toEqual([
+    expect(healthNotices(status({ active: [runningBlock(["reddit.com"])] }, failed))).toEqual([
       {
         level: "error",
         text: "Active blocks can be bypassed: DoH protection (nftables) failed — nft: command not found. Browsers using DNS-over-HTTPS (Firefox, Mullvad Browser) may still reach blocked sites.",
@@ -277,7 +213,7 @@ describe("healthNotices", () => {
 
   it("orders RED before YELLOW before INFO whatever the rule order", () => {
     const s = status(
-      { active: [active(["reddit.com"])] },
+      { active: [runningBlock(["reddit.com"])] },
       {
         proxy: "degraded",
         hosts: { kind: "unlocked", reason: "r" },
@@ -346,10 +282,10 @@ describe("healthSummary", () => {
   });
 
   it("reads an unattempted lock under a domain block as the premium gate", () => {
-    const unlicensed = status({ active: [active(["reddit.com"])] }, { hosts: { kind: "not_applicable" } });
+    const unlicensed = status({ active: [runningBlock(["reddit.com"])] }, { hosts: { kind: "not_applicable" } });
     expect(healthSummary(unlicensed)).toContain("/etc/hosts lock: off (premium feature) ·");
     const licensed = status(
-      { active: [active(["reddit.com"])], license_valid: true, licensed_features: ["tamper_protection"] },
+      { active: [runningBlock(["reddit.com"])], license_valid: true, licensed_features: ["tamper_protection"] },
       { hosts: { kind: "not_applicable" } },
     );
     expect(healthSummary(licensed)).toContain("/etc/hosts lock: not applicable ·");

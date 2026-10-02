@@ -7,6 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use anyhow::Context;
+use grepfocus_core::config_doc::{self, ImportMode, ImportPlan};
 use grepfocus_core::license::{self, LicenseClaims};
 use grepfocus_core::validate::{schedules_equivalent, validate_block, validate_schedule};
 use grepfocus_core::{
@@ -48,6 +49,9 @@ const MSG_BREAK_NEEDS_PASSWORD: &str =
     "password-locked breaks need a settings password — set one in Settings";
 const MSG_BREAK_CHALLENGE_MISMATCH: &str =
     "challenge response doesn't match — request a new challenge";
+/// `ImportConfig` in Replace mode while anything runs: an active block's
+/// saved record (and its schedules) must outlive the run. Merge is allowed.
+const MSG_REPLACE_WHILE_ACTIVE: &str = "cannot replace configuration while a block is active";
 
 /// Group whose members are authorized to talk to the socket.
 pub(crate) const GROUP: &str = "grepfocus";
@@ -977,7 +981,137 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             }
             Response::Ok {}
         }
+
+        // Ungated, like ListBlocks and ListSchedules: the document is what
+        // those two already hand out and, by construction of
+        // `config_doc::build`, nothing more. The stamp is WALL time, not the
+        // block clock: it is provenance read on another machine next to the
+        // file's wall-clock name, and the block clock can lag the wall by
+        // however much a running block absorbed.
+        Request::ExportConfig {} => {
+            let st = daemon.state.lock().await;
+            Response::Config {
+                doc: config_doc::build(
+                    &st.blocks,
+                    &st.schedules,
+                    grepfocus_core::now_unix(),
+                    crate::health::DAEMON_VERSION,
+                ),
+            }
+        }
+
+        // All or nothing: the whole plan is validated and license-gated
+        // before anything mutates, and the only mutation is two vector swaps
+        // plus the two id counters — all four restored if the save fails.
+        Request::ImportConfig { doc, mode } => {
+            let mut st = daemon.state.lock().await;
+            if let Some(resp) = gate_config(daemon, &st).await {
+                return resp;
+            }
+            // The GUI ran `config_doc::parse`; a raw socket client did not.
+            // The daemon is the authority either way.
+            if let Err(msg) = config_doc::check_schema(&doc) {
+                return err(msg);
+            }
+            // Replace drops every saved block, and an active block's saved
+            // record must outlive the run (its schedules, its id in stats).
+            // Merge never touches an active, so it is allowed while one runs.
+            if mode == ImportMode::Replace && (!st.active.is_empty() || st.pomodoro.is_some()) {
+                return err(MSG_REPLACE_WHILE_ACTIVE);
+            }
+            let (base_blocks, base_schedules) = match mode {
+                ImportMode::Merge => (st.blocks.len(), st.schedules.len()),
+                ImportMode::Replace => (0, 0),
+            };
+            // Validation first, as in AddBlock: a typo gets the typo error
+            // rather than a feature pitch.
+            let plan = match config_doc::plan_import(
+                doc,
+                &st.blocks,
+                &st.schedules,
+                st.next_id,
+                st.next_schedule_id,
+                mode,
+            ) {
+                Ok(plan) => plan,
+                Err(msg) => return err(msg),
+            };
+            {
+                let lic = daemon.license.lock().await;
+                let unlimited = has_feature(lic.as_ref(), &st, license::features::UNLIMITED_BLOCKS);
+                let app_blocking = has_feature(lic.as_ref(), &st, license::features::APP_BLOCKING);
+                let lock_modes = has_feature(lic.as_ref(), &st, license::features::LOCK_MODES);
+                // Each imported block is gated as the AddBlock it stands for,
+                // with the blocks before it (saved or imported) counted as
+                // saved — so the free tier's cap and the exact MSG_* copy
+                // apply unchanged, and an import can never grant what a save
+                // would refuse.
+                for (i, block) in plan.blocks[base_blocks..].iter().enumerate() {
+                    if let Some(msg) = gate_add_block(
+                        unlimited,
+                        app_blocking,
+                        lock_modes,
+                        base_blocks + i,
+                        &block.apps,
+                        block.lock,
+                    ) {
+                        return err(msg);
+                    }
+                }
+                if plan.schedules.len() > base_schedules
+                    && !has_feature(lic.as_ref(), &st, license::features::SCHEDULES)
+                {
+                    return err(MSG_SCHEDULES);
+                }
+            }
+            let (blocks, schedules) = imported_counts(&plan, base_blocks, base_schedules);
+            let prev_blocks = std::mem::replace(&mut st.blocks, plan.blocks);
+            let prev_schedules = std::mem::replace(&mut st.schedules, plan.schedules);
+            let prev_next_id = std::mem::replace(&mut st.next_id, plan.next_id);
+            let prev_next_schedule_id =
+                std::mem::replace(&mut st.next_schedule_id, plan.next_schedule_id);
+            if let Err(e) = state::save(&st, &daemon.key) {
+                st.blocks = prev_blocks;
+                st.schedules = prev_schedules;
+                st.next_id = prev_next_id;
+                st.next_schedule_id = prev_next_schedule_id;
+                return err(format!("save failed: {e}"));
+            }
+            info!(
+                ?mode,
+                blocks,
+                schedules,
+                renamed = plan.renamed.len(),
+                skipped = plan.skipped_schedules,
+                "configuration imported"
+            );
+            Response::Imported {
+                blocks,
+                schedules,
+                renamed: renamed_lines(&plan.renamed),
+                skipped_schedules: plan.skipped_schedules,
+            }
+        }
     }
+}
+
+/// How many blocks and schedules an import adds: the plan's totals less
+/// what was already saved (`base_*`, zero on Replace). Pure, since the
+/// branch that reports them ends in a save a dev box cannot complete.
+fn imported_counts(plan: &ImportPlan, base_blocks: usize, base_schedules: usize) -> (usize, usize) {
+    (
+        plan.blocks.len() - base_blocks,
+        plan.schedules.len() - base_schedules,
+    )
+}
+
+/// `"old → new"` per renamed block, the form the `Imported` response and
+/// the GUI's summary line show.
+fn renamed_lines(renamed: &[(String, String)]) -> Vec<String> {
+    renamed
+        .iter()
+        .map(|(from, to)| format!("{from} → {to}"))
+        .collect()
 }
 
 /// Returns `Some(error)` when a settings password is set and no unlock window
@@ -3340,5 +3474,439 @@ mod tests {
         let st = daemon.state.lock().await;
         assert!(st.active[0].break_until_unix.is_none());
         assert!(st.allowance.is_empty());
+    }
+
+    // ── export / import ─────────────────────────────────────────────────────
+    //
+    // The document logic (ids, renames, duplicate schedules, validation
+    // text) is core's and tested there; these pin the dispatch arm: what the
+    // export carries, the order of the gates, the exact premium copy, and
+    // that a refusal leaves state untouched.
+
+    use grepfocus_core::config_doc::ConfigDoc;
+
+    fn doc(blocks: Vec<Block>, schedules: Vec<Schedule>) -> ConfigDoc {
+        config_doc::build(&blocks, &schedules, 0, "test")
+    }
+
+    fn import(doc: ConfigDoc, mode: ImportMode) -> Request {
+        Request::ImportConfig { doc, mode }
+    }
+
+    /// The accept path ends in `state::save`, which fails against the real
+    /// state dir in tests: `Imported` (a writable dir) and "save failed"
+    /// both prove every gate was passed. Returns whether the save failed,
+    /// so the caller can check the rollback.
+    fn assert_reached_save(resp: &Response) -> bool {
+        match resp {
+            Response::Imported { .. } => false,
+            Response::Error { message } => {
+                assert!(
+                    message.starts_with("save failed: "),
+                    "expected to reach the save step, got: {message}"
+                );
+                true
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// Blocks, schedules and the two id counters — the four things an import
+    /// may change — as one comparable value.
+    async fn config_of(daemon: &Arc<Daemon>) -> serde_json::Value {
+        let st = daemon.state.lock().await;
+        serde_json::json!({
+            "blocks": st.blocks,
+            "schedules": st.schedules,
+            "next_id": st.next_id,
+            "next_schedule_id": st.next_schedule_id,
+        })
+    }
+
+    #[test]
+    fn imported_counts_subtract_what_was_already_saved() {
+        let plan = ImportPlan {
+            blocks: vec![blk(1, vec![]), blk(2, vec![]), blk(3, vec![])],
+            schedules: vec![sched(1), sched(2)],
+            next_id: 4,
+            next_schedule_id: 3,
+            renamed: vec![],
+            skipped_schedules: 0,
+        };
+        // Merge over one saved block and two saved schedules: two blocks
+        // and nothing else were added. Replace counts everything.
+        assert_eq!(imported_counts(&plan, 1, 2), (2, 0));
+        assert_eq!(imported_counts(&plan, 0, 0), (3, 2));
+        assert_eq!(imported_counts(&plan, 3, 2), (0, 0));
+    }
+
+    #[test]
+    fn renamed_lines_join_with_an_arrow() {
+        assert_eq!(
+            renamed_lines(&[
+                ("Work".to_string(), "Work (imported)".to_string()),
+                ("Work".to_string(), "Work (imported 2)".to_string()),
+            ]),
+            ["Work → Work (imported)", "Work → Work (imported 2)"]
+        );
+        assert!(renamed_lines(&[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn export_config_returns_only_blocks_and_schedules() {
+        let daemon = test_daemon();
+        {
+            let mut st = daemon.state.lock().await;
+            st.blocks.push(blk(1, vec![steam()]));
+            st.schedules.push(Schedule { id: 4, ..sched(1) });
+            st.next_id = 2;
+            st.next_schedule_id = 5;
+            st.password_hash = Some("$argon2id$v=19$m=19456,t=2,p=1$abc$def".into());
+            st.license_token = Some("GF1.sekrit-token".into());
+            st.high_water_unix = 1_752_192_000;
+            st.stats.totals.sessions = 3;
+            st.active.push(active_with_lock(1, Unlocked, 0));
+            st.settings.notifications = false;
+        }
+        *daemon.license.lock().await = Some(claims("perpetual", None));
+        // A block clock far behind the wall: the stamp must follow the wall.
+        *daemon.clock() = crate::clock::BlockClock::seed(
+            crate::clock::Readings {
+                wall_unix: 1_000_000,
+                boot_secs: crate::clock::read().boot_secs,
+            },
+            0,
+        );
+        let resp = dispatch(Request::ExportConfig {}, &daemon).await;
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["result"], "config");
+        let stamp = v["doc"]["exported_at_unix"].as_u64().unwrap();
+        assert!(stamp.abs_diff(now_unix()) <= 5, "wall time, got {stamp}");
+        assert!(
+            stamp.abs_diff(daemon.now()) > 1_000_000,
+            "the block clock ({}) leaked into the export stamp",
+            daemon.now()
+        );
+        let d = v["doc"].as_object().expect("doc object");
+        let mut keys: Vec<&str> = d.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "app_version",
+                "blocks",
+                "exported_at_unix",
+                "schedules",
+                "schema"
+            ]
+        );
+        assert_eq!(d["schema"], config_doc::SCHEMA);
+        assert_eq!(d["app_version"], crate::health::DAEMON_VERSION);
+        assert_eq!(d["blocks"].as_array().unwrap().len(), 1);
+        assert_eq!(d["blocks"][0]["id"], 1);
+        assert_eq!(d["blocks"][0]["name"], "block-1");
+        assert_eq!(d["blocks"][0]["apps"][0]["name"], "steam");
+        assert_eq!(d["schedules"].as_array().unwrap().len(), 1);
+        assert_eq!(d["schedules"][0]["id"], 4);
+        assert_eq!(d["schedules"][0]["block_id"], 1);
+        // Nothing else rides along, under any spelling.
+        let text = serde_json::to_string(&resp).unwrap();
+        for needle in [
+            "argon2",
+            "password",
+            "sekrit",
+            "license",
+            "high_water",
+            "stats",
+            "sessions",
+            "active",
+            "started_at",
+            "pomodoro",
+            "notifications",
+            "next_id",
+        ] {
+            assert!(
+                !text.contains(needle),
+                "{needle} leaked into the export: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn import_config_is_gated_by_the_settings_lock() {
+        let daemon = test_daemon();
+        daemon.state.lock().await.password_hash =
+            Some("$argon2id$v=19$m=19456,t=2,p=1$abc$def".to_string());
+        let resp = dispatch(
+            import(doc(vec![blk(1, vec![])], vec![]), ImportMode::Merge),
+            &daemon,
+        )
+        .await;
+        assert_eq!(err_msg(resp), MSG_SETTINGS_LOCKED);
+        assert!(daemon.state.lock().await.blocks.is_empty());
+    }
+
+    // The schema check is the daemon's own, before the Replace refusal and
+    // before the plan: a raw socket client never ran `parse`.
+    #[tokio::test]
+    async fn import_config_refuses_newer_schema() {
+        let daemon = test_daemon();
+        daemon
+            .state
+            .lock()
+            .await
+            .active
+            .push(active_with_lock(1, Unlocked, 0));
+        let before = config_of(&daemon).await;
+        let mut newer = doc(vec![blk(1, vec![])], vec![]);
+        newer.schema = config_doc::SCHEMA + 1;
+        let resp = dispatch(import(newer, ImportMode::Replace), &daemon).await;
+        assert_eq!(
+            err_msg(resp),
+            "exported by a newer GrepFocus (schema 2) — update first"
+        );
+        let mut none = doc(vec![blk(1, vec![])], vec![]);
+        none.schema = 0;
+        let resp = dispatch(import(none, ImportMode::Merge), &daemon).await;
+        assert_eq!(err_msg(resp), "not a GrepFocus export: missing schema");
+        assert_eq!(config_of(&daemon).await, before);
+    }
+
+    #[tokio::test]
+    async fn import_merge_free_tier_cap_with_exact_copy() {
+        // One saved block: on the free tier the first imported one is the
+        // second saved one, and gets AddBlock's exact cap copy.
+        let daemon = test_daemon();
+        daemon.state.lock().await.blocks.push(blk(1, vec![]));
+        daemon.state.lock().await.next_id = 2;
+        let before = config_of(&daemon).await;
+        let resp = dispatch(
+            import(doc(vec![blk(1, vec![])], vec![]), ImportMode::Merge),
+            &daemon,
+        )
+        .await;
+        assert_eq!(err_msg(resp), MSG_BLOCK_CAP);
+        assert_eq!(config_of(&daemon).await, before, "nothing imported");
+
+        // No saved block, two in the file: the SECOND one trips the cap —
+        // the blocks before it count as saved. Still nothing imported.
+        let daemon = test_daemon();
+        let resp = dispatch(
+            import(
+                doc(vec![blk(1, vec![]), blk(2, vec![])], vec![]),
+                ImportMode::Merge,
+            ),
+            &daemon,
+        )
+        .await;
+        assert_eq!(err_msg(resp), MSG_BLOCK_CAP);
+        assert!(daemon.state.lock().await.blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn import_replace_one_block_passes_free_cap() {
+        // Replace empties the base first, so a one-block file fits the free
+        // tier even with a block saved — and reaches the save step.
+        let daemon = test_daemon();
+        daemon.state.lock().await.blocks.push(blk(1, vec![]));
+        daemon.state.lock().await.next_id = 2;
+        let before = config_of(&daemon).await;
+        let resp = dispatch(
+            import(doc(vec![blk(1, vec![])], vec![]), ImportMode::Replace),
+            &daemon,
+        )
+        .await;
+        assert_not_premium_gated(&resp);
+        if assert_reached_save(&resp) {
+            // All four restored after the failed save.
+            assert_eq!(config_of(&daemon).await, before);
+        } else {
+            let st = daemon.state.lock().await;
+            assert_eq!(st.blocks.len(), 1);
+            assert_eq!(st.blocks[0].id, 2, "ids are never reused");
+            assert_eq!(st.next_id, 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn import_apps_and_lock_gated_like_add_block() {
+        // No saved block, so the cap cannot trip first.
+        let daemon = test_daemon();
+        let resp = dispatch(
+            import(doc(vec![blk(1, vec![steam()])], vec![]), ImportMode::Merge),
+            &daemon,
+        )
+        .await;
+        assert_eq!(err_msg(resp), MSG_APP_BLOCKING);
+        let mut locked = blk(1, vec![]);
+        locked.lock = ChallengeBreaks;
+        let resp = dispatch(
+            import(doc(vec![locked], vec![]), ImportMode::Merge),
+            &daemon,
+        )
+        .await;
+        assert_eq!(err_msg(resp), MSG_LOCK_MODES);
+        assert!(daemon.state.lock().await.blocks.is_empty());
+
+        // Licensed: both pass every gate.
+        *daemon.license.lock().await = Some(claims("perpetual", None));
+        let mut locked = blk(1, vec![steam()]);
+        locked.lock = PasswordBreaks;
+        let resp = dispatch(
+            import(doc(vec![locked], vec![]), ImportMode::Merge),
+            &daemon,
+        )
+        .await;
+        assert_not_premium_gated(&resp);
+        assert_reached_save(&resp);
+    }
+
+    #[tokio::test]
+    async fn import_schedules_gated_free() {
+        let daemon = test_daemon();
+        let resp = dispatch(
+            import(doc(vec![blk(1, vec![])], vec![sched(1)]), ImportMode::Merge),
+            &daemon,
+        )
+        .await;
+        assert_eq!(err_msg(resp), MSG_SCHEDULES);
+        {
+            let st = daemon.state.lock().await;
+            assert!(
+                st.blocks.is_empty(),
+                "the block is not imported without its schedule"
+            );
+            assert!(st.schedules.is_empty());
+        }
+
+        *daemon.license.lock().await = Some(claims("perpetual", None));
+        let resp = dispatch(
+            import(doc(vec![blk(1, vec![])], vec![sched(1)]), ImportMode::Merge),
+            &daemon,
+        )
+        .await;
+        assert_not_premium_gated(&resp);
+        assert_reached_save(&resp);
+    }
+
+    // Free tier with a saved block, and a file whose block has a bad domain:
+    // the validation error, not the cap pitch — "typo before pitch".
+    #[tokio::test]
+    async fn import_validation_precedes_premium_gate() {
+        let daemon = test_daemon();
+        daemon.state.lock().await.blocks.push(blk(1, vec![]));
+        let resp = dispatch(
+            import(
+                doc(
+                    vec![blk_with_domains(9, &["reddit.com\n0.0.0.0 evil"])],
+                    vec![],
+                ),
+                ImportMode::Merge,
+            ),
+            &daemon,
+        )
+        .await;
+        let msg = err_msg(resp);
+        assert!(msg.starts_with("block \"block-9\": domain "), "{msg}");
+        assert!(!msg.contains("premium"), "{msg}");
+        assert_eq!(daemon.state.lock().await.blocks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn import_replace_refused_while_active_and_during_pomodoro() {
+        let daemon = test_daemon();
+        daemon
+            .state
+            .lock()
+            .await
+            .active
+            .push(active_with_lock(1, Unlocked, 0));
+        let before = config_of(&daemon).await;
+        let resp = dispatch(
+            import(doc(vec![blk(1, vec![])], vec![]), ImportMode::Replace),
+            &daemon,
+        )
+        .await;
+        assert_eq!(err_msg(resp), MSG_REPLACE_WHILE_ACTIVE);
+        assert_eq!(config_of(&daemon).await, before);
+
+        // A pomodoro session counts as running even between its actives.
+        let daemon = test_daemon();
+        daemon.state.lock().await.pomodoro = Some(PomodoroSession {
+            block_id: 1,
+            focus_secs: 1500,
+            break_secs: 300,
+            cycles_total: 4,
+            cycle_index: 0,
+            phase: PomodoroPhase::Break,
+            phase_ends_unix: u64::MAX,
+        });
+        let resp = dispatch(
+            import(doc(vec![blk(1, vec![])], vec![]), ImportMode::Replace),
+            &daemon,
+        )
+        .await;
+        assert_eq!(err_msg(resp), MSG_REPLACE_WHILE_ACTIVE);
+        assert!(daemon.state.lock().await.blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn import_merge_passes_while_a_block_is_active() {
+        // Adding never touches an active: Merge clears the running-block
+        // refusal and every gate (free tier, no saved block, one in the
+        // file) and reaches the save step.
+        let daemon = test_daemon();
+        daemon
+            .state
+            .lock()
+            .await
+            .active
+            .push(active_with_lock(1, Unlocked, 0));
+        let before = config_of(&daemon).await;
+        let resp = dispatch(
+            import(doc(vec![blk(1, vec![])], vec![]), ImportMode::Merge),
+            &daemon,
+        )
+        .await;
+        assert_not_premium_gated(&resp);
+        if let Response::Error { message } = &resp {
+            assert_ne!(message, MSG_REPLACE_WHILE_ACTIVE);
+        }
+        if assert_reached_save(&resp) {
+            assert_eq!(
+                config_of(&daemon).await,
+                before,
+                "rolled back after a failed save"
+            );
+        }
+        // The active was never touched either way.
+        assert_eq!(daemon.state.lock().await.active.len(), 1);
+    }
+
+    // A schedule pointing at a block the file does not contain is a plan
+    // error, found before any gate and before any mutation — even licensed,
+    // even with the referenced id SAVED (the file cannot know saved ids).
+    #[tokio::test]
+    async fn import_dangling_schedule_leaves_state_untouched() {
+        let daemon = test_daemon();
+        *daemon.license.lock().await = Some(claims("perpetual", None));
+        {
+            let mut st = daemon.state.lock().await;
+            st.blocks.push(blk(7, vec![]));
+            st.schedules.push(Schedule { id: 3, ..sched(7) });
+            st.next_id = 8;
+            st.next_schedule_id = 4;
+        }
+        let before = config_of(&daemon).await;
+        let resp = dispatch(
+            import(doc(vec![blk(1, vec![])], vec![sched(7)]), ImportMode::Merge),
+            &daemon,
+        )
+        .await;
+        assert_eq!(
+            err_msg(resp),
+            "schedule \"mornings\": refers to block id 7 which is not in the file"
+        );
+        assert_eq!(config_of(&daemon).await, before);
     }
 }
