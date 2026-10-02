@@ -2,11 +2,12 @@
 //! `state.schedules`. Runs once per second.
 //!
 //! Three jobs per tick, performed under a single state lock:
-//! 1. Drop any active blocks whose `ends_at_unix <= now`.
-//! 2. Drop any *schedule-originated* active blocks whose driving schedule
-//!    has been disabled/deleted or has slid outside its time window.
-//! 3. Start any enabled schedule that is currently in its window and not
+//! 1. Drop any active blocks whose `ends_at_unix <= now`. This is the ONLY
+//!    way a block ends: a schedule-started block runs to the window end it
+//!    snapshotted when it fired, whatever happens to its schedule meanwhile.
+//! 2. Start any enabled schedule that is currently in its window and not
 //!    already represented in `state.active`.
+//! 3. Clear breaks that have elapsed (enforcement resumes).
 //!
 //! After mutating, persist the new state and (if anything changed)
 //! recompute the hosts file outside the lock.
@@ -140,8 +141,8 @@ async fn tick(
         // drop + single `FocusSession` record to reconcile step 1 in this same
         // tick (the block's `ends_at_unix` == the last focus's `phase_ends`, so
         // step 1 fires). Running first also means the two never fight over
-        // `break_until_unix`: advance sets a future break (step 4 leaves it) or
-        // clears an elapsed one (step 4 then finds nothing) — either way they
+        // `break_until_unix`: advance sets a future break (step 3 leaves it) or
+        // clears an elapsed one (step 3 then finds nothing) — either way they
         // converge. A phase transition MUST be persisted or a restart loses it,
         // so its `changed` is OR'd into reconcile's before the save.
         let pomo_changed = {
@@ -203,7 +204,7 @@ fn prune_break_challenges(pending: &mut HashMap<u64, String>, active: &[ActiveBl
 ///   focus's `phase_ends`, so reconcile step 1 drops it and records the ONE
 ///   break-inclusive `FocusSession` through the existing single choke point.
 /// * Break ended → bump `cycle_index`, return to Focus, and clear the block's
-///   `break_until_unix` (reconcile step 4 would also clear an elapsed break —
+///   `break_until_unix` (reconcile step 3 would also clear an elapsed break —
 ///   idempotent; clearing here keeps the block's state self-consistent).
 ///
 /// Prune (checked first): if the session's block is no longer active — expired
@@ -280,14 +281,19 @@ fn advance_pomodoro(
 /// the state therefore needs persisting.
 ///
 /// Steps, in order:
-/// 1. Drop actives whose `ends_at_unix <= now_unix`.
-/// 2. Drop schedule-originated actives whose schedule was disabled/deleted or
-///    slid out of its window.
-/// 3. Start any enabled schedule currently in-window and not already active —
+/// 1. Drop actives whose `ends_at_unix <= now_unix`. The schedule table is
+///    NOT consulted here: a schedule-started active carries the end of the
+///    window it fired for in `ends_at_unix`, and nothing done to the schedule
+///    afterwards — disable, edit, delete — touches that record. The edit
+///    applies from the schedule's next window; an edit that EXTENDS the
+///    running window makes it re-fire at the old end (step 2 finds the block
+///    no longer active and the window still open), which is two sessions.
+/// 2. Start any enabled schedule currently in-window and not already active —
 ///    unless `gates.schedules` is off, in which case the fire is skipped (and
 ///    logged once per window via `skipped_fires`). New actives snapshot
-///    `gates.app_blocking` into `apps_enforced`.
-/// 4. Clear breaks that have elapsed (enforcement resumes).
+///    `gates.app_blocking` into `apps_enforced` and the window end into
+///    `ends_at_unix`.
+/// 3. Clear breaks that have elapsed (enforcement resumes).
 ///
 /// It also prunes break-history records no allowance policy can still see
 /// (retention only — the daily reset lives in the reducers' `day == today`
@@ -304,13 +310,16 @@ fn reconcile(
     let schedules: Vec<Schedule> = st.schedules.clone();
     let mut changed = false;
 
-    // Steps 1 and 2 are the SINGLE choke point where a block "ends": a
-    // manual block can only end by wall-clock expiry (step 1, no cancel), a
-    // scheduled block by expiry or by its window sliding/disabling/deleting
-    // (step 2). Both used to be plain `retain` drops; now each dropped active
-    // is turned into exactly one recorded `FocusSession`. A daemon restart
-    // mid-block emits NO false end — the `ActiveBlock` persists in `State` and
-    // is still active on reload, so nothing is dropped here.
+    // Step 1 is the SINGLE choke point where a block "ends": by expiry of
+    // its `ends_at_unix`, and by nothing else — a manual block has no cancel,
+    // a scheduled block snapshotted its window end when it fired and keeps
+    // it through any later change to the schedule, and a pomodoro active
+    // ends only by the set's backstop or `stop_pomodoro` (which sets the end
+    // to now so this step records it). The drop is a partition, not a
+    // `retain`, so each dropped active is turned into exactly one recorded
+    // `FocusSession`. A daemon restart mid-block emits NO false end — the
+    // `ActiveBlock` persists in `State` and is still active on reload, so
+    // nothing is dropped here.
 
     // 1. Expire by wall clock.
     let before = st.active.len();
@@ -327,32 +336,7 @@ fn reconcile(
         changed = true;
     }
 
-    // 2. End scheduled actives whose driving schedule disappeared,
-    //    was disabled, or slid out of its window.
-    let before = st.active.len();
-    let (kept, ended) = partition_active(std::mem::take(&mut st.active), |a| match &a.originator {
-        Originator::Manual => true,
-        // Not schedule-window-driven: retained like Manual. A pomodoro active
-        // ends only by its own `ends_at_unix` (the set backstop, step 1) or by
-        // `stop_pomodoro`; `advance_pomodoro` drives its focus/break rhythm.
-        Originator::Pomodoro => true,
-        Originator::Schedule { schedule_id } => schedules
-            .iter()
-            .find(|s| s.id == *schedule_id)
-            .map(|s| s.enabled && schedule_active_at(s, now_local))
-            .unwrap_or(false),
-    });
-    st.active = kept;
-    let auto_ended = before - st.active.len();
-    if auto_ended > 0 {
-        info!(count = auto_ended, "ended schedule-driven blocks");
-        for a in &ended {
-            record_ended_session(&mut st.stats, a, now_unix, today);
-        }
-        changed = true;
-    }
-
-    // 3. Auto-start schedules whose window is now open.
+    // 2. Auto-start schedules whose window is now open.
     //
     // Drop skip-log markers for windows that have passed first, so the set
     // can't grow across weeks of unlicensed uptime.
@@ -424,7 +408,7 @@ fn reconcile(
         changed = true;
     }
 
-    // 4. Resume any block whose break has ended (enforcement returns).
+    // 3. Resume any block whose break has ended (enforcement returns).
     for a in st.active.iter_mut() {
         if a.break_until_unix.is_some_and(|t| t <= now_unix) {
             a.break_until_unix = None;
@@ -809,8 +793,23 @@ mod tests {
         assert!(!changed);
     }
 
+    /// The running block must come out of `reconcile` exactly as it went in:
+    /// still the one active, with its snapshotted end, nothing recorded.
+    fn assert_still_running(st: &State, changed: bool, ends_at_unix: u64) {
+        assert!(!changed);
+        assert_eq!(st.active.len(), 1);
+        assert_eq!(st.active[0].ends_at_unix, ends_at_unix);
+        assert!(matches!(
+            st.active[0].originator,
+            Originator::Schedule { schedule_id: 1 }
+        ));
+        assert!(st.stats.sessions.is_empty());
+    }
+
     #[test]
-    fn ends_scheduled_active_when_disabled() {
+    fn disabled_schedule_does_not_end_its_running_block() {
+        // Disabling mid-window is not an escape hatch: the block keeps the
+        // window end it snapshotted when it fired.
         let now_l = t(9, 30, chrono::Weekday::Mon);
         let now = unix(&now_l);
         let mut st = State::default();
@@ -818,7 +817,8 @@ mod tests {
         let mut sch = s(540, 60, DAY_MON);
         sch.enabled = false;
         st.schedules.push(sch);
-        st.active.push(sched_active(0, 1, now + 3600));
+        let ends_at = unix(&t(10, 0, chrono::Weekday::Mon));
+        st.active.push(sched_active(0, 1, ends_at));
         let changed = reconcile(
             &mut st,
             now,
@@ -827,38 +827,18 @@ mod tests {
             &all_gates(),
             &mut HashSet::new(),
         );
-        assert!(changed);
-        assert!(st.active.is_empty());
+        assert_still_running(&st, changed, ends_at);
     }
 
     #[test]
-    fn ends_scheduled_active_when_window_slides() {
-        let now_l = t(10, 30, chrono::Weekday::Mon); // past the 09:00–10:00 window
-        let now = unix(&now_l);
-        let mut st = State::default();
-        st.blocks.push(block(0));
-        st.schedules.push(s(540, 60, DAY_MON));
-        st.active.push(sched_active(0, 1, now + 3600));
-        let changed = reconcile(
-            &mut st,
-            now,
-            &now_l,
-            day_of(&now_l),
-            &all_gates(),
-            &mut HashSet::new(),
-        );
-        assert!(changed);
-        assert!(st.active.is_empty());
-    }
-
-    #[test]
-    fn ends_scheduled_active_when_schedule_deleted() {
+    fn deleted_schedule_does_not_end_its_running_block() {
         let now_l = t(9, 30, chrono::Weekday::Mon);
         let now = unix(&now_l);
         let mut st = State::default();
         st.blocks.push(block(0));
-        // No schedule with id 99 exists.
-        st.active.push(sched_active(0, 99, now + 3600));
+        // The schedule that fired this block (id 1) is gone from the table.
+        let ends_at = unix(&t(10, 0, chrono::Weekday::Mon));
+        st.active.push(sched_active(0, 1, ends_at));
         let changed = reconcile(
             &mut st,
             now,
@@ -867,8 +847,108 @@ mod tests {
             &all_gates(),
             &mut HashSet::new(),
         );
+        assert_still_running(&st, changed, ends_at);
+    }
+
+    #[test]
+    fn moved_window_does_not_end_its_running_block() {
+        // The window was moved to the afternoon while its morning instance
+        // runs: `now` is outside the schedule's window, the block stays.
+        let now_l = t(9, 30, chrono::Weekday::Mon);
+        let now = unix(&now_l);
+        let mut st = State::default();
+        st.blocks.push(block(0));
+        st.schedules.push(s(14 * 60, 60, DAY_MON));
+        let ends_at = unix(&t(10, 0, chrono::Weekday::Mon));
+        st.active.push(sched_active(0, 1, ends_at));
+        let changed = reconcile(
+            &mut st,
+            now,
+            &now_l,
+            day_of(&now_l),
+            &all_gates(),
+            &mut HashSet::new(),
+        );
+        assert_still_running(&st, changed, ends_at);
+    }
+
+    #[test]
+    fn shortened_schedule_runs_to_snapshotted_end() {
+        // 09:00 for 60 min fired (end snapshotted at 10:00); the window is
+        // then cut to 30 min. At 09:45 the schedule is out of window and the
+        // block runs on; at 10:00 it expires through step 1, once.
+        let ends_at = unix(&t(10, 0, chrono::Weekday::Mon));
+        let mut st = State::default();
+        st.blocks.push(block(0));
+        st.schedules.push(s(540, 30, DAY_MON));
+        let mut a = sched_active(0, 1, ends_at);
+        a.started_at_unix = unix(&t(9, 0, chrono::Weekday::Mon));
+        st.active.push(a);
+
+        let mid = t(9, 45, chrono::Weekday::Mon);
+        let changed = reconcile(
+            &mut st,
+            unix(&mid),
+            &mid,
+            day_of(&mid),
+            &all_gates(),
+            &mut HashSet::new(),
+        );
+        assert_still_running(&st, changed, ends_at);
+
+        let end = t(10, 0, chrono::Weekday::Mon);
+        let changed = reconcile(
+            &mut st,
+            unix(&end),
+            &end,
+            day_of(&end),
+            &all_gates(),
+            &mut HashSet::new(),
+        );
         assert!(changed);
         assert!(st.active.is_empty());
+        assert_eq!(st.stats.sessions.len(), 1);
+        assert_eq!(st.stats.sessions[0].origin, Origin::Schedule);
+        assert_eq!(st.stats.sessions[0].duration_secs, 3600);
+    }
+
+    #[test]
+    fn extended_schedule_refires_at_snapshotted_end() {
+        // 09:00 for 60 min fired (end 10:00); the window is then stretched to
+        // 120 min. The running block still ends at 10:00 — one session — and
+        // the same tick re-fires the schedule, whose window is still open,
+        // as a second active ending at the new 11:00.
+        let ends_at = unix(&t(10, 0, chrono::Weekday::Mon));
+        let mut st = State::default();
+        st.blocks.push(block(0));
+        st.schedules.push(s(540, 120, DAY_MON));
+        let mut a = sched_active(0, 1, ends_at);
+        a.started_at_unix = unix(&t(9, 0, chrono::Weekday::Mon));
+        st.active.push(a);
+
+        let end = t(10, 0, chrono::Weekday::Mon);
+        let changed = reconcile(
+            &mut st,
+            unix(&end),
+            &end,
+            day_of(&end),
+            &all_gates(),
+            &mut HashSet::new(),
+        );
+        assert!(changed);
+        assert_eq!(st.stats.sessions.len(), 1);
+        assert_eq!(st.stats.sessions[0].origin, Origin::Schedule);
+        assert_eq!(st.stats.sessions[0].duration_secs, 3600);
+        assert_eq!(st.active.len(), 1);
+        assert_eq!(st.active[0].started_at_unix, unix(&end));
+        assert_eq!(
+            st.active[0].ends_at_unix,
+            unix(&t(11, 0, chrono::Weekday::Mon))
+        );
+        assert!(matches!(
+            st.active[0].originator,
+            Originator::Schedule { schedule_id: 1 }
+        ));
     }
 
     #[test]
@@ -1050,16 +1130,16 @@ mod tests {
 
     #[test]
     fn schedule_end_records_a_schedule_origin_session() {
-        // Disabled schedule → its active is dropped in step 2 and recorded.
-        let now_l = t(9, 30, chrono::Weekday::Mon);
+        // A schedule-started active reaches its snapshotted end → dropped in
+        // step 1 like any other, and recorded with a Schedule origin. The
+        // schedule is still enabled but out of window, so nothing re-fires.
+        let now_l = t(10, 0, chrono::Weekday::Mon);
         let now = unix(&now_l);
         let today = day_of(&now_l);
         let mut st = State::default();
         st.blocks.push(block(0));
-        let mut sch = s(540, 60, DAY_MON);
-        sch.enabled = false;
-        st.schedules.push(sch);
-        let mut a = sched_active(0, 1, now + 3600);
+        st.schedules.push(s(540, 60, DAY_MON));
+        let mut a = sched_active(0, 1, now);
         a.started_at_unix = now - 42;
         st.active.push(a);
         let changed = reconcile(
@@ -1071,6 +1151,7 @@ mod tests {
             &mut HashSet::new(),
         );
         assert!(changed);
+        assert!(st.active.is_empty());
         assert_eq!(st.stats.sessions.len(), 1);
         assert_eq!(st.stats.sessions[0].origin, Origin::Schedule);
         assert_eq!(st.stats.sessions[0].duration_secs, 42);
@@ -1381,9 +1462,9 @@ mod tests {
 
     #[test]
     fn reconcile_retains_a_running_pomodoro_active() {
-        // Step 2 retains a Pomodoro active like Manual — it is not
-        // schedule-window-driven. A mid-focus session on reload keeps running
-        // and records no false end.
+        // Nothing but its own backstop (step 1) ends a Pomodoro active, and
+        // the backstop is in the future. A mid-focus session on reload keeps
+        // running and records no false end.
         let now_l = t(9, 30, chrono::Weekday::Mon);
         let now = unix(&now_l);
         let mut st = State::default();

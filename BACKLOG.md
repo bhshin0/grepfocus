@@ -361,6 +361,24 @@ Two things to settle at release time:
 - Locking the screen no longer brings a window that was hidden in the tray
   back on screen.
 
+## 0.7.0 — blocks that tell you, schedules that hold, config you can carry
+
+Status: **in progress** — design and work packages in
+`docs/plans/0.7.0-plan.md`. Landed so far: the core types, the daemon's
+attempt counts and event log, the GUI notification watcher, and the daemon
+half of schedule integrity (a schedule-started block keeps its snapshotted
+window end). Still to come: midnight-spanning windows, the GUI's
+"running now until" hint, export/import, the plan records.
+
+### Pending release-note lines (0.7.0)
+
+Drafted as each package lands, in changelog order; the release commit turns
+them into `docs/release-notes-0.7.0.txt` as the 0.6.0 lines were.
+
+- Editing, disabling or deleting a schedule no longer ends a block it has
+  already started: the block runs to the end of the window it fired for,
+  and the change applies from the next window.
+
 ## Decisions
 
 - **Rename to grepfocus: DONE (2026-07-10).** Deferred on 2026-07-04 (then

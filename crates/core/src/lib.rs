@@ -202,6 +202,10 @@ pub enum Originator {
 pub struct ActiveBlock {
     pub block: Block,
     pub started_at_unix: u64,
+    /// When the block ends — the ONLY way it does. For a `Schedule`
+    /// originator this is the end of the window that fired it, snapshotted
+    /// at activation like `lock` and `allowance` below: disabling, editing or
+    /// deleting the schedule afterwards never moves it.
     pub ends_at_unix: u64,
     #[serde(default = "default_originator")]
     pub originator: Originator,

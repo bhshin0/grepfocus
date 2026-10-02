@@ -297,6 +297,10 @@ own — `Request` in `crates/core/src/lib.rs` is the full list):
 | `cancel_block`    | —                                     | Always rejected while a block is active      |
 | `get_status`      | —                                     | Active blocks, server time, license, settings, plus `health` (daemon version, install kind, nft/hosts/proxy state, browser DoH policies, drift counters, last error) |
 
+`update_schedule` and `delete_schedule` are accepted while the schedule's
+block is running: the block keeps the window end it snapshotted when it
+fired, so the change applies from the schedule's next window.
+
 A `Block` is `{ id, name, domains: [..], apps: [AppMatcher, ..] }` where
 `AppMatcher` is one of `{kind: "exe_path", path}`, `{kind: "basename", name}`,
 or `{kind: "cmdline", contains}`.
@@ -582,6 +586,10 @@ that Cold Turkey beats either.
   long as the lock screen is up, and the window stays hidden until the tray
   is back after the unlock. Launching GrepFocus again always surfaces the
   existing instance.
+- **Schedules.** Editing, disabling or deleting a schedule takes effect
+  from its next window — a block the schedule already started keeps the
+  end it was given when it fired. Stretching the running window makes it
+  fire again at the old end (two sessions in the usage stats).
 - **The update check fails behind a TLS-intercepting proxy.** It trusts the
   Mozilla root store bundled with the app (webpki-roots), not the system
   trust store, so a proxy that re-signs traffic with a private CA makes the

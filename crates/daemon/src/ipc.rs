@@ -625,6 +625,12 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             Response::Added { id }
         }
 
+        // Allowed while the schedule's block is running, unlike UpdateBlock:
+        // the running active snapshotted its window end at fire time
+        // (`ActiveBlock::ends_at_unix`) and the scheduler never re-reads the
+        // schedule for it, so no edit can shorten or end the block — it takes
+        // effect from the next window. Refusing would only lock the schedule
+        // table for the whole window and buy no safety.
         Request::UpdateSchedule { schedule } => {
             let mut st = daemon.state.lock().await;
             if let Some(resp) = gate_config(daemon, &st).await {
@@ -661,7 +667,9 @@ async fn dispatch(req: Request, daemon: &Arc<Daemon>) -> Response {
             Response::Ok {}
         }
 
-        // No license gate: removing configuration is always allowed.
+        // No license gate: removing configuration is always allowed. Also
+        // allowed while the schedule's block is running, for the reason given
+        // on UpdateSchedule: the active keeps its snapshotted end and runs on.
         Request::DeleteSchedule { id } => {
             let mut st = daemon.state.lock().await;
             if let Some(resp) = gate_config(daemon, &st).await {
@@ -2530,6 +2538,78 @@ mod tests {
         daemon.state.lock().await.blocks.push(blk(1, vec![]));
         let resp = dispatch(Request::UpdateSchedule { schedule: sched(1) }, &daemon).await;
         assert_eq!(err_msg(resp), MSG_SCHEDULES);
+    }
+
+    /// A running block started by this very schedule. Seeded straight into
+    /// state, the way the scheduler would have fired it.
+    fn running_from_schedule(block_id: u64, schedule_id: u64) -> ActiveBlock {
+        ActiveBlock {
+            block: blk(block_id, vec![]),
+            started_at_unix: 1_752_192_000,
+            ends_at_unix: 1_752_195_600,
+            originator: Originator::Schedule { schedule_id },
+            break_until_unix: None,
+            apps_enforced: false,
+            lock: LockMode::Unlocked,
+            allowance: None,
+            attempts: 0,
+        }
+    }
+
+    /// Past every "is it running" check: Ok, or the save error the real state
+    /// dir produces in tests — never a refusal about an active block.
+    fn assert_not_refused_for_running(resp: &Response) {
+        if let Response::Error { message } = resp {
+            assert!(
+                message.starts_with("save failed"),
+                "unexpected refusal: {message}"
+            );
+            assert!(
+                !message.contains("active"),
+                "refused for running: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_schedule_passes_while_its_block_runs() {
+        // The edit lands on the table (or dies at the save); the running
+        // active is not consulted and not touched — its snapshotted end
+        // carries it.
+        let daemon = test_daemon();
+        *daemon.license.lock().await = Some(claims("perpetual", None));
+        {
+            let mut st = daemon.state.lock().await;
+            st.blocks.push(blk(1, vec![]));
+            st.schedules.push(Schedule { id: 1, ..sched(1) });
+            st.active.push(running_from_schedule(1, 1));
+        }
+        let moved = Schedule {
+            id: 1,
+            start_minute: 14 * 60,
+            ..sched(1)
+        };
+        let resp = dispatch(Request::UpdateSchedule { schedule: moved }, &daemon).await;
+        assert_not_refused_for_running(&resp);
+        let st = daemon.state.lock().await;
+        assert_eq!(st.active.len(), 1);
+        assert_eq!(st.active[0].ends_at_unix, 1_752_195_600);
+    }
+
+    #[tokio::test]
+    async fn delete_schedule_passes_while_its_block_runs() {
+        let daemon = test_daemon();
+        {
+            let mut st = daemon.state.lock().await;
+            st.blocks.push(blk(1, vec![]));
+            st.schedules.push(Schedule { id: 1, ..sched(1) });
+            st.active.push(running_from_schedule(1, 1));
+        }
+        let resp = dispatch(Request::DeleteSchedule { id: 1 }, &daemon).await;
+        assert_not_refused_for_running(&resp);
+        let st = daemon.state.lock().await;
+        assert_eq!(st.active.len(), 1);
+        assert_eq!(st.active[0].ends_at_unix, 1_752_195_600);
     }
 
     #[tokio::test]
