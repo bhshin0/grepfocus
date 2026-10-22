@@ -580,6 +580,17 @@ that Cold Turkey beats either.
   long as the lock screen is up, and the window stays hidden until the tray
   is back after the unlock. Launching GrepFocus again always surfaces the
   existing instance.
+- **Blank window on NVIDIA / Wayland.** WebKitGTK's DMA-BUF renderer can
+  leave the window blank on NVIDIA's proprietary driver, mostly under
+  Wayland. When that driver is loaded the app sets
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1` itself at startup — the slower
+  rendering path, which a settings window never notices; put `=0` in your
+  environment to get the default back. On another setup that shows a blank
+  window, try `WEBKIT_DISABLE_DMABUF_RENDERER=1 grepfocus-gui` first, then
+  `__NV_DISABLE_EXPLICIT_SYNC=1`, then `WEBKIT_DISABLE_COMPOSITING_MODE=1`
+  as a last resort, and persist whichever works as a line in
+  `~/.config/environment.d/grepfocus.conf` (log out and back in).
+  Enforcement is daemon-side and unaffected.
 - **The update check fails behind a TLS-intercepting proxy.** It trusts the
   Mozilla root store bundled with the app (webpki-roots), not the system
   trust store, so a proxy that re-signs traffic with a private CA makes the

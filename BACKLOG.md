@@ -607,3 +607,14 @@ to be redone when the item is picked up.
   `grepfocus` group. Connect failures now say what to do instead
   (start/install the daemon; `usermod` + re-login), with the raw error kept
   as a trailing line.
+- **[FIXED — 0.6.1, 2026-10-21] Blank window on NVIDIA /
+  Wayland** — reported from Bazzite (Fedora Atomic) with KDE Wayland: every
+  install route opened a blank window. WebKitGTK's DMA-BUF renderer against
+  NVIDIA's proprietary driver (Tauri's documented Linux-graphics case). The
+  GUI now sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` at startup, set-if-unset,
+  gated on the proprietary kernel module alone (`/proc/driver/nvidia/version`
+  or `/sys/module/nvidia`; Nouveau and other GPUs are untouched), so a blank
+  window on any other stack is still the user's to work around — the README
+  *Known limits* bullet lists the manual ladder (`__NV_DISABLE_EXPLICIT_SYNC`,
+  `WEBKIT_DISABLE_COMPOSITING_MODE`, `environment.d`). Not yet confirmed on
+  the reporter's machine.

@@ -1027,6 +1027,30 @@ fn configure_appimage_webview_env() {
     }
 }
 
+/// On NVIDIA's proprietary driver, WebKitGTK's DMA-BUF renderer and the
+/// driver disagree about the buffers they hand each other — mostly under
+/// Wayland — and the window stays blank: no error, no page, nothing to
+/// click. The fix Tauri documents (develop/debug/linux-graphics) is
+/// WEBKIT_DISABLE_DMABUF_RENDERER=1, which costs the faster rendering path,
+/// irrelevant for a settings-style UI. Must run before GTK/webkit initialize
+/// (before tauri::Builder::run). Unlike the AppImage fix above this applies
+/// to every install kind — the driver, not the packaging, is at fault — and
+/// is gated on the proprietary kernel module being loaded, so Nouveau and
+/// other GPUs keep WebKit's default. Set only if unset, so a user with
+/// WEBKIT_DISABLE_DMABUF_RENDERER=0 in their environment still wins.
+fn configure_gpu_webview_env() {
+    if nvidia_proprietary_present(std::path::Path::new("/")) {
+        set_env_if_unset("WEBKIT_DISABLE_DMABUF_RENDERER", std::ffi::OsStr::new("1"));
+    }
+}
+
+/// Whether NVIDIA's proprietary kernel module is loaded: it registers
+/// /proc/driver/nvidia and /sys/module/nvidia, and Nouveau exposes neither.
+/// `root` stands in for `/` so the check can run against a tempdir.
+fn nvidia_proprietary_present(root: &std::path::Path) -> bool {
+    root.join("proc/driver/nvidia/version").exists() || root.join("sys/module/nvidia").exists()
+}
+
 fn set_env_if_unset(key: &str, val: &std::ffi::OsStr) {
     if std::env::var_os(key).is_none() {
         std::env::set_var(key, val);
@@ -1044,8 +1068,10 @@ fn main() {
         return;
     }
 
-    // AppImage-only webview env fixes; must precede any GTK/webkit init below.
+    // Webview env fixes (AppImage helper paths, NVIDIA renderer); must
+    // precede any GTK/webkit init below.
     configure_appimage_webview_env();
+    configure_gpu_webview_env();
 
     // wry's custom URI scheme handler is unreliable on this webkit2gtk-4.1
     // build (2.52). Serve embedded assets via a real localhost HTTP server
@@ -1154,8 +1180,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        enforcement_red, installer_error, removal_refusal, version, ServiceAction, BOOTSTRAP,
-        GUI_VERSION, LOCAL_DAEMON_BIN, PACKAGED_DAEMON_BIN, PAYLOAD_FILES,
+        enforcement_red, installer_error, nvidia_proprietary_present, removal_refusal, version,
+        ServiceAction, BOOTSTRAP, GUI_VERSION, LOCAL_DAEMON_BIN, PACKAGED_DAEMON_BIN,
+        PAYLOAD_FILES,
     };
     use grepfocus_core::{Health, NftStatus};
 
@@ -1227,6 +1254,24 @@ mod tests {
             v.pre.is_empty() && v.build.is_empty(),
             "plain release: {GUI_VERSION}"
         );
+    }
+
+    /// The automatic DMA-BUF workaround keys off the proprietary module
+    /// alone, through either of the two paths it registers; Nouveau and other
+    /// GPUs must keep WebKit's default renderer.
+    #[test]
+    fn nvidia_detection_needs_the_proprietary_module() {
+        let root = tempfile::tempdir().expect("tempdir");
+        assert!(!nvidia_proprietary_present(root.path()));
+
+        let version = root.path().join("proc/driver/nvidia/version");
+        std::fs::create_dir_all(version.parent().unwrap()).unwrap();
+        std::fs::write(&version, "NVRM version: NVIDIA UNIX Open Kernel Module\n").unwrap();
+        assert!(nvidia_proprietary_present(root.path()));
+
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("sys/module/nvidia")).unwrap();
+        assert!(nvidia_proprietary_present(root.path()));
     }
 
     #[test]
