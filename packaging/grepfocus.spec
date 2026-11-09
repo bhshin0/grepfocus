@@ -12,7 +12,7 @@
 %global debug_package %{nil}
 
 Name:           grepfocus
-Version:        0.6.0
+Version:        0.6.1
 Release:        1%{?dist}
 Summary:        Website and app blocker for Linux
 
@@ -125,6 +125,15 @@ fi
 %dir %attr(0700,root,root) %{_sharedstatedir}/grepfocus
 
 %changelog
+* Sun Nov 08 2026 Bryan <bhshin@gmail.com> - 0.6.1-1
+- Fixed a blank, empty window on computers with NVIDIA's proprietary
+  graphics driver (reported from Bazzite with KDE on Wayland). When that
+  driver is loaded, GrepFocus now switches off WebKit's DMA-BUF renderer
+  at startup, the known workaround for this driver; other graphics cards
+  are unaffected. Set WEBKIT_DISABLE_DMABUF_RENDERER=0 in your
+  environment to force the default back. The README's Known limits lists
+  further steps for other setups that show a blank window.
+
 * Wed Sep 30 2026 Bryan <bhshin@gmail.com> - 0.6.0-1
 - Each block's schedule card shows a compact weekly grid of its windows,
   and a new schedule takes its name from the block it belongs to.

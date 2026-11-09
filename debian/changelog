@@ -1,3 +1,16 @@
+grepfocus (0.6.1-1) unstable; urgency=medium
+
+  * Fixed a blank, empty window on computers with NVIDIA's proprietary
+    graphics driver (reported from Bazzite with KDE on Wayland). When
+    that driver is loaded, GrepFocus now switches off WebKit's DMA-BUF
+    renderer at startup, the known workaround for this driver; other
+    graphics cards are unaffected. Set WEBKIT_DISABLE_DMABUF_RENDERER=0
+    in your environment to force the default back. The README's Known
+    limits lists further steps for other setups that show a blank
+    window.
+
+ -- Bryan <bhshin@gmail.com>  Sun, 08 Nov 2026 19:44:24 -0800
+
 grepfocus (0.6.0-1) unstable; urgency=medium
 
   * Each block's schedule card shows a compact weekly grid of its
