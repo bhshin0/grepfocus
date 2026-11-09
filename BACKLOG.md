@@ -683,7 +683,7 @@ to be redone when the item is picked up.
   `grepfocus` group. Connect failures now say what to do instead
   (start/install the daemon; `usermod` + re-login), with the raw error kept
   as a trailing line.
-- **[WORKAROUND — `0.7.0-dev`, 2026-10-21] Blank window on NVIDIA /
+- **[FIXED — 0.6.1, 2026-10-21] Blank window on NVIDIA /
   Wayland** — reported from Bazzite (Fedora Atomic) with KDE Wayland: every
   install route opened a blank window. WebKitGTK's DMA-BUF renderer against
   NVIDIA's proprietary driver (Tauri's documented Linux-graphics case). The

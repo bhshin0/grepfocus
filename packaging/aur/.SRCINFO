@@ -1,6 +1,6 @@
 pkgbase = grepfocus
 	pkgdesc = Website and app blocker for Linux
-	pkgver = 0.6.0
+	pkgver = 0.6.1
 	pkgrel = 1
 	url = https://grepfocus.com
 	install = grepfocus.install
@@ -16,7 +16,7 @@ pkgbase = grepfocus
 	depends = nftables
 	depends = libayatana-appindicator
 	optdepends = xdg-utils: open grepfocus.com links from the app
-	source = grepfocus-0.6.0.tar.gz::https://github.com/bhshin0/grepfocus/archive/refs/tags/v0.6.0.tar.gz
-	sha256sums = fcd104dbf10a89eae4d1141dd728c9722b8f158f01c240174e500d43b4956714
+	source = grepfocus-0.6.1.tar.gz::https://github.com/bhshin0/grepfocus/archive/refs/tags/v0.6.1.tar.gz
+	sha256sums = da18a2b411023f65c70b9c7a3021f391d16e3e951707dce7336d4f1523212914
 
 pkgname = grepfocus
